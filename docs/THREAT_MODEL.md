@@ -135,8 +135,8 @@ Rust crates, build runners, signing keys, package repositories, release hosting,
 | T18 | Generated dependency trees inflate bundle | Medium | Known exclusion catalog, size preview, overrideable review |
 | T19 | Silent Git push publishes private work | Critical | Immutable push plan, exact refs/remotes, explicit approval, no default new refs |
 | T20 | Push triggers CI/deployment | High | Clear external-side-effect warning; never bundle with pack approval |
-| T21 | Malicious Git config invokes helpers or hooks | High | Minimal Git commands, controlled environment, disable hooks where possible, no shell |
-| T22 | Git URL or subprocess output leaks credentials | High | Sanitize URLs and output; never persist verbatim |
+| T21 | Malicious Git config invokes helpers or hooks | High | Minimal Git commands, cleared environment, disabled hooks and helpers, protocol allowlist, direct arguments without a shell |
+| T22 | Git URL or subprocess output leaks credentials | High | Strip credentials, queries, fragments, and local paths; neutralize controls; bound output; never persist raw subprocess text |
 | T23 | Copy corruption goes unnoticed | High | Reopen, authenticate, and whole-file hash each copy |
 | T24 | Plan/receipt leaks sensitive paths | Medium | Redacted IDs by default, restrictive permissions, explicit verbose mode |
 | T25 | Diagnostic export leaks source or secrets | High | Allowlist fields/files, preview, secret scanning, explicit consent |

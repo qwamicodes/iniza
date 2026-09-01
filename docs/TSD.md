@@ -268,11 +268,11 @@ Account-synchronized application settings are not assumed protected. Their compi
 - Search only approved roots.
 - Detect working trees, bare repositories, submodules, and nested repositories.
 - Avoid descending into known generated or dependency directories unless explicitly included.
-- Assign stable project IDs from canonical source identity plus migration ID; do not expose raw absolute paths in diagnostics.
+- Assign stable Project identifiers from the matching reviewed Migration Item identifier. Machine-readable output does not expose raw absolute or relative paths.
 
 ### Audit
 
-The adapter invokes the installed `git` binary with a sanitized environment, explicit working directory, no shell interpolation, and disabled optional prompts when running non-interactively.
+The adapter invokes the installed `git` binary with a cleared and allowlisted environment, explicit working directory, direct arguments without shell interpolation, disabled hooks, credential helpers, optional locks, filesystem monitoring, colors, and prompts. Git standard output and standard error are captured concurrently with a one-mebibyte limit per stream; oversized results fail closed and are never embedded verbatim.
 
 Audit collects:
 
@@ -285,6 +285,10 @@ Audit collects:
 - Git LFS presence and pointer inventory
 - Ahead/behind when fetch-free local refs permit it
 - Remote reachability only when the user requested a network check
+
+The default audit is local-only. An explicit remote check permits only Hypertext Transfer Protocol Secure and Secure Shell transports and uses `git ls-remote --heads --tags`; local file, external-helper, unauthenticated Git, and all other transports fail closed. Configured remote user information, passwords, queries, fragments, local paths, and terminal control characters are absent or neutralized in reports. Pre-audit and post-audit status and reference observations identify Projects that changed during inspection and mark their local evidence Unverified.
+
+Restorable and Synchronized are separate conclusions. Until a Project Capsule and Restore Rehearsal exist, the audit always reports a Restorable gap. Remote absence, skipped or failed checks, missing upstreams, ahead or behind state, and local-only references appear as Synchronized gaps. A remote failure retains the local audit and cannot block later Project protection.
 
 ### Capsule representation
 
@@ -704,11 +708,12 @@ Recorded:
 - ADR-0003: Independent Vaultwarden and offline recovery methods
 - ADR-0004: IZ1 cryptographic suite and immutable prototype format
 - ADR-0005: IZ2 streaming multi-file Bundle format
+- ADR-0006: Read-only Project audit and constrained Git subprocess boundary
 
 Required from HITL technical spikes before their affected implementation proceeds:
 
 - Project Capsule representation
-- Git subprocess trust and immutable publication execution
+- Immutable Git publication execution
 - Logical paths and metadata portability
 - Restore transaction and future merge boundary
 - Receipt authenticity, local state, and diagnostic redaction

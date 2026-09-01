@@ -2,7 +2,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use iniza::{
-    CoreError, InizaCore, Plan, PlanApprovalState, PlanEngine, PublicationPolicy, ScanRequest,
+    CoreError, InizaCore, Plan, PlanApprovalState, PlanEngine, ProjectAuditEngine,
+    ProjectAuditRequest, PublicationPolicy, ScanRequest,
 };
 
 fn main() -> ExitCode {
@@ -12,7 +13,7 @@ fn main() -> ExitCode {
     let command_name = machine_command_name(&arguments);
 
     match run(arguments, machine_output, json_events) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(exit_code) => exit_code,
         Err(error) => {
             if machine_output {
                 print_machine_error(&command_name, &error);
@@ -24,10 +25,19 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(arguments: Vec<String>, machine_output: bool, json_events: bool) -> Result<(), CliError> {
+fn run(
+    arguments: Vec<String>,
+    machine_output: bool,
+    json_events: bool,
+) -> Result<ExitCode, CliError> {
     match arguments.as_slice() {
         [command, scan_arguments @ ..] if command == "scan" => {
             run_scan(scan_arguments, machine_output, json_events)
+        }
+        [namespace, command, project_arguments @ ..]
+            if namespace == "projects" && command == "scan" =>
+        {
+            run_project_audit(project_arguments, machine_output, json_events)
         }
         [command, subcommand, plan_flag, plan]
             if command == "plan" && subcommand == "show" && plan_flag == "--plan" =>
@@ -41,7 +51,7 @@ fn run(arguments: Vec<String>, machine_output: bool, json_events: bool) -> Resul
             } else {
                 print_plan_review(&plan)?;
             }
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         }
         [command, subcommand, original, revised]
             if command == "plan" && subcommand == "diff" =>
@@ -72,7 +82,7 @@ fn run(arguments: Vec<String>, machine_output: bool, json_events: bool) -> Resul
             } else {
                 println!("{}", comparison.to_human_text());
             }
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         }
         [command, subcommand, plan_flag, plan]
             if command == "plan" && subcommand == "validate" && plan_flag == "--plan" =>
@@ -128,7 +138,7 @@ fn run(arguments: Vec<String>, machine_output: bool, json_events: bool) -> Resul
                     );
                 }
             }
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         }
         [command, subcommand, plan_flag, plan, hash_flag, approved_hash]
             if command == "plan"
@@ -151,7 +161,7 @@ fn run(arguments: Vec<String>, machine_output: bool, json_events: bool) -> Resul
             } else {
                 println!("Plan approved: {approved_hash}");
             }
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         }
         [namespace, command, plan_flag, plan, output_flag, output]
             if namespace == "fixture"
@@ -186,7 +196,7 @@ fn run(arguments: Vec<String>, machine_output: bool, json_events: bool) -> Resul
                     summary.source_name
                 );
             }
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         }
         [namespace, command, fixture] if namespace == "fixture" && command == "inspect" => {
             let fixture_path = PathBuf::from(fixture);
@@ -212,7 +222,7 @@ fn run(arguments: Vec<String>, machine_output: bool, json_events: bool) -> Resul
                     summary.source_name, summary.logical_size
                 );
             }
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         }
         [namespace, command, fixture, destination_flag, destination]
             if namespace == "fixture"
@@ -246,7 +256,7 @@ fn run(arguments: Vec<String>, machine_output: bool, json_events: bool) -> Resul
                     restored_file.display()
                 );
             }
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         }
         [command, bundle] if command == "inspect" => {
             let bundle_path = PathBuf::from(bundle);
@@ -260,13 +270,17 @@ fn run(arguments: Vec<String>, machine_output: bool, json_events: bool) -> Resul
             unreachable!("encrypted Bundle inspection is not implemented")
         }
         _ => Err(CliError::Usage(
-            "usage: iniza scan <SOURCE> --output-plan <PLAN> [DIRECTORY PLAN OPTIONS] | iniza plan show --plan <PLAN> | iniza plan validate --plan <PLAN> | iniza plan approve --plan <PLAN> --approved-hash <HASH> | iniza plan diff <OLD> <NEW> | iniza inspect <BUNDLE> | iniza fixture pack --plan <PLAN> --output <PATH.iniza-fixture> | iniza fixture inspect <PATH.iniza-fixture> | iniza fixture restore <PATH.iniza-fixture> --to <NEW_DESTINATION>"
+            "usage: iniza scan <SOURCE> --output-plan <PLAN> [DIRECTORY PLAN OPTIONS] | iniza projects scan --plan <APPROVED_PLAN> [--remote-check] | iniza plan show --plan <PLAN> | iniza plan validate --plan <PLAN> | iniza plan approve --plan <PLAN> --approved-hash <HASH> | iniza plan diff <OLD> <NEW> | iniza inspect <BUNDLE> | iniza fixture pack --plan <PLAN> --output <PATH.iniza-fixture> | iniza fixture inspect <PATH.iniza-fixture> | iniza fixture restore <PATH.iniza-fixture> --to <NEW_DESTINATION>"
                 .to_owned(),
         )),
     }
 }
 
-fn run_scan(arguments: &[String], machine_output: bool, json_events: bool) -> Result<(), CliError> {
+fn run_scan(
+    arguments: &[String],
+    machine_output: bool,
+    json_events: bool,
+) -> Result<ExitCode, CliError> {
     let source = arguments
         .first()
         .map(PathBuf::from)
@@ -394,7 +408,68 @@ fn run_scan(arguments: &[String], machine_output: bool, json_events: bool) -> Re
     } else {
         println!("Plan created: {}", plan_path.display());
     }
-    Ok(())
+    Ok(ExitCode::SUCCESS)
+}
+
+fn run_project_audit(
+    arguments: &[String],
+    machine_output: bool,
+    json_events: bool,
+) -> Result<ExitCode, CliError> {
+    let mut plan_path = None;
+    let mut remote_check = false;
+    let mut index = 0;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "--plan" => {
+                plan_path = Some(PathBuf::from(
+                    arguments.get(index + 1).ok_or_else(project_audit_usage)?,
+                ));
+                index += 2;
+            }
+            "--remote-check" => {
+                remote_check = true;
+                index += 1;
+            }
+            _ => return Err(project_audit_usage()),
+        }
+    }
+    let plan_path = plan_path.ok_or_else(project_audit_usage)?;
+    let plan =
+        Plan::read_from(&plan_path).map_err(|error| CliError::Approval(error.to_string()))?;
+    print_progress(
+        machine_output || json_events,
+        &format!("Auditing Projects from {}", plan_path.display()),
+    );
+    if json_events {
+        print_json_event("project-audit-started", serde_json::json!({}));
+    }
+    let mut request = ProjectAuditRequest::from_plan(&plan);
+    if remote_check {
+        request = request.with_remote_check();
+    }
+    let report = ProjectAuditEngine::local()
+        .audit(request)
+        .map_err(|error| match error {
+            error @ CoreError::InvalidPlan(_) => CliError::Approval(error.to_string()),
+            error => CliError::GitAudit(error.to_string()),
+        })?;
+    if json_events {
+        print_json_event(
+            "project-audit-completed",
+            serde_json::json!({"project_count": report.projects().len()}),
+        );
+    }
+    if machine_output {
+        println!("{}", report.machine_json_result());
+    } else {
+        println!("{}", report.to_human_text());
+    }
+    Ok(ExitCode::from(1))
+}
+
+fn project_audit_usage() -> CliError {
+    CliError::Usage("usage: iniza projects scan --plan <APPROVED_PLAN> [--remote-check]".to_owned())
 }
 
 fn scan_usage() -> CliError {
@@ -525,7 +600,9 @@ fn print_machine_error(command: &str, error: &CliError) {
 
 fn machine_command_name(arguments: &[String]) -> String {
     match arguments {
-        [namespace, command, ..] if namespace == "plan" || namespace == "fixture" => {
+        [namespace, command, ..]
+            if namespace == "plan" || namespace == "fixture" || namespace == "projects" =>
+        {
             format!("{namespace} {command}")
         }
         [command, ..] => command.clone(),
@@ -564,6 +641,7 @@ enum CliError {
     Approval(String),
     BundleInvalid(String),
     Conflict(String),
+    GitAudit(String),
     Usage(String),
     Operation(String),
 }
@@ -574,6 +652,7 @@ impl CliError {
             Self::Approval(_) => 10,
             Self::BundleInvalid(_) => 20,
             Self::Conflict(_) => 50,
+            Self::GitAudit(_) => 40,
             Self::Usage(_) => 2,
             Self::Operation(_) => 11,
         }
@@ -584,6 +663,7 @@ impl CliError {
             Self::Approval(_) => "INIZA-E010",
             Self::BundleInvalid(_) => "INIZA-E020",
             Self::Conflict(_) => "INIZA-E050",
+            Self::GitAudit(_) => "INIZA-E040",
             Self::Usage(_) => "INIZA-E002",
             Self::Operation(_) => "INIZA-E011",
         }
@@ -596,6 +676,7 @@ impl std::fmt::Display for CliError {
             Self::Approval(message)
             | Self::BundleInvalid(message)
             | Self::Conflict(message)
+            | Self::GitAudit(message)
             | Self::Usage(message)
             | Self::Operation(message) => formatter.write_str(message),
         }
