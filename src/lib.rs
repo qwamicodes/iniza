@@ -4,11 +4,17 @@ use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 
+mod bundle;
 mod iz1;
 mod plan_comparison;
 mod plan_document;
 mod plan_engine;
 
+pub use bundle::{
+    BundleEngine, BundleEvent, BundleEventSink, BundleSource, BundleSourceObservation,
+    BundleVerification, DestinationCapacity, InspectRequest, LocalBundleSource,
+    LocalDestinationCapacity, PackRequest, VerifyRequest,
+};
 pub use iz1::{
     AuthenticatedBundleSummary, Iz1Prototype, RecoveryMethod, RecoverySecret, SealedBundle,
 };
@@ -198,6 +204,11 @@ pub enum CoreError {
     BundleIncomplete(PathBuf),
     BundleInvalid(String),
     DestinationAlreadyExists(PathBuf),
+    InsufficientSpace {
+        path: PathBuf,
+        required: u64,
+        available: u64,
+    },
     InvalidFixture(String),
     InvalidFixtureOutput(PathBuf),
     InvalidPlan(String),
@@ -222,6 +233,15 @@ impl fmt::Display for CoreError {
             Self::DestinationAlreadyExists(path) => {
                 write!(formatter, "destination already exists: {}", path.display())
             }
+            Self::InsufficientSpace {
+                path,
+                required,
+                available,
+            } => write!(
+                formatter,
+                "insufficient destination space at {}: requires at least {required} bytes, {available} bytes available",
+                path.display()
+            ),
             Self::InvalidFixtureOutput(path) => write!(
                 formatter,
                 "test-only fixture output must end with .iniza-fixture: {}",

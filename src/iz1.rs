@@ -39,14 +39,14 @@ pub enum RecoveryMethod {
 }
 
 impl RecoveryMethod {
-    fn slot_id(self) -> u8 {
+    pub(crate) fn slot_id(self) -> u8 {
         match self {
             Self::Vaultwarden => 1,
             Self::Offline => 2,
         }
     }
 
-    fn from_slot_id(value: u8) -> Result<Self, CoreError> {
+    pub(crate) fn from_slot_id(value: u8) -> Result<Self, CoreError> {
         match value {
             1 => Ok(Self::Vaultwarden),
             2 => Ok(Self::Offline),
@@ -56,11 +56,15 @@ impl RecoveryMethod {
 }
 
 pub struct RecoverySecret {
-    method: RecoveryMethod,
-    bytes: Zeroizing<[u8; 32]>,
+    pub(crate) method: RecoveryMethod,
+    pub(crate) bytes: Zeroizing<[u8; 32]>,
 }
 
 impl RecoverySecret {
+    pub fn from_bytes(method: RecoveryMethod, bytes: Zeroizing<[u8; 32]>) -> Self {
+        Self { method, bytes }
+    }
+
     pub fn method(&self) -> RecoveryMethod {
         self.method
     }
@@ -82,11 +86,15 @@ pub struct AuthenticatedBundleSummary {
     pub logical_size: u64,
     pub format_version: u16,
     pub cryptographic_suite: &'static str,
+    pub included_items: u64,
+    pub changed_items: u64,
+    pub unsupported_items: u64,
+    pub unverified_items: u64,
 }
 
 pub struct SealedBundle {
-    vaultwarden_recovery_secret: RecoverySecret,
-    offline_recovery_key: RecoverySecret,
+    pub(crate) vaultwarden_recovery_secret: RecoverySecret,
+    pub(crate) offline_recovery_key: RecoverySecret,
 }
 
 impl SealedBundle {
@@ -733,6 +741,10 @@ fn decode_manifest(
         logical_size,
         format_version,
         cryptographic_suite: "IZ1",
+        included_items: 1,
+        changed_items: 0,
+        unsupported_items: 0,
+        unverified_items: 0,
     })
 }
 

@@ -387,6 +387,14 @@ The encrypted manifest contains bundle identity, source platform, plan hash, ite
 - Resume journals contain no plaintext paths or secrets and are authenticated using a derived journal key.
 - Resume verifies the last complete checkpoint before appending.
 
+### Streaming multi-file format `IZ2`
+
+ADR 0005 defines format version 2 for reviewed directory Plans. IZ2 retains the reviewed cryptographic suite while changing the record format instead of altering IZ1 byte semantics. Content uses bounded one-mebibyte encrypted chunks, the encrypted Manifest binds Plan coverage and per-item content digests, the encrypted fixed-entry Index binds chunk locations, and the authenticated Completion binds the exact preceding stream.
+
+Pack performs three bounded source-consistency attempts. Every attempt stages only ciphertext, and discarded attempts consume record sequences so nonces are never reused. Inspect authenticates metadata, index, and completion without decrypting Content or extracting files. Full Verify authenticates every selected chunk and recomputes content digests without whole-Bundle memory loading.
+
+Capacity is checked before creation and before persisted writes. Only a synchronized Bundle with a valid Completion can receive the final `.iniza` name. Cross-process Recovery Method storage remains assigned to the Offline Recovery Key and Vaultwarden issues.
+
 ## 12. Bitwarden connector
 
 ### Boundary
@@ -694,11 +702,11 @@ Recorded:
 - ADR-0001: CLI-first Rust core and future client boundary
 - ADR-0002: Project protection remains separate from Git publication
 - ADR-0003: Independent Vaultwarden and offline recovery methods
+- ADR-0004: IZ1 cryptographic suite and immutable prototype format
+- ADR-0005: IZ2 streaming multi-file Bundle format
 
 Required from HITL technical spikes before their affected implementation proceeds:
 
-- `.iniza` public format and compatibility policy
-- `IZ1` cryptographic suite, crates, parameters, and key-slot lifecycle
 - Project Capsule representation
 - Git subprocess trust and immutable publication execution
 - Logical paths and metadata portability
@@ -708,7 +716,6 @@ Required from HITL technical spikes before their affected implementation proceed
 ## 25. Open technical decisions
 
 - Minimum platform versions
-- Exact crypto crates, KDF parameters, and chunk size
 - Compression algorithm and per-file heuristic
 - Capsule representation selected by prototype
 - Git version floor and LFS behavior

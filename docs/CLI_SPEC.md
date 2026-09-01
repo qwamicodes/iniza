@@ -97,6 +97,8 @@ iniza pack
 
 Owner Dogfood requires both Vaultwarden and offline recovery. Interactive `pack` may collect the missing choices through review prompts. In `--non-interactive` or `--json` mode, `--bitwarden` and `--offline-recovery <PATH>` are required; omission exits with code 10. `--dry-run` validates and estimates but does not read full file contents, create recovery material, contact Vaultwarden, or write the final bundle.
 
+The IZ2 core and command-rendering seam precede the recovery storage adapters. Until the Offline Recovery Key and Vaultwarden issues are complete, the supported executable must not persist, print, or accept Recovery Secrets merely to make `pack`, `inspect`, or `verify` appear usable across processes. Synthetic integration tests retain both Recovery Secrets in one process and verify the versioned result and progress-event contracts.
+
 ### `iniza inspect`
 
 ```text
