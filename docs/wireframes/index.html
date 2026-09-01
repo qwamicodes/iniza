@@ -1,0 +1,714 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MoveMyMac · Wireframe Packs</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --gallery-bg: #111317;
+      --gallery-surface: #191c21;
+      --gallery-border: #30343c;
+      --gallery-text: #f4f5f7;
+      --gallery-muted: #a8adb7;
+      --app-bg: #f4f5f7;
+      --app-surface: #ffffff;
+      --app-sidebar: #e9ebef;
+      --app-border: #d5d8df;
+      --app-text: #1c1d21;
+      --app-muted: #666b75;
+      --accent: #0a66d6;
+      --accent-soft: #e6f0fc;
+      --success: #147d3f;
+      --success-soft: #e7f6ec;
+      --warning: #9a5a00;
+      --warning-soft: #fff3df;
+      --danger: #b42318;
+      --danger-soft: #ffebe9;
+      --shadow: 0 26px 70px rgba(0, 0, 0, .28);
+      --radius: 14px;
+    }
+
+    body.dark-apps {
+      --app-bg: #191a1e;
+      --app-surface: #25272c;
+      --app-sidebar: #202226;
+      --app-border: #3a3d44;
+      --app-text: #f5f5f7;
+      --app-muted: #b1b5bd;
+      --accent: #409cff;
+      --accent-soft: #183a5d;
+      --success: #42d87c;
+      --success-soft: #173b26;
+      --warning: #ffb340;
+      --warning-soft: #493719;
+      --danger: #ff6961;
+      --danger-soft: #4b2527;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      background:
+        radial-gradient(circle at 8% -10%, rgba(64, 156, 255, .14), transparent 35rem),
+        var(--gallery-bg);
+      color: var(--gallery-text);
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", sans-serif;
+      line-height: 1.45;
+    }
+
+    button { font: inherit; }
+
+    .gallery-header {
+      position: sticky;
+      top: 0;
+      z-index: 50;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 24px;
+      padding: 18px 28px;
+      border-bottom: 1px solid var(--gallery-border);
+      background: rgba(17, 19, 23, .88);
+      backdrop-filter: blur(18px);
+    }
+
+    .brand { display: flex; align-items: center; gap: 12px; }
+    .brand-mark {
+      display: grid;
+      width: 34px;
+      height: 34px;
+      place-items: center;
+      border-radius: 10px;
+      background: linear-gradient(145deg, #58a9ff, #075bbd);
+      color: white;
+      font-weight: 750;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,.3);
+    }
+    .brand strong { display: block; font-size: 15px; }
+    .brand span { display: block; color: var(--gallery-muted); font-size: 12px; }
+
+    .gallery-controls { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+    .gallery-controls button {
+      min-height: 34px;
+      padding: 7px 12px;
+      border: 1px solid var(--gallery-border);
+      border-radius: 9px;
+      background: var(--gallery-surface);
+      color: var(--gallery-text);
+      cursor: pointer;
+    }
+    .gallery-controls button[aria-pressed="true"] { border-color: #409cff; background: #183a5d; }
+    .gallery-controls button:focus-visible { outline: 2px solid #65adff; outline-offset: 2px; }
+
+    main { width: min(1540px, calc(100% - 36px)); margin: 0 auto; padding: 28px 0 54px; }
+    .intro { max-width: 780px; margin-bottom: 18px; }
+    .eyebrow { margin: 0 0 8px; color: #65adff; font-size: 12px; font-weight: 720; letter-spacing: .12em; text-transform: uppercase; }
+    h1 { margin: 0 0 12px; font-size: clamp(34px, 5vw, 62px); line-height: 1.03; letter-spacing: -.045em; }
+    .intro p { margin: 0; color: var(--gallery-muted); font-size: 17px; }
+
+    .pack { margin-top: 30px; scroll-margin-top: 92px; }
+    .pack[hidden] { display: none; }
+    .pack-head { display: flex; align-items: end; justify-content: space-between; gap: 18px; margin-bottom: 12px; }
+    .pack-head h2 { margin: 0; font-size: 25px; letter-spacing: -.02em; }
+    .pack-head p { margin: 4px 0 0; color: var(--gallery-muted); }
+    .pack-count { color: var(--gallery-muted); font-size: 13px; white-space: nowrap; }
+
+    .board {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+    }
+
+    .frame {
+      min-width: 0;
+      border: 1px solid var(--gallery-border);
+      border-radius: 18px;
+      background: var(--gallery-surface);
+      padding: 10px;
+      box-shadow: 0 14px 40px rgba(0,0,0,.18);
+    }
+    .frame figcaption { display: flex; justify-content: space-between; gap: 14px; padding: 2px 2px 12px; }
+    .frame-title { font-weight: 700; }
+    .frame-id { color: var(--gallery-muted); font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+    .mac {
+      min-height: 430px;
+      overflow: hidden;
+      border: 1px solid var(--app-border);
+      border-radius: 12px;
+      background: var(--app-bg);
+      color: var(--app-text);
+      box-shadow: var(--shadow);
+    }
+    .titlebar {
+      display: grid;
+      grid-template-columns: 140px 1fr 140px;
+      align-items: center;
+      height: 38px;
+      padding: 0 12px;
+      border-bottom: 1px solid var(--app-border);
+      background: color-mix(in srgb, var(--app-surface) 88%, transparent);
+    }
+    .traffic { display: flex; gap: 7px; }
+    .traffic i { width: 10px; height: 10px; border-radius: 50%; background: #c9ccd2; }
+    .traffic i:first-child { background: #ff5f57; }
+    .traffic i:nth-child(2) { background: #febc2e; }
+    .traffic i:nth-child(3) { background: #28c840; }
+    .window-title { text-align: center; font-size: 12px; font-weight: 650; }
+    .session { justify-self: end; color: var(--app-muted); font-size: 10px; }
+
+    .shell { display: grid; grid-template-columns: 148px minmax(0, 1fr); min-height: 392px; }
+    .sidebar { padding: 14px 10px; border-right: 1px solid var(--app-border); background: var(--app-sidebar); }
+    .side-brand { display: flex; align-items: center; gap: 7px; padding: 0 7px 14px; font-size: 12px; font-weight: 730; }
+    .side-brand b { display: grid; place-items: center; width: 22px; height: 22px; border-radius: 7px; background: var(--accent); color: white; }
+    .nav-group { margin: 6px 0 12px; }
+    .nav-label { padding: 0 8px 5px; color: var(--app-muted); font-size: 8px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+    .nav-item { display: flex; align-items: center; gap: 7px; min-height: 28px; padding: 5px 8px; border-radius: 6px; color: var(--app-muted); font-size: 10px; }
+    .nav-item.active { background: var(--accent-soft); color: var(--app-text); font-weight: 650; }
+    .nav-icon { display: inline-grid; width: 14px; place-items: center; font-size: 9px; }
+
+    .content { min-width: 0; padding: 24px 26px; background: var(--app-bg); }
+    .content.narrow { display: grid; place-items: center; }
+    .hero { max-width: 510px; }
+    .kicker { color: var(--accent); font-size: 9px; font-weight: 750; letter-spacing: .1em; text-transform: uppercase; }
+    .hero h3, .content h3 { margin: 5px 0 7px; font-size: 22px; line-height: 1.14; letter-spacing: -.025em; }
+    .content h4 { margin: 0 0 5px; font-size: 12px; }
+    .copy { color: var(--app-muted); font-size: 10px; line-height: 1.5; }
+
+    .actions { display: flex; gap: 8px; align-items: center; margin-top: 16px; flex-wrap: wrap; }
+    .btn { display: inline-flex; min-height: 29px; align-items: center; justify-content: center; gap: 6px; padding: 6px 11px; border: 1px solid var(--app-border); border-radius: 7px; background: var(--app-surface); color: var(--app-text); font-size: 9px; font-weight: 650; }
+    .btn.primary { border-color: var(--accent); background: var(--accent); color: white; }
+    .btn.danger { border-color: var(--danger); color: var(--danger); }
+    .btn.ghost { border-color: transparent; background: transparent; color: var(--accent); }
+    .btn.disabled { opacity: .45; }
+
+    .card-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; margin-top: 14px; }
+    .card-grid.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .card { min-width: 0; padding: 11px; border: 1px solid var(--app-border); border-radius: 9px; background: var(--app-surface); }
+    .card.selected { border-color: var(--accent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 14%, transparent); }
+    .card.warning { border-color: color-mix(in srgb, var(--warning) 45%, var(--app-border)); background: var(--warning-soft); }
+    .card.success { border-color: color-mix(in srgb, var(--success) 45%, var(--app-border)); background: var(--success-soft); }
+    .card.danger { border-color: color-mix(in srgb, var(--danger) 45%, var(--app-border)); background: var(--danger-soft); }
+    .card-title { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 10px; font-weight: 700; }
+    .card p { margin: 5px 0 0; color: var(--app-muted); font-size: 8.5px; line-height: 1.45; }
+    .iconbox { display: grid; width: 25px; height: 25px; place-items: center; margin-bottom: 8px; border-radius: 7px; background: var(--accent-soft); color: var(--accent); font-size: 12px; }
+
+    .pill { display: inline-flex; align-items: center; gap: 4px; min-height: 18px; padding: 2px 6px; border-radius: 999px; background: var(--app-sidebar); color: var(--app-muted); font-size: 7px; font-weight: 700; white-space: nowrap; }
+    .pill.success { background: var(--success-soft); color: var(--success); }
+    .pill.warning { background: var(--warning-soft); color: var(--warning); }
+    .pill.danger { background: var(--danger-soft); color: var(--danger); }
+    .pill.blue { background: var(--accent-soft); color: var(--accent); }
+
+    .notice { display: flex; gap: 8px; margin-top: 12px; padding: 9px 10px; border: 1px solid var(--app-border); border-radius: 8px; background: var(--app-surface); color: var(--app-muted); font-size: 8.5px; }
+    .notice.warning { border-color: color-mix(in srgb, var(--warning) 45%, var(--app-border)); background: var(--warning-soft); color: var(--app-text); }
+    .notice.danger { border-color: color-mix(in srgb, var(--danger) 45%, var(--app-border)); background: var(--danger-soft); color: var(--app-text); }
+
+    .stepper { display: flex; align-items: center; gap: 6px; margin-bottom: 17px; color: var(--app-muted); font-size: 8px; }
+    .stepper span { display: inline-flex; align-items: center; gap: 4px; }
+    .stepper span::before { content: ""; width: 7px; height: 7px; border: 1px solid var(--app-border); border-radius: 50%; }
+    .stepper span.done::before { border-color: var(--success); background: var(--success); }
+    .stepper span.current { color: var(--app-text); font-weight: 700; }
+    .stepper span.current::before { border: 2px solid var(--accent); }
+    .stepper i { width: 18px; height: 1px; background: var(--app-border); }
+
+    .bar { height: 6px; overflow: hidden; border-radius: 99px; background: var(--app-sidebar); }
+    .bar > span { display: block; height: 100%; border-radius: inherit; background: var(--accent); }
+    .bar.success > span { background: var(--success); }
+
+    .metrics { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin: 12px 0; }
+    .metric { padding: 9px; border: 1px solid var(--app-border); border-radius: 8px; background: var(--app-surface); }
+    .metric strong { display: block; font-size: 17px; }
+    .metric span { color: var(--app-muted); font-size: 7.5px; }
+
+    .table { margin-top: 12px; overflow: hidden; border: 1px solid var(--app-border); border-radius: 8px; background: var(--app-surface); }
+    .row { display: grid; grid-template-columns: 22px minmax(90px, 1.4fr) 1fr .65fr .75fr; align-items: center; min-height: 35px; padding: 5px 8px; border-bottom: 1px solid var(--app-border); font-size: 8px; gap: 8px; }
+    .row:last-child { border-bottom: 0; }
+    .row.header { min-height: 27px; background: var(--app-sidebar); color: var(--app-muted); font-size: 7px; font-weight: 700; }
+    .check { display: grid; width: 13px; height: 13px; place-items: center; border: 1px solid var(--app-border); border-radius: 4px; color: white; font-size: 8px; }
+    .check.on { border-color: var(--accent); background: var(--accent); }
+    .item-name { font-weight: 650; }
+    .sub { display: block; margin-top: 2px; color: var(--app-muted); font-size: 7px; font-weight: 400; }
+
+    .split { display: grid; grid-template-columns: minmax(0, 1fr) 168px; gap: 10px; }
+    .inspector { padding: 11px; border: 1px solid var(--app-border); border-radius: 8px; background: var(--app-surface); }
+    .kv { display: grid; grid-template-columns: 58px 1fr; gap: 5px; margin-top: 8px; font-size: 7px; }
+    .kv dt { color: var(--app-muted); }
+    .kv dd { margin: 0; overflow-wrap: anywhere; }
+
+    .choice-list { display: grid; gap: 8px; margin-top: 13px; }
+    .choice { display: flex; gap: 9px; align-items: flex-start; padding: 9px; border: 1px solid var(--app-border); border-radius: 8px; background: var(--app-surface); }
+    .choice.on { border-color: var(--accent); }
+    .radio { width: 12px; height: 12px; flex: 0 0 auto; border: 1.5px solid var(--app-border); border-radius: 50%; }
+    .choice.on .radio { border: 4px solid var(--accent); }
+    .choice strong { display: block; font-size: 9px; }
+    .choice small { display: block; margin-top: 2px; color: var(--app-muted); font-size: 7.5px; }
+
+    .timeline { margin-top: 13px; }
+    .phase { display: grid; grid-template-columns: 20px 1fr auto; gap: 8px; align-items: center; padding: 7px 0; border-bottom: 1px solid var(--app-border); font-size: 8.5px; }
+    .phase:last-child { border: 0; }
+    .phase-dot { display: grid; width: 17px; height: 17px; place-items: center; border: 1px solid var(--app-border); border-radius: 50%; color: var(--app-muted); font-size: 7px; }
+    .phase.done .phase-dot { border-color: var(--success); background: var(--success); color: white; }
+    .phase.active .phase-dot { border: 2px solid var(--accent); color: var(--accent); }
+
+    .diff { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 10px; }
+    .diff-panel { min-height: 90px; padding: 9px; border: 1px solid var(--app-border); border-radius: 8px; background: var(--app-surface); }
+    .diff-panel strong { font-size: 8px; }
+    .code { margin-top: 7px; color: var(--app-muted); font: 7px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-line; }
+
+    .footer-actions { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-top: 15px; }
+    .hint { color: var(--app-muted); font-size: 7.5px; }
+
+    .lock-hero { text-align: center; max-width: 380px; }
+    .lock-glyph { display: grid; width: 54px; height: 54px; margin: 0 auto 12px; place-items: center; border-radius: 16px; background: var(--accent-soft); color: var(--accent); font-size: 24px; }
+
+    @media (max-width: 980px) {
+      .board { grid-template-columns: 1fr; }
+      .gallery-header { align-items: flex-start; flex-direction: column; }
+      .gallery-controls { justify-content: flex-start; }
+    }
+
+    @media (max-width: 650px) {
+      main { width: min(100% - 18px, 1540px); }
+      .frame { overflow-x: auto; }
+      .mac { min-width: 620px; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; }
+    }
+  </style>
+</head>
+<body>
+  <header class="gallery-header">
+    <div class="brand">
+      <div class="brand-mark" aria-hidden="true">M</div>
+      <div><strong>MoveMyMac wireframes</strong><span>Functional design pack · v0.1</span></div>
+    </div>
+    <nav class="gallery-controls" aria-label="Wireframe filters">
+      <button type="button" data-filter="all" aria-pressed="true">All packs</button>
+      <button type="button" data-filter="A" aria-pressed="false">A · Start</button>
+      <button type="button" data-filter="B" aria-pressed="false">B · Prepare</button>
+      <button type="button" data-filter="C" aria-pressed="false">C · Restore</button>
+      <button type="button" data-filter="D" aria-pressed="false">D · Manage</button>
+      <button type="button" id="appearance" aria-pressed="false">Dark app</button>
+    </nav>
+  </header>
+
+  <main>
+    <section class="intro">
+      <p class="eyebrow">Native macOS functional wireframes</p>
+      <h1>Move with certainty.</h1>
+      <p>Four packs describe the complete MoveMyMac experience—from first scan to verified restore—using one calm, reviewable, security-first interface.</p>
+    </section>
+
+    <section class="pack" data-pack="A" id="pack-a">
+      <div class="pack-head"><div><h2>Pack A · Start and permissions</h2><p>Orient the user, understand intent, and explain coverage before requesting access.</p></div><span class="pack-count">3 screens</span></div>
+      <div class="board">
+        <figure class="frame">
+          <figcaption><span class="frame-title">Welcome and home</span><span class="frame-id">A1</span></figcaption>
+          <div class="mac">
+            <div class="titlebar"><div class="traffic"><i></i><i></i><i></i></div><div class="window-title">MoveMyMac</div><div class="session">Not signed in</div></div>
+            <div class="shell">
+              <aside class="sidebar">
+                <div class="side-brand"><b>M</b> MoveMyMac</div>
+                <div class="nav-group"><div class="nav-item active"><span class="nav-icon">⌂</span>Home</div></div>
+                <div class="nav-group"><div class="nav-label">Library</div><div class="nav-item"><span class="nav-icon">◴</span>History</div><div class="nav-item"><span class="nav-icon">⌁</span>Connectors</div></div>
+                <div class="nav-group"><div class="nav-item"><span class="nav-icon">⚙</span>Settings</div></div>
+              </aside>
+              <section class="content narrow">
+                <div class="hero">
+                  <div class="kicker">Private by design</div>
+                  <h3>Move your setup,<br>not your clutter.</h3>
+                  <p class="copy">Carry the keys, credentials, tools, and settings that make this Mac yours. Review everything before it moves.</p>
+                  <div class="actions"><span class="btn primary">Start a migration</span><span class="btn">Open a bundle</span></div>
+                  <div class="notice"><span>◉</span><span>Scanning and encryption happen on this Mac. MoveMyMac never stores your bundle.</span></div>
+                </div>
+              </section>
+            </div>
+          </div>
+        </figure>
+
+        <figure class="frame">
+          <figcaption><span class="frame-title">Choose migration intent</span><span class="frame-id">A2</span></figcaption>
+          <div class="mac">
+            <div class="titlebar"><div class="traffic"><i></i><i></i><i></i></div><div class="window-title">New migration</div><div class="session">Protected</div></div>
+            <div class="shell">
+              <aside class="sidebar"><div class="side-brand"><b>M</b> MoveMyMac</div><div class="nav-group"><div class="nav-label">New project</div><div class="nav-item active"><span class="nav-icon">1</span>Purpose</div><div class="nav-item"><span class="nav-icon">2</span>Discover</div><div class="nav-item"><span class="nav-icon">3</span>Review</div></div></aside>
+              <section class="content">
+                <div class="kicker">Step 1 of 5</div><h3>What are you preparing for?</h3><p class="copy">This changes recommendations and your final checklist. It does not limit what the bundle can restore.</p>
+                <div class="card-grid three">
+                  <div class="card selected"><div class="iconbox">→</div><div class="card-title">A new Mac</div><p><span class="pill blue">Selected</span> Move to a replacement or upgraded Mac.</p></div>
+                  <div class="card"><div class="iconbox">↻</div><div class="card-title">Clean reinstall</div><p>Wipe and rebuild this Mac.</p></div>
+                  <div class="card"><div class="iconbox">⌁</div><div class="card-title">Repair or return</div><p>Prepare before the Mac leaves you.</p></div>
+                  <div class="card"><div class="iconbox">◇</div><div class="card-title">Safety snapshot</div><p>Protect hard-to-replace setup.</p></div>
+                  <div class="card"><div class="iconbox">⌘</div><div class="card-title">Rebuild environment</div><p>Recreate a developer workspace.</p></div>
+                  <div class="card"><div class="iconbox">◎</div><div class="card-title">Audit only</div><p>See what would be difficult to replace.</p></div>
+                </div>
+                <div class="footer-actions"><span class="btn ghost">Skip for now</span><span class="btn primary">Continue</span></div>
+              </section>
+            </div>
+          </div>
+        </figure>
+
+        <figure class="frame">
+          <figcaption><span class="frame-title">Coverage and permissions</span><span class="frame-id">A3</span></figcaption>
+          <div class="mac">
+            <div class="titlebar"><div class="traffic"><i></i><i></i><i></i></div><div class="window-title">Migration coverage</div><div class="session">● Protected</div></div>
+            <div class="shell">
+              <aside class="sidebar"><div class="side-brand"><b>M</b> MoveMyMac</div><div class="nav-group"><div class="nav-label">Current project</div><div class="nav-item active"><span class="nav-icon">◌</span>Discover</div><div class="nav-item"><span class="nav-icon">○</span>Review</div><div class="nav-item"><span class="nav-icon">○</span>Protect</div></div></aside>
+              <section class="content">
+                <div class="stepper"><span class="current">Discover</span><i></i><span>Review</span><i></i><span>Protect</span><i></i><span>Store</span><i></i><span>Ready</span></div>
+                <h3>Start with the access you have</h3><p class="copy">MoveMyMac can scan six categories now. Two protected locations need permission if you want them checked.</p>
+                <div class="card-grid">
+                  <div class="card success"><div class="card-title">Home folder <span class="pill success">Available</span></div><p>SSH, Git, shell profiles, Warp, and editor settings.</p></div>
+                  <div class="card warning"><div class="card-title">Protected app data <span class="pill warning">Limited</span></div><p>Full Disk Access may reveal additional supported settings.</p><div class="actions"><span class="btn">Review access</span></div></div>
+                  <div class="card"><div class="card-title">Keychain <span class="pill">On selection</span></div><p>MoveMyMac asks only when you choose an exportable credential.</p></div>
+                  <div class="card"><div class="card-title">Exclusions <span class="pill">12 defaults</span></div><p>Repositories, caches, dependencies, VMs, containers, and media.</p></div>
+                </div>
+                <div class="footer-actions"><span class="btn">Edit exclusions</span><span class="btn primary">Scan with current access</span></div>
+              </section>
+            </div>
+          </div>
+        </figure>
+      </div>
+    </section>
+
+    <section class="pack" data-pack="B" id="pack-b">
+      <div class="pack-head"><div><h2>Pack B · Prepare the bundle</h2><p>Discover, review, protect, store, and reach an evidence-based readiness state.</p></div><span class="pack-count">5 screens</span></div>
+      <div class="board">
+        <figure class="frame">
+          <figcaption><span class="frame-title">Discovery progress</span><span class="frame-id">B1</span></figcaption>
+          <div class="mac">
+            <div class="titlebar"><div class="traffic"><i></i><i></i><i></i></div><div class="window-title">Discovering this Mac</div><div class="session">● Protected</div></div>
+            <div class="shell">
+              <aside class="sidebar"><div class="side-brand"><b>M</b> MoveMyMac</div><div class="nav-group"><div class="nav-label">Current project</div><div class="nav-item active"><span class="nav-icon">◔</span>Discover</div><div class="nav-item"><span class="nav-icon">○</span>Review</div><div class="nav-item"><span class="nav-icon">○</span>Protect</div><div class="nav-item"><span class="nav-icon">○</span>Store</div></div></aside>
+              <section class="content">
+                <div class="stepper"><span class="current">Discover</span><i></i><span>Review</span><i></i><span>Protect</span><i></i><span>Store</span><i></i><span>Ready</span></div>
+                <h3>Finding what makes this Mac yours</h3><p class="copy">Scanning known developer locations. File contents stay on this Mac.</p>
+                <div class="metrics"><div class="metric"><strong>37</strong><span>items found</span></div><div class="metric"><strong>7</strong><span>recipes checked</span></div><div class="metric"><strong>2</strong><span>need attention</span></div><div class="metric"><strong>84%</strong><span>scan complete</span></div></div>
+                <div class="bar"><span style="width:84%"></span></div>
+                <div class="timeline">
+                  <div class="phase done"><span class="phase-dot">✓</span><span>SSH and Git identity</span><span class="pill success">12 found</span></div>
+                  <div class="phase done"><span class="phase-dot">✓</span><span>Shell profiles and dotfiles</span><span class="pill success">9 found</span></div>
+                  <div class="phase active"><span class="phase-dot">••</span><span>Warp and editor settings</span><span class="pill blue">Scanning</span></div>
+                  <div class="phase"><span class="phase-dot">4</span><span>Homebrew inventory</span><span class="pill">Queued</span></div>
+                </div>
+                <div class="footer-actions"><span class="hint">Current recipe: com.movemymac.cursor</span><span><span class="btn">Pause</span> <span class="btn danger">Cancel</span></span></div>
+              </section>
+            </div>
+          </div>
+        </figure>
+
+        <figure class="frame">
+          <figcaption><span class="frame-title">Review discovered items</span><span class="frame-id">B2</span></figcaption>
+          <div class="mac">
+            <div class="titlebar"><div class="traffic"><i></i><i></i><i></i></div><div class="window-title">Review 41 discovered items</div><div class="session">● Protected</div></div>
+            <div class="shell">
+              <aside class="sidebar"><div class="side-brand"><b>M</b> MoveMyMac</div><div class="nav-group"><div class="nav-label">Categories</div><div class="nav-item active"><span class="nav-icon">●</span>All items <span>41</span></div><div class="nav-item"><span class="nav-icon">⌘</span>Identity <span>12</span></div><div class="nav-item"><span class="nav-icon">›_</span>Terminal <span>14</span></div><div class="nav-item"><span class="nav-icon">◇</span>Editors <span>9</span></div><div class="nav-item"><span class="nav-icon">◫</span>Packages <span>6</span></div></div></aside>
+              <section class="content">
+                <div class="stepper"><span class="done">Discover</span><i></i><span class="current">Review</span><i></i><span>Protect</span><i></i><span>Store</span><i></i><span>Ready</span></div>
+                <div class="split">
+                  <div>
+                    <div class="metrics"><div class="metric"><strong>38</strong><span>included</span></div><div class="metric"><strong>2</strong><span>needs action</span></div><div class="metric"><strong>1</strong><span>excluded</span></div><div class="metric"><strong>24 MB</strong><span>estimated</span></div></div>
+                    <div class="table">
+                      <div class="row header"><span></span><span>Item</span><span>Source</span><span>Size</span><span>Status</span></div>
+                      <div class="row"><span class="check on">✓</span><span class="item-name">SSH private keys<span class="sub">Critical secret</span></span><span>~/.ssh</span><span>18 KB</span><span class="pill success">Ready</span></div>
+                      <div class="row"><span class="check on">✓</span><span class="item-name">Git configuration<span class="sub">Identity</span></span><span>Home folder</span><span>4 KB</span><span class="pill success">Ready</span></div>
+                      <div class="row"><span class="check on">✓</span><span class="item-name">Warp settings<span class="sub">Application</span></span><span>App data</span><span>1.8 MB</span><span class="pill warning">Review</span></div>
+                      <div class="row"><span class="check"> </span><span class="item-name">Build cache<span class="sub">Default exclusion</span></span><span>Library</span><span>4.2 GB</span><span class="pill">Excluded</span></div>
+                    </div>
+                  </div>
+                  <aside class="inspector"><div class="card-title">SSH private keys <span class="pill danger">Critical</span></div><p class="copy">Required to authenticate to configured SSH services.</p><dl class="kv"><dt>Destination</dt><dd>Current user’s SSH directory</dd><dt>Permissions</dt><dd>Owner read/write only</dd><dt>Portability</dt><dd>Portable</dd><dt>Recipe</dt><dd>ssh · v1</dd><dt>Fingerprint</dt><dd>7D4A…C921</dd></dl><div class="actions"><span class="btn">Exclude once</span><span class="btn ghost">Never scan</span></div></aside>
+                </div>
+                <div class="footer-actions"><span class="btn">Rescan</span><span class="btn primary">Continue with 38 items</span></div>
+              </section>
+            </div>
+          </div>
+        </figure>
+
+        <figure class="frame">
+          <figcaption><span class="frame-title">Protect with two recovery methods</span><span class="frame-id">B3</span></figcaption>
+          <div class="mac">
+            <div class="titlebar"><div class="traffic"><i></i><i></i><i></i></div><div class="window-title">Protect your bundle</div><div class="session">● Protected</div></div>
+            <div class="shell">
+              <aside class="sidebar"><div class="side-brand"><b>M</b> MoveMyMac</div><div class="nav-group"><div class="nav-label">Current project</div><div class="nav-item"><span class="nav-icon">✓</span>Discover</div><div class="nav-item"><span class="nav-icon">✓</span>Review</div><div class="nav-item active"><span class="nav-icon">◔</span>Protect</div><div class="nav-item"><span class="nav-icon">○</span>Store</div></div></aside>
+              <section class="content">
+                <div class="stepper"><span class="done">Discover</span><i></i><span class="done">Review</span><i></i><span class="current">Protect</span><i></i><span>Store</span><i></i><span>Ready</span></div>
+                <h3>Two ways back in</h3><p class="copy">Verify both methods before wiping this Mac. MoveMyMac cannot unlock the bundle if both are lost.</p>
+                <div class="card-grid">
+                  <div class="card success"><div class="iconbox">⌁</div><div class="card-title">Password manager <span class="pill success">Verified</span></div><p>Recommended. Saved through the system credential provider and retrieved successfully.</p><div class="actions"><span class="btn">Test again</span></div></div>
+                  <div class="card warning"><div class="iconbox">⌘</div><div class="card-title">Offline recovery key <span class="pill warning">Not verified</span></div><p>Save this separately from the bundle, then enter it once to confirm.</p><div class="actions"><span class="btn primary">Save and verify</span></div></div>
+                </div>
+                <div class="notice warning"><span>!</span><span><strong>Do not continue yet.</strong> The offline recovery method has not been verified.</span></div>
+                <div class="footer-actions"><span class="btn">Back</span><span class="btn primary disabled">Continue to storage</span></div>
+              </section>
+            </div>
+          </div>
+        </figure>
+
+        <figure class="frame">
+          <figcaption><span class="frame-title">Store and export</span><span class="frame-id">B4</span></figcaption>
+          <div class="mac">
+            <div class="titlebar"><div class="traffic"><i></i><i></i><i></i></div><div class="window-title">Store your bundle</div><div class="session">● Protected</div></div>
+            <div class="shell">
+              <aside class="sidebar"><div class="side-brand"><b>M</b> MoveMyMac</div><div class="nav-group"><div class="nav-label">Current project</div><div class="nav-item"><span class="nav-icon">✓</span>Discover</div><div class="nav-item"><span class="nav-icon">✓</span>Review</div><div class="nav-item"><span class="nav-icon">✓</span>Protect</div><div class="nav-item active"><span class="nav-icon">◔</span>Store</div></div></aside>
+              <section class="content">
+                <div class="stepper"><span class="done">Discover</span><i></i><span class="done">Review</span><i></i><span class="done">Protect</span><i></i><span class="current">Store</span><i></i><span>Ready</span></div>
+                <h3>Choose where the bundle lives</h3><p class="copy">MoveMyMac creates one encrypted file. Your storage provider cannot read its contents.</p>
+                <div class="card-grid three">
+                  <div class="card selected"><div class="iconbox">☁</div><div class="card-title">iCloud Drive <span class="pill blue">Selected</span></div><p>System File Provider · 124 GB available</p></div>
+                  <div class="card"><div class="iconbox">▣</div><div class="card-title">External drive</div><p>Choose a connected volume.</p></div>
+                  <div class="card"><div class="iconbox">⌕</div><div class="card-title">Choose location</div><p>Local, shared, or another provider.</p></div>
+                </div>
+                <div class="notice"><span>◇</span><span><strong>Developer-Mac-2026-08-06.movemymac</strong><br>Estimated 24 MB · New immutable bundle</span></div>
+                <div class="footer-actions"><span class="hint">Cloud sync will be verified when the provider reports completion.</span><span class="btn primary">Create bundle</span></div>
+              </section>
+            </div>
+          </div>
+        </figure>
+
+        <figure class="frame">
+          <figcaption><span class="frame-title">Readiness report</span><span class="frame-id">B5</span></figcaption>
+          <div class="mac">
+            <div class="titlebar"><div class="traffic"><i></i><i></i><i></i></div><div class="window-title">Ready to move</div><div class="session">● Protected</div></div>
+            <div class="shell">
+              <aside class="sidebar"><div class="side-brand"><b>M</b> MoveMyMac</div><div class="nav-group"><div class="nav-label">Current project</div><div class="nav-item"><span class="nav-icon">✓</span>Discover</div><div class="nav-item"><span class="nav-icon">✓</span>Review</div><div class="nav-item"><span class="nav-icon">✓</span>Protect</div><div class="nav-item"><span class="nav-icon">✓</span>Store</div><div class="nav-item active"><span class="nav-icon">✓</span>Ready</div></div></aside>
+              <section class="content">
+                <div class="kicker" style="color:var(--success)">Bundle verified</div><h3>Your selected setup is ready</h3><p class="copy">38 selected items are protected. Two actions will be completed after restore; one item was intentionally excluded.</p>
+                <div class="metrics"><div class="metric"><strong>38</strong><span>verified in bundle</span></div><div class="metric"><strong>2</strong><span>manual actions</span></div><div class="metric"><strong>1</strong><span>excluded</span></div><div class="metric"><strong>2/2</strong><span>recovery methods</span></div></div>
+                <div class="card-grid">
+                  <div class="card success"><div class="card-title">Bundle integrity <span class="pill success">Verified</span></div><p>All selected chunks and the encrypted manifest passed verification.</p></div>
+                  <div class="card success"><div class="card-title">Stored copy <span class="pill success">Synced</span></div><p>iCloud Drive reported the immutable bundle available.</p></div>
+                  <div class="card warning"><div class="card-title">After restore <span class="pill warning">2 actions</span></div><p>Sign in to Warp and confirm one shell hook.</p></div>
+                  <div class="card"><div class="card-title">Before erasing</div><p>Open this bundle on the new Mac and complete verification first.</p></div>
+                </div>
+                <div class="footer-actions"><span class="btn">View full report</span><span class="btn primary">Open on the new Mac</span></div>
+              </section>
+            </div>
+          </div>
+        </figure>
+      </div>
+    </section>
+
+    <section class="pack" data-pack="C" id="pack-c">
+      <div class="pack-head"><div><h2>Pack C · Restore and verify</h2><p>Unlock, dry-run, resolve conflicts, restore transactionally, and prove the destination.</p></div><span class="pack-count">5 screens</span></div>
+      <div class="board">
+        <figure class="frame">
+          <figcaption><span class="frame-title">Open and unlock bundle</span><span class="frame-id">C1</span></figcaption>
+          <div class="mac">
+            <div class="titlebar"><div class="traffic"><i></i><i></i><i></i></div><div class="window-title">Open bundle</div><div class="session">Locked</div></div>
+            <div class="shell">
+              <aside class="sidebar"><div class="side-brand"><b>M</b> MoveMyMac</div><div class="nav-group"><div class="nav-item active"><span class="nav-icon">◇</span>Open</div><div class="nav-item"><span class="nav-icon">○</span>Plan</div><div class="nav-item"><span class="nav-icon">○</span>Restore</div><div class="nav-item"><span class="nav-icon">○</span>Verify</div></div></aside>
+              <section class="content narrow">
+                <div class="lock-hero"><div class="lock-glyph">▣</div><div class="kicker">Compatible bundle</div><h3>Unlock Developer-Mac</h3><p class="copy">The manifest stays private until you unlock it. Format v1 · 24 MB · integrity precheck passed.</p><div class="actions" style="justify-content:center"><span class="btn primary">Use password manager</span><span class="btn">Use recovery key</span></div><div class="notice"><span>✓</span><span>This bundle includes restoration rights. No additional purchase is required to restore it.</span></div></div>
+              </section>
+            </div>
+          </div>
+        </figure>
+
+        <figure class="frame">
+          <figcaption><span class="frame-title">Restore plan</span><span class="frame-id">C2</span></figcaption>
+          <div class="mac">
+            <div class="titlebar"><div class="traffic"><i></i><i></i><i></i></div><div class="window-title">Plan restore</div><div class="session">● Protected</div></div>
+            <div class="shell">
+              <aside class="sidebar"><div class="side-brand"><b>M</b> MoveMyMac</div><div class="nav-group"><div class="nav-item"><span class="nav-icon">✓</span>Open</div><div class="nav-item active"><span class="nav-icon">◔</span>Plan</div><div class="nav-item"><span class="nav-icon">○</span>Restore</div><div class="nav-item"><span class="nav-icon">○</span>Verify</div></div></aside>
+              <section class="content">
+                <div class="stepper"><span class="done">Open</span><i></i><span class="current">Plan</span><i></i><span>Restore</span><i></i><span>Verify</span><i></i><span>Finish</span></div>
+                <h3>Choose how much control you want</h3>
+                <div class="choice-list">
+                  <div class="choice on"><span class="radio"></span><div><strong>Automatic</strong><small>Apply 31 pre-approved safe changes. Pause for 3 conflicts and 4 manual actions.</small></div><span class="pill blue" style="margin-left:auto">Recommended</span></div>
+                  <div class="choice"><span class="radio"></span><div><strong>Custom</strong><small>Choose categories, then automate the safe subset.</small></div></div>
+                  <div class="choice"><span class="radio"></span><div><strong>Manual</strong><small>Review and apply every item individually.</small></div></div>
+                </div>
+                <div class="metrics"><div class="metric"><strong>31</strong><span>automatic</span></div><div class="metric"><strong>3</strong><span>conflicts</span></div><div class="metric"><strong>4</strong><span>manual</span></div><div class="metric"><strong>2</strong><span>unsupported</span></div></div>
+                <div class="footer-actions"><span class="hint">Rollback will be created before any destination change.</span><span class="btn primary">Review 3 conflicts</span></div>
+              </section>
+            </div>
+          </div>
+        </figure>
+
+        <figure class="frame">
+          <figcaption><span class="frame-title">Resolve conflicts</span><span class="frame-id">C3</span></figcaption>
+          <div class="mac">
+            <div class="titlebar"><div class="traffic"><i></i><i></i><i></i></div><div class="window-title">Conflict 1 of 3</div><div class="session">● Protected</div></div>
+            <div class="shell">
+              <aside class="sidebar"><div class="side-brand"><b>M</b> MoveMyMac</div><div class="nav-group"><div class="nav-label">Conflicts</div><div class="nav-item active"><span class="nav-icon">!</span>Git identity</div><div class="nav-item"><span class="nav-icon">!</span>SSH config</div><div class="nav-item"><span class="nav-icon">!</span>Shell aliases</div></div></aside>
+              <section class="content">
+                <div class="kicker">Git configuration</div><h3>Both Macs have a user identity</h3><p class="copy">Review the semantic difference. No secret values are shown.</p>
+                <div class="diff"><div class="diff-panel"><strong>In the bundle</strong><div class="code">user.name  Qwami
+signing     enabled
+helper      osxkeychain</div></div><div class="diff-panel"><strong>On this Mac</strong><div class="code">user.name  Qwami Work
+signing     not set
+helper      osxkeychain</div></div></div>
+                <div class="choice-list">
+                  <div class="choice"><span class="radio"></span><div><strong>Keep this Mac</strong><small>Leave the current destination values unchanged.</small></div></div>
+                  <div class="choice on"><span class="radio"></span><div><strong>Merge safely</strong><small>Keep the destination name and add compatible signing settings.</small></div><span class="pill blue" style="margin-left:auto">Recipe supported</span></div>
+                  <div class="choice"><span class="radio"></span><div><strong>Use the bundle</strong><small>Replace these values after rollback capture.</small></div></div>
+                </div>
+                <div class="footer-actions"><span class="btn">Back</span><span class="btn primary">Save and next</span></div>
+              </section>
+            </div>
+          </div>
+        </figure>
+
+        <figure class="frame">
+          <figcaption><span class="frame-title">Restore progress</span><span class="frame-id">C4</span></figcaption>
+          <div class="mac">
+            <div class="titlebar"><div class="traffic"><i></i><i></i><i></i></div><div class="window-title">Restoring Developer-Mac</div><div class="session">● Protected</div></div>
+            <div class="shell">
+              <aside class="sidebar"><div class="side-brand"><b>M</b> MoveMyMac</div><div class="nav-group"><div class="nav-item"><span class="nav-icon">✓</span>Open</div><div class="nav-item"><span class="nav-icon">✓</span>Plan</div><div class="nav-item active"><span class="nav-icon">◔</span>Restore</div><div class="nav-item"><span class="nav-icon">○</span>Verify</div></div></aside>
+              <section class="content">
+                <div class="stepper"><span class="done">Open</span><i></i><span class="done">Plan</span><i></i><span class="current">Restore</span><i></i><span>Verify</span><i></i><span>Finish</span></div>
+                <h3>Restoring in a safe order</h3><p class="copy">Rollback is active. MoveMyMac will pause before anything needs your decision.</p>
+                <div class="bar"><span style="width:58%"></span></div>
+                <div class="timeline">
+                  <div class="phase done"><span class="phase-dot">✓</span><span>Identity and SSH permissions</span><span class="pill success">Validated</span></div>
+                  <div class="phase done"><span class="phase-dot">✓</span><span>Git and shell configuration</span><span class="pill success">Validated</span></div>
+                  <div class="phase active"><span class="phase-dot">••</span><span>Homebrew tools · 18 of 31</span><span class="pill blue">Installing</span></div>
+                  <div class="phase"><span class="phase-dot">4</span><span>Warp and editor settings</span><span class="pill">Queued</span></div>
+                  <div class="phase"><span class="phase-dot">5</span><span>Reauthentication and final checks</span><span class="pill">Queued</span></div>
+                </div>
+                <div class="footer-actions"><span class="hint">58% · 2m estimated · no secret values shown</span><span><span class="btn">Pause</span> <span class="btn danger">Stop and roll back</span></span></div>
+              </section>
+            </div>
+          </div>
+        </figure>
+
+        <figure class="frame">
+          <figcaption><span class="frame-title">Verification and finish</span><span class="frame-id">C5</span></figcaption>
+          <div class="mac">
+            <div class="titlebar"><div class="traffic"><i></i><i></i><i></i></div><div class="window-title">Migration verified</div><div class="session">● Protected</div></div>
+            <div class="shell">
+              <aside class="sidebar"><div class="side-brand"><b>M</b> MoveMyMac</div><div class="nav-group"><div class="nav-item"><span class="nav-icon">✓</span>Open</div><div class="nav-item"><span class="nav-icon">✓</span>Plan</div><div class="nav-item"><span class="nav-icon">✓</span>Restore</div><div class="nav-item active"><span class="nav-icon">✓</span>Verify</div></div></aside>
+              <section class="content">
+                <div class="kicker" style="color:var(--success)">Verified restoration</div><h3>Your developer setup arrived safely</h3><p class="copy">34 items passed validation. Four acknowledged actions remain; two macOS-only items were skipped.</p>
+                <div class="metrics"><div class="metric"><strong>34</strong><span>verified</span></div><div class="metric"><strong>4</strong><span>needs action</span></div><div class="metric"><strong>2</strong><span>skipped</span></div><div class="metric"><strong>7 days</strong><span>rollback available</span></div></div>
+                <div class="card-grid">
+                  <div class="card success"><div class="card-title">SSH and Git <span class="pill success">Working</span></div><p>Permissions and identity checks passed.</p></div>
+                  <div class="card warning"><div class="card-title">Warp <span class="pill warning">Sign in</span></div><p>Settings restored; app-native sync needs authentication.</p></div>
+                  <div class="card"><div class="card-title">Rollback</div><p>Encrypted before-state retained until you confirm or seven days pass.</p></div>
+                  <div class="card"><div class="card-title">Old Mac</div><p>Do not erase it until you finish the remaining checklist.</p></div>
+                </div>
+                <div class="footer-actions"><span class="btn">View receipt</span><span class="btn primary">Make this my active Mac</span></div>
+              </section>
+            </div>
+          </div>
+        </figure>
+      </div>
+    </section>
+
+    <section class="pack" data-pack="D" id="pack-d">
+      <div class="pack-head"><div><h2>Pack D · Manage and maintain</h2><p>Inspect local history, system connectors, durable security settings, and the active license.</p></div><span class="pack-count">4 screens</span></div>
+      <div class="board">
+        <figure class="frame">
+          <figcaption><span class="frame-title">Migration history</span><span class="frame-id">D1</span></figcaption>
+          <div class="mac">
+            <div class="titlebar"><div class="traffic"><i></i><i></i><i></i></div><div class="window-title">History</div><div class="session">● Protected</div></div>
+            <div class="shell">
+              <aside class="sidebar"><div class="side-brand"><b>M</b> MoveMyMac</div><div class="nav-group"><div class="nav-item"><span class="nav-icon">⌂</span>Home</div><div class="nav-item active"><span class="nav-icon">◴</span>History</div><div class="nav-item"><span class="nav-icon">⌁</span>Connectors</div><div class="nav-item"><span class="nav-icon">⚙</span>Settings</div></div></aside>
+              <section class="content">
+                <h3>Migration history</h3><p class="copy">Receipts stay on this Mac and never contain secret values.</p>
+                <div class="table">
+                  <div class="row header" style="grid-template-columns:1.5fr .9fr .8fr .8fr"><span>Project</span><span>Intent</span><span>Date</span><span>Status</span></div>
+                  <div class="row" style="grid-template-columns:1.5fr .9fr .8fr .8fr"><span class="item-name">Developer-Mac<span class="sub">Intel → Apple Silicon</span></span><span>New Mac</span><span>Aug 6</span><span class="pill success">Verified</span></div>
+                  <div class="row" style="grid-template-columns:1.5fr .9fr .8fr .8fr"><span class="item-name">Repair snapshot<span class="sub">Apple Silicon</span></span><span>Repair</span><span>Jun 18</span><span class="pill warning">2 actions</span></div>
+                  <div class="row" style="grid-template-columns:1.5fr .9fr .8fr .8fr"><span class="item-name">Environment audit<span class="sub">No bundle created</span></span><span>Audit</span><span>May 02</span><span class="pill">Complete</span></div>
+                </div>
+                <div class="notice"><span>⌁</span><span>Deleting history does not delete bundles stored elsewhere. Bundle cleanup is always a separate action.</span></div>
+              </section>
+            </div>
+          </div>
+        </figure>
+
+        <figure class="frame">
+          <figcaption><span class="frame-title">Connectors</span><span class="frame-id">D2</span></figcaption>
+          <div class="mac">
+            <div class="titlebar"><div class="traffic"><i></i><i></i><i></i></div><div class="window-title">Connectors</div><div class="session">Protected</div></div>
+            <div class="shell">
+              <aside class="sidebar"><div class="side-brand"><b>M</b> MoveMyMac</div><div class="nav-group"><div class="nav-item"><span class="nav-icon">⌂</span>Home</div><div class="nav-item"><span class="nav-icon">◴</span>History</div><div class="nav-item active"><span class="nav-icon">⌁</span>Connectors</div><div class="nav-item"><span class="nav-icon">⚙</span>Settings</div></div></aside>
+              <section class="content">
+                <h3>Connectors</h3><p class="copy">MoveMyMac uses system-managed access. Connectors run only when you choose them.</p>
+                <h4 style="margin-top:16px">Credential providers</h4>
+                <div class="card-grid">
+                  <div class="card success"><div class="card-title">Apple Passwords <span class="pill success">Available</span></div><p>Provides only the credential you approve through AutoFill. MoveMyMac cannot browse your vault.</p></div>
+                  <div class="card"><div class="card-title">Other password managers <span class="pill">System managed</span></div><p>Compatible enabled providers appear in the macOS credential picker.</p></div>
+                </div>
+                <h4 style="margin-top:16px">Storage</h4>
+                <div class="card-grid three">
+                  <div class="card success"><div class="card-title">iCloud Drive <span class="pill success">Available</span></div><p>Read/write when selected.</p></div>
+                  <div class="card"><div class="card-title">External drives</div><p>Available when connected.</p></div>
+                  <div class="card"><div class="card-title">Other providers</div><p>Choose through Finder.</p></div>
+                </div>
+              </section>
+            </div>
+          </div>
+        </figure>
+
+        <figure class="frame">
+          <figcaption><span class="frame-title">Security and recipes</span><span class="frame-id">D3</span></figcaption>
+          <div class="mac">
+            <div class="titlebar"><div class="traffic"><i></i><i></i><i></i></div><div class="window-title">Settings</div><div class="session">Protected</div></div>
+            <div class="shell">
+              <aside class="sidebar"><div class="side-brand"><b>M</b> MoveMyMac</div><div class="nav-group"><div class="nav-label">Settings</div><div class="nav-item"><span class="nav-icon">◉</span>General</div><div class="nav-item active"><span class="nav-icon">⌾</span>Security</div><div class="nav-item"><span class="nav-icon">◇</span>Recipes</div><div class="nav-item"><span class="nav-icon">⌁</span>License</div><div class="nav-item"><span class="nav-icon">…</span>Diagnostics</div></div></aside>
+              <section class="content">
+                <h3>Security</h3>
+                <div class="table">
+                  <div class="row" style="grid-template-columns:1.4fr 1fr auto"><span class="item-name">Protected session<span class="sub">Locks after inactivity, sleep, or user switch</span></span><span>5 minutes</span><span class="pill success">On</span></div>
+                  <div class="row" style="grid-template-columns:1.4fr 1fr auto"><span class="item-name">Rollback retention<span class="sub">Encrypted destination before-state</span></span><span>7 days</span><span class="btn">Change</span></div>
+                  <div class="row" style="grid-template-columns:1.4fr 1fr auto"><span class="item-name">Persistent exclusions<span class="sub">Never scan these locations</span></span><span>3 rules</span><span class="btn">Review</span></div>
+                  <div class="row" style="grid-template-columns:1.4fr 1fr auto"><span class="item-name">Signed recipe updates<span class="sub">Stable catalog · previous version retained</span></span><span>Automatic</span><span class="pill success">Current</span></div>
+                  <div class="row" style="grid-template-columns:1.4fr 1fr auto"><span class="item-name">Diagnostics<span class="sub">Review every redacted package before sending</span></span><span>Opt-in</span><span class="pill">Off</span></div>
+                </div>
+                <div class="notice"><span>✓</span><span>MoveMyMac will always ask again before export, secret reveal, restore, rollback, or license transfer.</span></div>
+              </section>
+            </div>
+          </div>
+        </figure>
+
+        <figure class="frame">
+          <figcaption><span class="frame-title">License</span><span class="frame-id">D4</span></figcaption>
+          <div class="mac">
+            <div class="titlebar"><div class="traffic"><i></i><i></i><i></i></div><div class="window-title">License</div><div class="session">Offline valid</div></div>
+            <div class="shell">
+              <aside class="sidebar"><div class="side-brand"><b>M</b> MoveMyMac</div><div class="nav-group"><div class="nav-label">Settings</div><div class="nav-item"><span class="nav-icon">◉</span>General</div><div class="nav-item"><span class="nav-icon">⌾</span>Security</div><div class="nav-item"><span class="nav-icon">◇</span>Recipes</div><div class="nav-item active"><span class="nav-icon">⌁</span>License</div><div class="nav-item"><span class="nav-icon">…</span>Diagnostics</div></div></aside>
+              <section class="content">
+                <div class="kicker">Personal license</div><h3>This is your active Mac</h3><p class="copy">Your purchase is linked privately through Apple and can move after a verified restoration.</p>
+                <div class="card success"><div class="card-title">Qwami’s MacBook Pro <span class="pill success">Active</span></div><p>Direct website license · MoveMyMac 1.x · Signed offline entitlement valid</p></div>
+                <div class="card-grid">
+                  <div class="card"><div class="card-title">Works offline</div><p>No periodic license check is required on this active Mac.</p></div>
+                  <div class="card"><div class="card-title">Moves after restore</div><p>Confirm the new Mac only after its migration is verified.</p></div>
+                </div>
+                <div class="notice"><span>i</span><span>License identity and bundle recovery are separate. Apple authentication cannot decrypt your bundle.</span></div>
+                <div class="footer-actions"><span class="btn">View purchase details</span><span class="btn disabled">Transfer after verified restore</span></div>
+              </section>
+            </div>
+          </div>
+        </figure>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const filterButtons = [...document.querySelectorAll('[data-filter]')];
+    const packs = [...document.querySelectorAll('[data-pack]')];
+    const appearanceButton = document.querySelector('#appearance');
+
+    filterButtons.forEach((button) => {
+      button.addEventListener('click', () => {
+        const filter = button.dataset.filter;
+        filterButtons.forEach((candidate) => candidate.setAttribute('aria-pressed', String(candidate === button)));
+        packs.forEach((pack) => { pack.hidden = filter !== 'all' && pack.dataset.pack !== filter; });
+      });
+    });
+
+    appearanceButton.addEventListener('click', () => {
+      const enabled = document.body.classList.toggle('dark-apps');
+      appearanceButton.setAttribute('aria-pressed', String(enabled));
+      appearanceButton.textContent = enabled ? 'Light app' : 'Dark app';
+    });
+  </script>
+</body>
+</html>
