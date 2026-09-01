@@ -31,26 +31,32 @@ Global options:
 ### `iniza scan`
 
 ```text
-iniza scan [ROOT ...]
-  --deep
-  --exclude <PATH_OR_PATTERN>...
-  --recipe <ssh|git|shell|custom>...
-  --project-root <PATH>...
+iniza scan <ROOT>
+  --exclude <RELATIVE_PATH>...
+  --optional <RELATIVE_PATH>...
+  --recipe <NAME>...
+  --destination <BUNDLE_PATH>
+  --publication-policy <protect-locally-only|review-separately>
   --output-plan <PATH>
   --cross-mounts
 ```
 
-Default behavior is read-only metadata discovery. `--deep` without a root is invalid. Mount boundaries are not crossed unless explicitly enabled.
+Directory scanning is read-only metadata discovery beneath exactly one explicit approved root. The filesystem root is rejected as too broad. Relative exclusions and Optional classifications remain visible in the Plan. Symbolic links are recorded but never followed. Mount boundaries are recorded and not crossed unless `--cross-mounts` is explicitly enabled. A regular-file source continues to create a development-only fixture Plan for the `fixture` workflow.
 
 ### `iniza plan`
 
 ```text
 iniza plan show [--plan <PATH>]
 iniza plan validate [--plan <PATH>]
+iniza plan approve --plan <PATH> --approved-hash <HASH>
 iniza plan diff <OLD> <NEW>
 ```
 
-`show` renders included, excluded, review, unsupported, and unavailable categories. `validate` emits a stable plan hash.
+`show` renders Included, Excluded, Requires Review, Unsupported, and Unavailable totals together with the Must-Protect blocker and Optional warning totals. The human view may show reviewed relative paths; JSON output emits stable item identifiers and classifications without source roots or relative paths.
+
+`validate` emits the canonical approval hash and reports whether the Plan is unapproved, approved, or stale. `approve` succeeds only when `--approved-hash` exactly matches the current canonical Plan. Approval metadata is stored in the Plan but excluded from the canonical approval hash. Any change to an approval-relevant field makes the stored approval stale and causes validation to exit with the approval-required status.
+
+`diff` explains approval-relevant changes without reading or showing protected content. JSON diff records contain a stable change kind and, for Migration Item changes, the stable item identifier; paths are intentionally omitted.
 
 ### `iniza projects scan`
 

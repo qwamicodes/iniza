@@ -217,15 +217,21 @@ Planned → Preflight → Writing → Validating → Complete
 ### Plan invariants
 
 - Every selected path is beneath an approved root or a known recipe root.
+- Directory Plan schema version 2 records the approved root, each Migration Item and its stable identifier, recipes, exclusions, destination preference, publication policy, and mount-crossing policy.
 - Every item has a Protection Requirement independent of its Disposition; unresolved Must-Protect Items block Owner Dogfood readiness.
+- Every item has exactly one Disposition: Included, Excluded, Requires Review, Unsupported, or Unavailable. Requires Review, Unsupported, and Unavailable Optional items produce warnings instead of Must-Protect blockers.
 - Canonicalization failures remain review items; they are not guessed.
 - Exclusions record origin: built-in, recipe, plan, command line, or user review.
 - Secret values and file contents never enter the plan.
-- Plans have a schema version and stable hash used in receipts.
+- Plans have a schema version and deterministic TOML representation. The canonical approval hash covers every approval-relevant field and excludes only the stored approval metadata.
+- An approval binds the reviewed canonical hash. A mismatched hash is rejected, and editing an approval-relevant field makes an existing approval stale.
+- Human comparison output may identify reviewed relative paths. Machine comparison output uses change kinds and stable Migration Item identifiers so automation does not receive source paths by default.
 
 ### Change detection
 
 Before reading a file, capture identity, size, modification time, and platform-specific file identifier where available. Recheck after capture. Retry bounded times; otherwise mark the item changed and prevent a clean readiness result.
+
+Directory discovery does not follow symbolic links. A mount boundary is a visible Requires Review item unless the Plan explicitly enables traversal. Unreadable roots and items, special files, observations that change during discovery, and failures to inspect an entry remain visible as blocking or warning classifications rather than disappearing from coverage.
 
 ## 9. Recipe system
 

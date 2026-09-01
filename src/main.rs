@@ -1,17 +1,17 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use iniza::{CoreError, InizaCore};
+use iniza::{
+    CoreError, InizaCore, Plan, PlanApprovalState, PlanEngine, PublicationPolicy, ScanRequest,
+};
 
 fn main() -> ExitCode {
     let mut arguments: Vec<String> = std::env::args().skip(1).collect();
-    let machine_output = arguments.first().is_some_and(|value| value == "--json");
-    if machine_output {
-        arguments.remove(0);
-    }
+    let machine_output = remove_global_flag(&mut arguments, "--json");
+    let json_events = remove_global_flag(&mut arguments, "--json-events");
     let command_name = machine_command_name(&arguments);
 
-    match run(arguments, machine_output) {
+    match run(arguments, machine_output, json_events) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             if machine_output {
@@ -24,31 +24,53 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(arguments: Vec<String>, machine_output: bool) -> Result<(), CliError> {
+fn run(arguments: Vec<String>, machine_output: bool, json_events: bool) -> Result<(), CliError> {
     match arguments.as_slice() {
-        [command, source, output_flag, plan]
-            if command == "scan" && output_flag == "--output-plan" =>
+        [command, scan_arguments @ ..] if command == "scan" => {
+            run_scan(scan_arguments, machine_output, json_events)
+        }
+        [command, subcommand, plan_flag, plan]
+            if command == "plan" && subcommand == "show" && plan_flag == "--plan" =>
         {
-            let source = PathBuf::from(source);
             let plan_path = PathBuf::from(plan);
-            print_progress(machine_output, &format!("Scanning {}", source.display()));
-            let plan = InizaCore
-                .scan_explicit_file(&source)
-                .map_err(|error| CliError::Operation(error.to_string()))?;
-            plan.write_to(&plan_path)
+            print_progress(machine_output, &format!("Reviewing {}", plan_path.display()));
+            let plan = Plan::read_from(&plan_path)
                 .map_err(|error| CliError::Operation(error.to_string()))?;
             if machine_output {
-                print_machine_success(
-                    "scan",
-                    &format!(
-                        "{{\"plan_path\":{},\"source_name\":{},\"logical_size\":{}}}",
-                        json_string(&plan_path.to_string_lossy()),
-                        json_string(&plan.source_name),
-                        plan.logical_size
-                    ),
+                print_machine_value("plan show", plan_review_value(&plan));
+            } else {
+                print_plan_review(&plan)?;
+            }
+            Ok(())
+        }
+        [command, subcommand, original, revised]
+            if command == "plan" && subcommand == "diff" =>
+        {
+            let original = Plan::read_from(&PathBuf::from(original))
+                .map_err(|error| CliError::Operation(error.to_string()))?;
+            let revised = Plan::read_from(&PathBuf::from(revised))
+                .map_err(|error| CliError::Operation(error.to_string()))?;
+            let comparison = original.compare(&revised);
+            if machine_output {
+                let changes = comparison
+                    .changes()
+                    .iter()
+                    .map(|change| {
+                        serde_json::json!({
+                            "kind": change.kind().as_str(),
+                            "item_id": change.item_id(),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                print_machine_value(
+                    "plan diff",
+                    serde_json::json!({
+                        "changed": !comparison.is_empty(),
+                        "changes": changes,
+                    }),
                 );
             } else {
-                println!("Plan created: {}", plan_path.display());
+                println!("{}", comparison.to_human_text());
             }
             Ok(())
         }
@@ -60,19 +82,74 @@ fn run(arguments: Vec<String>, machine_output: bool) -> Result<(), CliError> {
                 machine_output,
                 &format!("Validating {}", plan_path.display()),
             );
-            InizaCore
+            let plan = InizaCore
                 .validate_plan(&plan_path)
                 .map_err(|error| CliError::Operation(error.to_string()))?;
+            if plan.is_directory_plan()
+                && plan
+                    .approval_state()
+                    .map_err(|error| CliError::Operation(error.to_string()))?
+                    == PlanApprovalState::Stale
+            {
+                return Err(CliError::Approval(
+                    "Plan approval is stale because approval-relevant content changed".to_owned(),
+                ));
+            }
             if machine_output {
-                print_machine_success(
-                    "plan validate",
-                    &format!(
-                        "{{\"plan_path\":{}}}",
-                        json_string(&plan_path.to_string_lossy())
-                    ),
-                );
+                if plan.is_directory_plan() {
+                    print_machine_value(
+                        "plan validate",
+                        serde_json::json!({
+                            "approval_hash": plan.approval_hash().map_err(|error| CliError::Operation(error.to_string()))?,
+                            "approval_state": format!("{:?}", plan.approval_state().map_err(|error| CliError::Operation(error.to_string()))?).to_ascii_lowercase(),
+                        }),
+                    );
+                } else {
+                    print_machine_success(
+                        "plan validate",
+                        &format!(
+                            "{{\"plan_path\":{}}}",
+                            json_string(&plan_path.to_string_lossy())
+                        ),
+                    );
+                }
             } else {
                 println!("Plan valid: {}", plan_path.display());
+                if plan.is_directory_plan() {
+                    println!(
+                        "Approval hash: {}",
+                        plan.approval_hash()
+                            .map_err(|error| CliError::Operation(error.to_string()))?
+                    );
+                    println!(
+                        "Approval: {:?}",
+                        plan.approval_state()
+                            .map_err(|error| CliError::Operation(error.to_string()))?
+                    );
+                }
+            }
+            Ok(())
+        }
+        [command, subcommand, plan_flag, plan, hash_flag, approved_hash]
+            if command == "plan"
+                && subcommand == "approve"
+                && plan_flag == "--plan"
+                && hash_flag == "--approved-hash" =>
+        {
+            let plan_path = PathBuf::from(plan);
+            let mut plan = Plan::read_from(&plan_path)
+                .map_err(|error| CliError::Operation(error.to_string()))?;
+            plan.approve(approved_hash)
+                .map_err(|error| CliError::Approval(error.to_string()))?;
+            plan.write_to(&plan_path)
+                .map_err(|error| CliError::Operation(error.to_string()))?;
+            if machine_output {
+                print_machine_value(
+                    "plan approve",
+                    serde_json::json!({"approved_hash": approved_hash}),
+                );
+            } else {
+                println!("Plan approved: {approved_hash}");
             }
             Ok(())
         }
@@ -183,15 +260,175 @@ fn run(arguments: Vec<String>, machine_output: bool) -> Result<(), CliError> {
             unreachable!("encrypted Bundle inspection is not implemented")
         }
         _ => Err(CliError::Usage(
-            "usage: iniza scan <SOURCE> --output-plan <PLAN> | iniza plan validate --plan <PLAN> | iniza inspect <BUNDLE> | iniza fixture pack --plan <PLAN> --output <PATH.iniza-fixture> | iniza fixture inspect <PATH.iniza-fixture> | iniza fixture restore <PATH.iniza-fixture> --to <NEW_DESTINATION>"
+            "usage: iniza scan <SOURCE> --output-plan <PLAN> [DIRECTORY PLAN OPTIONS] | iniza plan show --plan <PLAN> | iniza plan validate --plan <PLAN> | iniza plan approve --plan <PLAN> --approved-hash <HASH> | iniza plan diff <OLD> <NEW> | iniza inspect <BUNDLE> | iniza fixture pack --plan <PLAN> --output <PATH.iniza-fixture> | iniza fixture inspect <PATH.iniza-fixture> | iniza fixture restore <PATH.iniza-fixture> --to <NEW_DESTINATION>"
                 .to_owned(),
         )),
     }
 }
 
+fn run_scan(arguments: &[String], machine_output: bool, json_events: bool) -> Result<(), CliError> {
+    let source = arguments
+        .first()
+        .map(PathBuf::from)
+        .ok_or_else(scan_usage)?;
+    let mut output_plan = None;
+    let mut exclusions = Vec::new();
+    let mut optional_items = Vec::new();
+    let mut recipes = Vec::new();
+    let mut destination = None;
+    let mut publication_policy = PublicationPolicy::ProtectLocallyOnly;
+    let mut cross_mounts = false;
+    let mut index = 1;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "--output-plan" => {
+                output_plan = Some(PathBuf::from(
+                    arguments.get(index + 1).ok_or_else(scan_usage)?,
+                ));
+                index += 2;
+            }
+            "--exclude" => {
+                exclusions.push(PathBuf::from(
+                    arguments.get(index + 1).ok_or_else(scan_usage)?,
+                ));
+                index += 2;
+            }
+            "--optional" => {
+                optional_items.push(PathBuf::from(
+                    arguments.get(index + 1).ok_or_else(scan_usage)?,
+                ));
+                index += 2;
+            }
+            "--recipe" => {
+                recipes.push(arguments.get(index + 1).ok_or_else(scan_usage)?.clone());
+                index += 2;
+            }
+            "--destination" => {
+                destination = Some(PathBuf::from(
+                    arguments.get(index + 1).ok_or_else(scan_usage)?,
+                ));
+                index += 2;
+            }
+            "--publication-policy" => {
+                publication_policy = match arguments.get(index + 1).map(String::as_str) {
+                    Some("protect-locally-only") => PublicationPolicy::ProtectLocallyOnly,
+                    Some("review-separately") => PublicationPolicy::ReviewSeparately,
+                    _ => return Err(scan_usage()),
+                };
+                index += 2;
+            }
+            "--cross-mounts" => {
+                cross_mounts = true;
+                index += 1;
+            }
+            _ => return Err(scan_usage()),
+        }
+    }
+    let plan_path = output_plan.ok_or_else(scan_usage)?;
+    print_progress(
+        machine_output || json_events,
+        &format!("Scanning {}", source.display()),
+    );
+    if json_events {
+        print_json_event("scan-started", serde_json::json!({}));
+    }
+    let metadata = std::fs::symlink_metadata(&source).map_err(|error| {
+        CliError::Operation(format!(
+            "could not inspect approved source at {}: {error}",
+            source.display()
+        ))
+    })?;
+    let plan = if metadata.is_dir() {
+        let mut request = ScanRequest::for_directory(&source)
+            .with_cross_mounts(cross_mounts)
+            .with_publication_policy(publication_policy);
+        for exclusion in exclusions {
+            request = request.exclude(exclusion);
+        }
+        for optional_item in optional_items {
+            request = request.mark_optional(optional_item);
+        }
+        for recipe in recipes {
+            request = request.with_recipe(recipe);
+        }
+        if let Some(destination) = destination {
+            request = request.with_destination_preference(destination);
+        }
+        PlanEngine::local()
+            .scan(request)
+            .map_err(|error| CliError::Operation(error.to_string()))?
+    } else {
+        if !exclusions.is_empty()
+            || !optional_items.is_empty()
+            || !recipes.is_empty()
+            || destination.is_some()
+            || publication_policy != PublicationPolicy::ProtectLocallyOnly
+            || cross_mounts
+        {
+            return Err(CliError::Usage(
+                "directory scan options require a directory source".to_owned(),
+            ));
+        }
+        InizaCore
+            .scan_explicit_file(&source)
+            .map_err(|error| CliError::Operation(error.to_string()))?
+    };
+    plan.write_to(&plan_path)
+        .map_err(|error| CliError::Operation(error.to_string()))?;
+    if json_events {
+        print_json_event(
+            "scan-completed",
+            serde_json::json!({"item_count": plan.items().len()}),
+        );
+    }
+    if machine_output {
+        print_machine_success(
+            "scan",
+            &format!(
+                "{{\"plan_path\":{},\"source_name\":{},\"logical_size\":{}}}",
+                json_string(&plan_path.to_string_lossy()),
+                json_string(&plan.source_name),
+                plan.logical_size
+            ),
+        );
+    } else {
+        println!("Plan created: {}", plan_path.display());
+    }
+    Ok(())
+}
+
+fn scan_usage() -> CliError {
+    CliError::Usage(
+        "usage: iniza scan <SOURCE> --output-plan <PLAN> [--exclude <RELATIVE_PATH>] [--optional <RELATIVE_PATH>] [--recipe <NAME>] [--destination <BUNDLE_PATH>] [--publication-policy <protect-locally-only|review-separately>] [--cross-mounts]"
+            .to_owned(),
+    )
+}
+
 fn print_progress(machine_output: bool, message: &str) {
     if !machine_output {
         eprintln!("{message}");
+    }
+}
+
+fn print_json_event(event: &str, fields: serde_json::Value) {
+    let mut value = serde_json::json!({
+        "schema_version": 1,
+        "event": event,
+    });
+    if let (Some(target), Some(fields)) = (value.as_object_mut(), fields.as_object()) {
+        for (key, value) in fields {
+            target.insert(key.clone(), value.clone());
+        }
+    }
+    eprintln!("{value}");
+}
+
+fn remove_global_flag(arguments: &mut Vec<String>, flag: &str) -> bool {
+    if let Some(position) = arguments.iter().position(|argument| argument == flag) {
+        arguments.remove(position);
+        true
+    } else {
+        false
     }
 }
 
@@ -201,6 +438,80 @@ fn print_machine_success(command: &str, data: &str) {
         json_string(command),
         data
     );
+}
+
+fn print_machine_value(command: &str, data: serde_json::Value) {
+    println!(
+        "{}",
+        serde_json::json!({
+            "schema_version": 1,
+            "command": command,
+            "status": "success",
+            "data": data,
+            "warnings": [],
+            "errors": [],
+        })
+    );
+}
+
+fn plan_review_value(plan: &Plan) -> serde_json::Value {
+    let coverage = plan.coverage_summary();
+    serde_json::json!({
+        "approval_hash": plan.approval_hash().ok(),
+        "approval_state": plan.approval_state().ok().map(|state| format!("{state:?}").to_ascii_lowercase()),
+        "coverage": {
+            "included": coverage.included,
+            "excluded": coverage.excluded,
+            "requires_review": coverage.requires_review,
+            "unsupported": coverage.unsupported,
+            "unavailable": coverage.unavailable,
+            "must_protect_blocking": coverage.must_protect_blocking,
+            "optional_warnings": coverage.optional_warnings,
+        },
+        "items": plan.items().iter().map(|item| serde_json::json!({
+            "id": item.id,
+            "kind": item.kind,
+            "estimated_size": item.estimated_size,
+            "disposition": item.disposition,
+            "protection_requirement": item.protection_requirement,
+            "explanation": item.explanation,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+fn print_plan_review(plan: &Plan) -> Result<(), CliError> {
+    let coverage = plan.coverage_summary();
+    let approval_hash = plan
+        .approval_hash()
+        .map_err(|error| CliError::Operation(error.to_string()))?;
+    let approval_state = plan
+        .approval_state()
+        .map_err(|error| CliError::Operation(error.to_string()))?;
+    println!("Plan approval hash: {approval_hash}");
+    println!("Approval: {approval_state:?}");
+    println!("Coverage");
+    println!("  Included: {}", coverage.included);
+    println!("  Excluded: {}", coverage.excluded);
+    println!("  Requires Review: {}", coverage.requires_review);
+    println!("  Unsupported: {}", coverage.unsupported);
+    println!("  Unavailable: {}", coverage.unavailable);
+    println!(
+        "  Must-Protect blockers: {}",
+        coverage.must_protect_blocking
+    );
+    println!("  Optional warnings: {}", coverage.optional_warnings);
+    println!("Migration Items");
+    for item in plan.items() {
+        println!(
+            "  {}  {:?}  {:?}  {:?}  {}",
+            item.relative_path.display(),
+            item.kind,
+            item.disposition,
+            item.protection_requirement,
+            item.explanation
+        );
+    }
+    Ok(())
 }
 
 fn print_machine_error(command: &str, error: &CliError) {
@@ -250,6 +561,7 @@ fn map_restore_error(error: CoreError) -> CliError {
 
 #[derive(Debug)]
 enum CliError {
+    Approval(String),
     BundleInvalid(String),
     Conflict(String),
     Usage(String),
@@ -259,6 +571,7 @@ enum CliError {
 impl CliError {
     fn exit_code(&self) -> u8 {
         match self {
+            Self::Approval(_) => 10,
             Self::BundleInvalid(_) => 20,
             Self::Conflict(_) => 50,
             Self::Usage(_) => 2,
@@ -268,6 +581,7 @@ impl CliError {
 
     fn machine_code(&self) -> &'static str {
         match self {
+            Self::Approval(_) => "INIZA-E010",
             Self::BundleInvalid(_) => "INIZA-E020",
             Self::Conflict(_) => "INIZA-E050",
             Self::Usage(_) => "INIZA-E002",
@@ -279,7 +593,8 @@ impl CliError {
 impl std::fmt::Display for CliError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::BundleInvalid(message)
+            Self::Approval(message)
+            | Self::BundleInvalid(message)
             | Self::Conflict(message)
             | Self::Usage(message)
             | Self::Operation(message) => formatter.write_str(message),

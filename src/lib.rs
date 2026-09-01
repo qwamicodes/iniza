@@ -5,9 +5,18 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 
 mod iz1;
+mod plan_comparison;
+mod plan_document;
+mod plan_engine;
 
 pub use iz1::{
     AuthenticatedBundleSummary, Iz1Prototype, RecoveryMethod, RecoverySecret, SealedBundle,
+};
+pub use plan_comparison::{PlanChange, PlanChangeKind, PlanComparison};
+pub use plan_engine::{
+    CoverageSummary, Disposition, MigrationItem, MigrationItemKind, PlanEngine,
+    ProtectionRequirement, PublicationPolicy, ScanRequest, SourceEntryKind, SourceFilesystem,
+    SourceObservation,
 };
 
 pub const FIXTURE_MAGIC: &[u8] = b"INIZA-TEST-FIXTURE-V0\0";
@@ -15,9 +24,31 @@ pub const FIXTURE_MAGIC: &[u8] = b"INIZA-TEST-FIXTURE-V0\0";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Plan {
     pub schema_version: u32,
+    kind: PlanKind,
     pub source_path: PathBuf,
     pub source_name: String,
     pub logical_size: u64,
+    approved_roots: Vec<PathBuf>,
+    items: Vec<MigrationItem>,
+    recipes: Vec<String>,
+    exclusions: Vec<PathBuf>,
+    destination_preference: Option<PathBuf>,
+    publication_policy: PublicationPolicy,
+    cross_mounts: bool,
+    approved_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlanKind {
+    Fixture,
+    Directory,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanApprovalState {
+    Unapproved,
+    Approved,
+    Stale,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,7 +58,54 @@ pub struct FixtureSummary {
 }
 
 impl Plan {
+    pub fn is_directory_plan(&self) -> bool {
+        self.kind == PlanKind::Directory
+    }
+
+    pub fn approved_roots(&self) -> &[PathBuf] {
+        &self.approved_roots
+    }
+
+    pub fn items(&self) -> &[MigrationItem] {
+        &self.items
+    }
+
+    pub fn estimated_logical_size(&self) -> u64 {
+        self.items
+            .iter()
+            .filter(|item| item.kind == MigrationItemKind::RegularFile)
+            .map(|item| item.estimated_size)
+            .sum()
+    }
+
+    pub fn coverage_summary(&self) -> CoverageSummary {
+        CoverageSummary::from_items(&self.items)
+    }
+
+    pub fn recipes(&self) -> &[String] {
+        &self.recipes
+    }
+
+    pub fn exclusions(&self) -> &[PathBuf] {
+        &self.exclusions
+    }
+
+    pub fn destination_preference(&self) -> Option<&Path> {
+        self.destination_preference.as_deref()
+    }
+
+    pub fn publication_policy(&self) -> PublicationPolicy {
+        self.publication_policy
+    }
+
+    pub fn cross_mounts(&self) -> bool {
+        self.cross_mounts
+    }
+
     pub fn write_to(&self, destination: &Path) -> Result<(), CoreError> {
+        if self.kind == PlanKind::Directory {
+            return plan_document::write(self, destination);
+        }
         let source_path = quote_plan_string(&self.source_path.to_string_lossy());
         let source_name = quote_plan_string(&self.source_name);
         let text = format!(
@@ -47,6 +125,9 @@ impl Plan {
             path: source.to_path_buf(),
             source: error,
         })?;
+        if text.contains("plan_kind = \"directory\"") {
+            return plan_document::decode(&text);
+        }
         let mut fields = BTreeMap::new();
         for line in text.lines().filter(|line| !line.trim().is_empty()) {
             let (key, value) = line
@@ -68,10 +149,46 @@ impl Plan {
 
         Ok(Self {
             schema_version,
+            kind: PlanKind::Fixture,
             source_path: PathBuf::from(parse_quoted_string(&fields, "source_path")?),
             source_name: parse_quoted_string(&fields, "source_name")?,
             logical_size: parse_number(&fields, "logical_size")?,
+            approved_roots: Vec::new(),
+            items: Vec::new(),
+            recipes: Vec::new(),
+            exclusions: Vec::new(),
+            destination_preference: None,
+            publication_policy: PublicationPolicy::ProtectLocallyOnly,
+            cross_mounts: false,
+            approved_hash: None,
         })
+    }
+
+    pub fn approval_hash(&self) -> Result<String, CoreError> {
+        plan_document::approval_hash(self)
+    }
+
+    pub fn approve(&mut self, reviewed_hash: &str) -> Result<(), CoreError> {
+        let current = self.approval_hash()?;
+        if reviewed_hash != current {
+            return Err(CoreError::InvalidPlan(
+                "reviewed Plan hash does not match the current Plan".to_owned(),
+            ));
+        }
+        self.approved_hash = Some(current);
+        Ok(())
+    }
+
+    pub fn approval_state(&self) -> Result<PlanApprovalState, CoreError> {
+        match &self.approved_hash {
+            None => Ok(PlanApprovalState::Unapproved),
+            Some(approved) if approved == &self.approval_hash()? => Ok(PlanApprovalState::Approved),
+            Some(_) => Ok(PlanApprovalState::Stale),
+        }
+    }
+
+    pub fn compare(&self, revised: &Self) -> PlanComparison {
+        plan_comparison::compare(self, revised)
     }
 }
 
@@ -177,9 +294,26 @@ impl InizaCore {
 
         Ok(Plan {
             schema_version: 1,
-            source_path,
+            kind: PlanKind::Fixture,
+            source_path: source_path.clone(),
             source_name,
             logical_size: metadata.len(),
+            approved_roots: vec![source_path.clone()],
+            items: vec![MigrationItem {
+                id: plan_engine::stable_item_id(&source_path, Path::new("."), "regular-file"),
+                relative_path: PathBuf::from("."),
+                kind: MigrationItemKind::RegularFile,
+                estimated_size: metadata.len(),
+                disposition: Disposition::Included,
+                protection_requirement: ProtectionRequirement::MustProtect,
+                explanation: "explicitly approved file".to_owned(),
+            }],
+            recipes: Vec::new(),
+            exclusions: Vec::new(),
+            destination_preference: None,
+            publication_policy: PublicationPolicy::ProtectLocallyOnly,
+            cross_mounts: false,
+            approved_hash: None,
         })
     }
 
