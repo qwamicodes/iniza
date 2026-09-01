@@ -12,8 +12,8 @@ use sha2::Sha256;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
-    AuthenticatedBundleSummary, CoreError, Disposition, MigrationItemKind, Plan, PlanApprovalState,
-    RecoveryMethod, RecoverySecret, SealedBundle,
+    AuthenticatedBundleSummary, CoreError, Disposition, ExtendedAttribute, MigrationItemKind, Plan,
+    PlanApprovalState, RecoveryMethod, RecoverySecret, SealedBundle,
 };
 
 const MAGIC: &[u8; 8] = b"INIZAIZ2";
@@ -172,6 +172,7 @@ pub struct BundleSourceObservation {
     pub length: u64,
     pub identity: u64,
     pub change_token: u64,
+    pub posix_mode: Option<u32>,
 }
 
 impl BundleSourceObservation {
@@ -180,13 +181,46 @@ impl BundleSourceObservation {
             length,
             identity,
             change_token,
+            posix_mode: None,
         }
+    }
+
+    pub fn with_posix_mode(mut self, posix_mode: u32) -> Self {
+        self.posix_mode = Some(posix_mode & 0o7777);
+        self
     }
 }
 
 pub trait BundleSource {
     fn observe(&self, path: &Path) -> io::Result<BundleSourceObservation>;
     fn open(&self, path: &Path) -> io::Result<Box<dyn Read>>;
+    fn read_link(&self, path: &Path) -> io::Result<PathBuf> {
+        fs::read_link(path)
+    }
+    fn posix_mode(&self, path: &Path) -> io::Result<Option<u32>> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            Ok(Some(
+                fs::symlink_metadata(path)?.permissions().mode() & 0o7777,
+            ))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            Ok(None)
+        }
+    }
+    fn extended_attributes(
+        &self,
+        path: &Path,
+        no_follow: bool,
+    ) -> io::Result<Vec<ExtendedAttribute>> {
+        crate::platform_metadata::read_extended_attributes(path, no_follow)
+    }
+    fn access_control(&self, path: &Path, no_follow: bool) -> io::Result<Option<String>> {
+        crate::platform_metadata::read_access_control(path, no_follow)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -208,11 +242,11 @@ impl BundleSource for LocalBundleSource {
             let change_token = (metadata.mtime() as u64).rotate_left(29)
                 ^ metadata.mtime_nsec() as u64
                 ^ metadata.len();
-            Ok(BundleSourceObservation::new(
-                metadata.len(),
-                identity,
-                change_token,
-            ))
+            use std::os::unix::fs::PermissionsExt;
+            Ok(
+                BundleSourceObservation::new(metadata.len(), identity, change_token)
+                    .with_posix_mode(metadata.permissions().mode()),
+            )
         }
         #[cfg(not(unix))]
         {
@@ -384,22 +418,26 @@ impl<S: BundleSource, C: DestinationCapacity> BundleEngine<S, C> {
         request: InspectRequest<'_>,
     ) -> Result<AuthenticatedBundleSummary, CoreError> {
         let mut event_sink = None;
+        let mut content_sink = None;
         Ok(open_bundle(
             &request.source,
             request.recovery_secret,
             false,
             &mut event_sink,
+            &mut content_sink,
         )?
         .summary)
     }
 
     pub fn verify(&self, mut request: VerifyRequest<'_>) -> Result<BundleVerification, CoreError> {
         let mut event_sink = request.event_sink.take();
+        let mut content_sink = None;
         let opened = open_bundle(
             &request.source,
             request.recovery_secret,
             true,
             &mut event_sink,
+            &mut content_sink,
         )?;
         Ok(BundleVerification {
             summary: opened.summary,
@@ -485,10 +523,27 @@ fn write_bundle(
             .map_err(|_| invalid_bundle("Bundle contains too many Migration Items"))?;
         let mut chunk_sequences = Vec::new();
         let mut content_hash = None;
-        let outcome = if matches!(
-            item.kind,
-            MigrationItemKind::SymbolicLink | MigrationItemKind::Special
-        ) {
+        let mut posix_mode = None;
+        let mut symlink_target = None;
+        if item.kind == MigrationItemKind::Directory && item.disposition == Disposition::Included {
+            posix_mode = source_adapter
+                .posix_mode(&root.join(&item.relative_path))
+                .ok()
+                .flatten();
+        }
+        let outcome = if item.kind == MigrationItemKind::SymbolicLink {
+            match capture_symbolic_link(source_adapter, &root.join(&item.relative_path)) {
+                Some(target) => {
+                    included_items += 1;
+                    symlink_target = Some(target.to_string_lossy().into_owned());
+                    CaptureOutcome::Included
+                }
+                None => {
+                    unverified_items += 1;
+                    CaptureOutcome::Unverified
+                }
+            }
+        } else if item.kind == MigrationItemKind::Special {
             unsupported_items += 1;
             CaptureOutcome::Unsupported
         } else if item.disposition == Disposition::Included {
@@ -516,6 +571,7 @@ fn write_bundle(
                             .ok_or_else(|| invalid_bundle("Bundle logical size overflowed"))?;
                         chunk_sequences = captured.chunk_sequences;
                         content_hash = captured.content_hash;
+                        posix_mode = captured.posix_mode;
                         if captured.changed {
                             CaptureOutcome::Changed
                         } else {
@@ -545,6 +601,16 @@ fn write_bundle(
                 Disposition::Included => unreachable!("handled above"),
             }
         };
+        let (extended_attributes, access_control_captured, access_control) =
+            if matches!(outcome, CaptureOutcome::Included | CaptureOutcome::Changed) {
+                capture_platform_metadata(
+                    source_adapter,
+                    &root.join(&item.relative_path),
+                    item.kind == MigrationItemKind::SymbolicLink,
+                )
+            } else {
+                (None, None, None)
+            };
         manifest_items.push(ManifestItem {
             id: item.id.clone(),
             relative_path: item.relative_path.to_string_lossy().into_owned(),
@@ -553,6 +619,11 @@ fn write_bundle(
             outcome,
             chunk_sequences,
             content_hash,
+            posix_mode,
+            symlink_target,
+            extended_attributes,
+            access_control_captured,
+            access_control,
         });
         emit_event(
             events,
@@ -569,7 +640,7 @@ fn write_bundle(
 
     let manifest = Manifest {
         marker: "MNF2".to_owned(),
-        schema_version: 1,
+        schema_version: 2,
         source_name: plan.source_name.clone(),
         plan_hash: plan.approval_hash()?,
         logical_size,
@@ -706,8 +777,42 @@ struct CapturedFile {
     logical_size: u64,
     chunk_sequences: Vec<u64>,
     content_hash: Option<String>,
+    posix_mode: Option<u32>,
     changed: bool,
     verified: bool,
+}
+
+fn capture_symbolic_link(source_adapter: &impl BundleSource, source: &Path) -> Option<PathBuf> {
+    for _ in 0..3 {
+        let before = source_adapter.read_link(source).ok()?;
+        let after = source_adapter.read_link(source).ok()?;
+        if before == after {
+            return Some(before);
+        }
+    }
+    None
+}
+
+fn capture_platform_metadata(
+    source_adapter: &impl BundleSource,
+    source: &Path,
+    no_follow: bool,
+) -> (Option<Vec<ExtendedAttribute>>, Option<bool>, Option<String>) {
+    let extended_attributes = match (
+        source_adapter.extended_attributes(source, no_follow),
+        source_adapter.extended_attributes(source, no_follow),
+    ) {
+        (Ok(before), Ok(after)) if before == after => Some(before),
+        _ => None,
+    };
+    let (access_control_captured, access_control) = match (
+        source_adapter.access_control(source, no_follow),
+        source_adapter.access_control(source, no_follow),
+    ) {
+        (Ok(before), Ok(after)) if before == after => (Some(true), before),
+        _ => (Some(false), None),
+    };
+    (extended_attributes, access_control_captured, access_control)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -842,6 +947,7 @@ fn capture_regular_file(
                 logical_size,
                 chunk_sequences,
                 content_hash: Some(content_hasher.finalize().to_hex().to_string()),
+                posix_mode: before.posix_mode,
                 changed,
                 verified: true,
             });
@@ -854,6 +960,7 @@ fn capture_regular_file(
         logical_size: 0,
         chunk_sequences: Vec::new(),
         content_hash: None,
+        posix_mode: None,
         changed,
         verified: false,
     })
@@ -986,6 +1093,16 @@ struct ManifestItem {
     outcome: CaptureOutcome,
     chunk_sequences: Vec<u64>,
     content_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    posix_mode: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    symlink_target: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    extended_attributes: Option<Vec<ExtendedAttribute>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    access_control_captured: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    access_control: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -1069,6 +1186,68 @@ struct OpenedBundle {
     summary: AuthenticatedBundleSummary,
     authenticated_chunks: u64,
     authenticated_bytes: u64,
+    restore_plan: AuthenticatedRestorePlan,
+}
+
+#[derive(Debug)]
+pub(crate) struct AuthenticatedRestorePlan {
+    pub(crate) items: Vec<AuthenticatedRestoreItem>,
+}
+
+#[derive(Debug)]
+pub(crate) struct AuthenticatedRestoreItem {
+    pub(crate) ordinal: u32,
+    pub(crate) relative_path: String,
+    pub(crate) kind: String,
+    pub(crate) estimated_size: u64,
+    pub(crate) selected: bool,
+    pub(crate) posix_mode: Option<u32>,
+    pub(crate) symlink_target: Option<String>,
+    pub(crate) extended_attributes: Option<Vec<ExtendedAttribute>>,
+    pub(crate) access_control_captured: Option<bool>,
+    pub(crate) access_control: Option<String>,
+}
+
+pub(crate) trait AuthenticatedContentSink {
+    fn write_chunk(
+        &mut self,
+        item_ordinal: u32,
+        chunk_ordinal: u32,
+        content: &[u8],
+    ) -> Result<(), CoreError>;
+}
+
+pub(crate) fn authenticate_restore_plan(
+    source: &Path,
+    recovery_secret: &RecoverySecret,
+) -> Result<AuthenticatedRestorePlan, CoreError> {
+    let mut events = None;
+    let mut content_sink = None;
+    Ok(open_bundle(
+        source,
+        recovery_secret,
+        false,
+        &mut events,
+        &mut content_sink,
+    )?
+    .restore_plan)
+}
+
+pub(crate) fn stream_authenticated_content(
+    source: &Path,
+    recovery_secret: &RecoverySecret,
+    sink: &mut dyn AuthenticatedContentSink,
+) -> Result<u64, CoreError> {
+    let mut events = None;
+    let mut content_sink = Some(sink);
+    Ok(open_bundle(
+        source,
+        recovery_secret,
+        true,
+        &mut events,
+        &mut content_sink,
+    )?
+    .authenticated_bytes)
 }
 
 fn open_bundle(
@@ -1076,6 +1255,7 @@ fn open_bundle(
     recovery_secret: &RecoverySecret,
     verify_content: bool,
     events: &mut Option<&mut dyn BundleEventSink>,
+    content_sink: &mut Option<&mut dyn AuthenticatedContentSink>,
 ) -> Result<OpenedBundle, CoreError> {
     if verify_content {
         emit_event(events, BundleEvent::VerificationStarted);
@@ -1217,6 +1397,9 @@ fn open_bundle(
                         .entry(record.item_ordinal)
                         .or_default()
                         .update(&plaintext);
+                    if let Some(sink) = content_sink.as_deref_mut() {
+                        sink.write_chunk(record.item_ordinal, record.chunk_ordinal, &plaintext)?;
+                    }
                     emit_event(
                         events,
                         BundleEvent::ChunkVerified {
@@ -1276,6 +1459,31 @@ fn open_bundle(
             },
         );
     }
+    let restore_plan = AuthenticatedRestorePlan {
+        items: manifest
+            .items
+            .iter()
+            .enumerate()
+            .map(|(ordinal, item)| {
+                Ok(AuthenticatedRestoreItem {
+                    ordinal: u32::try_from(ordinal)
+                        .map_err(|_| invalid_bundle("Bundle contains too many Migration Items"))?,
+                    relative_path: item.relative_path.clone(),
+                    kind: item.kind.clone(),
+                    estimated_size: item.estimated_size,
+                    selected: matches!(
+                        item.outcome,
+                        CaptureOutcome::Included | CaptureOutcome::Changed
+                    ),
+                    posix_mode: item.posix_mode,
+                    symlink_target: item.symlink_target.clone(),
+                    extended_attributes: item.extended_attributes.clone(),
+                    access_control_captured: item.access_control_captured,
+                    access_control: item.access_control.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>, CoreError>>()?,
+    };
     Ok(OpenedBundle {
         summary: AuthenticatedBundleSummary {
             source_name: manifest.source_name,
@@ -1289,11 +1497,12 @@ fn open_bundle(
         },
         authenticated_chunks,
         authenticated_bytes,
+        restore_plan,
     })
 }
 
 fn validate_manifest(manifest: &Manifest, index: &[IndexEntry]) -> Result<(), CoreError> {
-    if manifest.marker != "MNF2" || manifest.schema_version != 1 {
+    if manifest.marker != "MNF2" || !matches!(manifest.schema_version, 1 | 2) {
         return Err(invalid_bundle("Bundle manifest version is unsupported"));
     }
     if manifest.source_name.is_empty() || manifest.source_name.len() > 4096 {

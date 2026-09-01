@@ -139,9 +139,9 @@ fn mixed_synthetic_directory_streams_without_plaintext_reaching_bundle_storage()
         .verify(VerifyRequest::new(&bundle, sealed.offline_recovery_key()))
         .expect("every selected chunk should authenticate");
 
-    assert_eq!(verified.summary.included_items, 7);
+    assert_eq!(verified.summary.included_items, 8);
     assert_eq!(verified.summary.changed_items, 0);
-    assert_eq!(verified.summary.unsupported_items, 1);
+    assert_eq!(verified.summary.unsupported_items, 0);
     assert_eq!(verified.summary.unverified_items, 0);
     assert_eq!(verified.authenticated_chunks, 8);
     assert_eq!(

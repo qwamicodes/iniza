@@ -9,7 +9,9 @@ mod iz1;
 mod plan_comparison;
 mod plan_document;
 mod plan_engine;
+mod platform_metadata;
 mod project_audit;
+mod restore;
 
 pub use bundle::{
     BundleEngine, BundleEvent, BundleEventSink, BundleSource, BundleSourceObservation,
@@ -25,11 +27,16 @@ pub use plan_engine::{
     ProtectionRequirement, PublicationPolicy, ScanRequest, SourceEntryKind, SourceFilesystem,
     SourceObservation,
 };
+pub use platform_metadata::ExtendedAttribute;
 pub use project_audit::{
     GitLargeFileStorageAudit, GitProcess, GitProcessOutput, IgnoredCandidate, IgnoredReview,
     InstalledGit, ProjectAudit, ProjectAuditEngine, ProjectAuditReport, ProjectAuditRequest,
     ProjectHead, ProjectKind, ProjectLocalState, ProjectSubmodule, RemoteCheckOutcome,
     SanitizedRemote,
+};
+pub use restore::{
+    RestoreCancellation, RestoreEngine, RestoreEvent, RestoreEventSink, RestoreReport,
+    RestoreRequest, RestoreState,
 };
 
 pub const FIXTURE_MAGIC: &[u8] = b"INIZA-TEST-FIXTURE-V0\0";

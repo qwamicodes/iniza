@@ -77,6 +77,7 @@ Cross-process Recovery Secret storage is intentionally deferred to COKS-33 and C
 
 ## Consequences
 
+- ADR 0007 supersedes this record's original symbolic-link limitation and Manifest schema detail for Restore. IZ2 Manifest revision 2 authenticates safe symbolic-link targets and bounded platform metadata while revision 1 remains readable. This does not change IZ2 public framing, record encryption, Index, Completion, or the synthetic-and-duplicated-data restriction.
 - Crash-resumable checkpoints remain COKS-30; Restore remains COKS-29.
 - Offline Recovery Key persistence remains COKS-33; Vaultwarden remains COKS-36.
 - Hard-link finalization, directory durability, broader platform metadata, fuzzing, advisories, and independent cryptographic/parser/key-lifecycle review remain gates before Owner Dogfood.
