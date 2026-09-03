@@ -2,7 +2,7 @@
 
 ## What was implemented
 
-The Rust core can authenticate an IZ2 Bundle and restore synthetic or duplicated content into an absent or empty destination. It stages and validates content before atomic no-overwrite publication, restores supported metadata, disables hooks and executable content, and can pause and resume through an authenticated path-free journal.
+The Rust core can authenticate an IZ2 Bundle and restore synthetic or duplicated content into an absent or empty destination. Both authentication passes remain bound to one no-follow Bundle file handle. Restore creates restrictive transaction state, performs bounded exact-tree validation, and publishes without overwrite through retained directory capabilities. Materialization and finalization use bounded, identity-checked descriptor windows instead of keeping one open file per Migration Item. Restore applies supported metadata without path traversal, disables hooks and executable content, revalidates each published candidate's authenticated bytes and restrictive mode before applying its reviewed final mode, and can resume from a staged pause, a publication pause, or an abrupt publication interruption through an authenticated path-free journal.
 
 ## Prerequisites
 
@@ -54,9 +54,31 @@ It should pass, proving the competing bytes remain unchanged and transaction con
 
 ```sh
 cargo test --test restore_transaction destination_identity_change_is_rejected_before_publication -- --exact
+cargo test --test restore_transaction destination_substitution_between_identity_and_open_is_rejected_before_staging -- --exact
 ```
 
 It should pass without placing content through the substituted destination path.
+
+Then exercise staged-content containment and publication recovery:
+
+```sh
+cargo test --test restore_transaction staged_content_substitution_with_the_same_size_is_rejected_before_publication -- --exact
+cargo test --test restore_transaction restore_rejects_an_unplanned_item_injected_into_staging -- --exact
+cargo test --test restore_transaction owner_can_resume_a_restore_paused_during_publication -- --exact
+cargo test --test restore_transaction owner_can_resume_after_an_abrupt_materialization_interruption -- --exact
+cargo test --test restore_transaction owner_can_resume_after_an_abrupt_publication_interruption -- --exact
+cargo test --test restore_transaction restore_reauthenticates_each_publication_candidate_before_checkpointing_it -- --exact
+cargo test --test restore_transaction restore_rejects_a_publication_candidate_made_executable_before_checkpointing_it -- --exact
+cargo test --test restore_transaction owner_can_resume_only_the_matching_authenticated_paused_restore -- --exact
+cargo test --test restore_transaction restore_preserves_a_reviewed_mode_that_the_destination_owner_cannot_read -- --exact
+cargo test --test restore_transaction restore_stops_enumerating_a_staged_tree_beyond_the_path_depth_limit -- --exact
+cargo test --test restore_transaction owner_can_resume_when_interrupted_final_mode_application_made_a_file_unreadable -- --exact
+cargo test --test restore_transaction restore_rejects_a_publication_candidate_replaced_after_its_checkpoint -- --exact
+cargo test --test restore_transaction restore_reports_an_existing_nonempty_destination_as_a_conflict -- --exact
+cargo test --test restore_transaction restore_handles_more_planned_items_than_the_open_file_limit -- --exact
+```
+
+All tests should pass. They prove that altered, extra, or overdeep staged content is never published, a substituted destination is rejected before staging, publication candidates are reopened without following symbolic links and must keep their authenticated stable identity through finalization, the number of planned items can exceed a deliberately low open-file limit, reviewed owner-unreadable modes can be applied after validation and safely normalized for authenticated Resume, non-empty destinations produce a conflict without changing unrelated bytes, non-canonical or unauthenticated journals are rejected, interrupted rollback state is recoverable, and cooperative or abrupt interruption can resume to exact authenticated content. The materialization test deliberately uses a disposable destination path containing spaces.
 
 ## Automated verification
 
@@ -65,8 +87,8 @@ Run the focused and repository-wide checks:
 ```sh
 cargo test --test restore_transaction
 cargo test --test multifile_bundle
-cargo test --all-targets
-cargo clippy --all-targets -- -D warnings
+cargo test --all-targets --all-features
+cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --check
 git diff --check
 ```
@@ -97,5 +119,5 @@ If a paused automated test is interrupted, remove only its generated `iniza-rest
 - The supported command-line Restore and Recovery Secret acquisition workflow is deferred to COKS-33 and COKS-36; this walkthrough uses the reusable Rust core example.
 - Resume rebuilds authenticated staging rather than continuing within a partially written file.
 - macOS metadata is implemented; other platforms report unsupported metadata.
-- Full descriptor-relative child traversal and metadata application, filesystem durability certification, fuzzing, and independent security review remain Owner Dogfood gates.
+- Capability-relative traversal, metadata application, publication, recovery, and cleanup are implemented. Filesystem durability certification across supported filesystem types, fuzzing, and independent security review remain Owner Dogfood gates.
 - In-place merge, overwrite, automatic execution, and machine-erasure decisions are intentionally unsupported.

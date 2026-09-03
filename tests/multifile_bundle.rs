@@ -99,6 +99,45 @@ fn owner_can_pack_inspect_and_fully_verify_an_approved_multifile_plan() {
 
 #[cfg(unix)]
 #[test]
+fn bundle_keeps_a_symbolic_link_that_requires_review_outside_included_scope() {
+    let directory = TestDirectory::new("symbolic-link-disposition");
+    let source = directory.path().join("developer-state");
+    let bundle = directory.path().join("developer-state.iniza");
+    fs::create_dir(&source).expect("source directory should be created");
+    fs::write(source.join("settings.txt"), b"synthetic settings\n")
+        .expect("settings fixture should be written");
+    symlink("settings.txt", source.join("settings-link"))
+        .expect("symbolic-link fixture should be created");
+
+    let mut plan = PlanEngine::local()
+        .scan(ScanRequest::for_directory(&source))
+        .expect("synthetic directory should scan");
+    let link = plan
+        .items()
+        .iter()
+        .find(|item| item.relative_path == Path::new("settings-link"))
+        .expect("Plan should contain the symbolic-link Migration Item");
+    assert_eq!(link.disposition, iniza::Disposition::RequiresReview);
+    let reviewed_hash = plan.approval_hash().expect("Plan should have a hash");
+    plan.approve(&reviewed_hash)
+        .expect("matching reviewed hash should approve the Plan");
+
+    let engine = BundleEngine::local();
+    let sealed = engine
+        .pack(PackRequest::new(&plan, &bundle))
+        .expect("approved Plan should seal");
+    let verified = engine
+        .verify(VerifyRequest::new(&bundle, sealed.offline_recovery_key()))
+        .expect("selected Bundle content should verify");
+
+    assert_eq!(verified.summary.included_items, 2);
+    assert_eq!(verified.summary.unverified_items, 1);
+    assert_eq!(verified.authenticated_chunks, 1);
+    assert_eq!(verified.authenticated_bytes, 19);
+}
+
+#[cfg(unix)]
+#[test]
 fn mixed_synthetic_directory_streams_without_plaintext_reaching_bundle_storage() {
     let directory = TestDirectory::new("mixed-streaming");
     let source = directory.path().join("mixed-state");
@@ -139,10 +178,10 @@ fn mixed_synthetic_directory_streams_without_plaintext_reaching_bundle_storage()
         .verify(VerifyRequest::new(&bundle, sealed.offline_recovery_key()))
         .expect("every selected chunk should authenticate");
 
-    assert_eq!(verified.summary.included_items, 8);
+    assert_eq!(verified.summary.included_items, 7);
     assert_eq!(verified.summary.changed_items, 0);
     assert_eq!(verified.summary.unsupported_items, 0);
-    assert_eq!(verified.summary.unverified_items, 0);
+    assert_eq!(verified.summary.unverified_items, 1);
     assert_eq!(verified.authenticated_chunks, 8);
     assert_eq!(
         verified.authenticated_bytes,

@@ -155,7 +155,7 @@ iniza restore <BUNDLE>
   --resume
 ```
 
-For a new restore, the destination must be absent or empty. `--resume` may use a non-empty destination only when it contains the matching authenticated Restore journal and staging state and no unrelated entries; otherwise it exits with code 50. In-place merge and overwrite flags do not exist in MVP.
+For a new restore, the destination must be absent or empty. `--resume` may use a non-empty destination only when it contains the matching canonical authenticated Restore journal, staging state, and exact journaled prefix of already-published top-level entries, with no unrelated entries; otherwise it exits with code 50. Published candidates are revalidated for authenticated bytes and restrictive non-executable mode before a durable completion checkpoint; reviewed final modes are applied through open descriptors afterward. Failed pre-publication cleanup retains an empty outer destination rather than risking deletion through a substituted pathname. In-place merge and overwrite flags do not exist in the first release.
 
 ### `iniza status`
 

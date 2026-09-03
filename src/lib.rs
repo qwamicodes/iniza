@@ -12,6 +12,7 @@ mod plan_engine;
 mod platform_metadata;
 mod project_audit;
 mod restore;
+mod restore_fs;
 
 pub use bundle::{
     BundleEngine, BundleEvent, BundleEventSink, BundleSource, BundleSourceObservation,

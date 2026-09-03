@@ -388,8 +388,8 @@ The encrypted manifest contains bundle identity, source platform, plan hash, ite
 
 - The completion footer authenticates manifest and index locations and the final bundle state.
 - A partial bundle cannot be opened by normal `inspect`, `verify`, or `restore` without explicit recovery mode.
-- Resume journals contain no plaintext paths or secrets and are authenticated using a derived journal key.
-- Resume verifies the last complete checkpoint before appending.
+- Resume journals use one bounded canonical encoding, contain no plaintext paths or secrets, and are authenticated using a derived journal key.
+- Restore resume verifies the last complete checkpoint, normalizes only exact authenticated final modes back to restrictive validation modes, reauthenticates visible content, and reconciles any durable top-level publication intent before rebuilding authenticated staging.
 
 ### Streaming multi-file format `IZ2`
 
@@ -471,14 +471,14 @@ Rules:
 
 ### Transaction
 
-1. Create a restore journal and staging area inside the approved destination.
-2. Materialize regular files with restrictive temporary permissions.
-3. Validate content hashes before final placement.
-4. Create directories and safe symlinks.
-5. Apply supported permissions and metadata.
-6. Restore projects with hooks disabled/quarantined.
-7. Run non-executing validation checks.
-8. Seal the receipt and retain unsupported-metadata reports.
+1. Secure the destination through a retained directory capability and create restrictive transaction directories atomically.
+2. Materialize regular files with restrictive temporary permissions and create reviewed directories and safe symbolic links without following them.
+3. Enumerate within the authenticated count and depth bounds, then validate the exact staged tree, content sizes, content hashes, and restrictive non-executable regular-file modes against the authenticated Manifest.
+4. Synchronize an authenticated, path-free journal before publication.
+5. Publish each top-level entry with a no-replace descriptor-relative rename bracketed by durable intent and completion checkpoints, recording the stable device and inode identity of each candidate after revalidating its authenticated content and restrictive non-executable mode.
+6. Use a bounded one-item descriptor window to reopen each published item without following symbolic links, require its stable identity to match, rehash regular-file content, and apply supported permissions and metadata through that same checked descriptor. Then re-enumerate the final tree and verify visible names remain bound to the validated filesystem objects while recovery state is present.
+7. Restore projects with hooks disabled or quarantined and run only non-executing validation checks.
+8. Remove transaction state durably, seal the Receipt, and retain unsupported-metadata reports.
 
 MVP never merges into existing paths. Future merge mode requires dry-run, conflict choices, backups, and rollback.
 

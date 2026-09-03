@@ -19,6 +19,7 @@ pub struct ExtendedAttribute {
 #[cfg(target_os = "macos")]
 mod macos {
     use std::ffi::{CStr, CString, c_char, c_int, c_void};
+    use std::os::fd::AsRawFd;
     use std::os::unix::ffi::OsStrExt;
     use std::ptr;
 
@@ -29,15 +30,10 @@ mod macos {
     unsafe extern "C" {
         fn acl_get_file(path: *const c_char, access_control_type: c_int) -> *mut c_void;
         fn acl_get_link_np(path: *const c_char, access_control_type: c_int) -> *mut c_void;
-        fn acl_set_file(
-            path: *const c_char,
-            access_control_type: c_int,
+        fn acl_set_fd_np(
+            file_descriptor: c_int,
             access_control: *mut c_void,
-        ) -> c_int;
-        fn acl_set_link_np(
-            path: *const c_char,
             access_control_type: c_int,
-            access_control: *mut c_void,
         ) -> c_int;
         fn acl_from_text(text: *const c_char) -> *mut c_void;
         fn acl_to_text(access_control: *mut c_void, length: *mut isize) -> *mut c_char;
@@ -153,14 +149,11 @@ mod macos {
         Ok(attributes)
     }
 
-    pub(super) fn write_extended_attributes(
-        path: &Path,
-        no_follow: bool,
+    pub(super) fn write_extended_attributes_file(
+        file: &std::fs::File,
         attributes: &[ExtendedAttribute],
     ) -> io::Result<()> {
         validate_extended_attributes(attributes)?;
-        let path = c_path(path)?;
-        let options = if no_follow { libc::XATTR_NOFOLLOW } else { 0 };
         for attribute in attributes {
             let name = CString::new(attribute.name.as_slice()).map_err(|_| {
                 io::Error::new(
@@ -168,16 +161,16 @@ mod macos {
                     "extended attribute name contains a null byte",
                 )
             })?;
-            // SAFETY: both C strings are live and `attribute.value` exposes the
-            // declared readable byte range for the duration of the call.
+            // SAFETY: the file descriptor remains open, the attribute name is
+            // null-terminated, and the value exposes the declared readable bytes.
             if unsafe {
-                libc::setxattr(
-                    path.as_ptr(),
+                libc::fsetxattr(
+                    file.as_raw_fd(),
                     name.as_ptr(),
                     attribute.value.as_ptr().cast(),
                     attribute.value.len(),
                     0,
-                    options,
+                    0,
                 )
             } != 0
             {
@@ -240,14 +233,13 @@ mod macos {
         })
     }
 
-    pub(super) fn write_access_control(path: &Path, no_follow: bool, text: &str) -> io::Result<()> {
+    pub(super) fn write_access_control_file(file: &std::fs::File, text: &str) -> io::Result<()> {
         if text.len() > MAX_ACCESS_CONTROL_TEXT {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "access-control metadata exceeds its apply limit",
             ));
         }
-        let path = c_path(path)?;
         let text = CString::new(text).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -260,14 +252,13 @@ mod macos {
         if access_control.is_null() {
             return Err(io::Error::last_os_error());
         }
-        // SAFETY: both path and access-control objects are live and valid for
-        // the duration of this call.
+        // SAFETY: the descriptor and access-control object remain live for the call.
         let result = unsafe {
-            if no_follow {
-                acl_set_link_np(path.as_ptr(), ACCESS_CONTROL_TYPE_EXTENDED, access_control)
-            } else {
-                acl_set_file(path.as_ptr(), ACCESS_CONTROL_TYPE_EXTENDED, access_control)
-            }
+            acl_set_fd_np(
+                file.as_raw_fd(),
+                access_control,
+                ACCESS_CONTROL_TYPE_EXTENDED,
+            )
         };
         // SAFETY: the object was allocated by `acl_from_text`.
         unsafe { acl_free(access_control) };
@@ -299,23 +290,6 @@ pub(crate) fn read_extended_attributes(
     }
 }
 
-pub(crate) fn write_extended_attributes(
-    path: &Path,
-    no_follow: bool,
-    attributes: &[ExtendedAttribute],
-) -> io::Result<()> {
-    #[cfg(target_os = "macos")]
-    return macos::write_extended_attributes(path, no_follow, attributes);
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (path, no_follow, attributes);
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "extended attributes are unsupported by this platform adapter",
-        ))
-    }
-}
-
 pub(crate) fn read_access_control(path: &Path, no_follow: bool) -> io::Result<Option<String>> {
     #[cfg(target_os = "macos")]
     return macos::read_access_control(path, no_follow);
@@ -329,12 +303,28 @@ pub(crate) fn read_access_control(path: &Path, no_follow: bool) -> io::Result<Op
     }
 }
 
-pub(crate) fn write_access_control(path: &Path, no_follow: bool, text: &str) -> io::Result<()> {
+pub(crate) fn write_extended_attributes_file(
+    file: &std::fs::File,
+    attributes: &[ExtendedAttribute],
+) -> io::Result<()> {
     #[cfg(target_os = "macos")]
-    return macos::write_access_control(path, no_follow, text);
+    return macos::write_extended_attributes_file(file, attributes);
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (path, no_follow, text);
+        let _ = (file, attributes);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "extended attributes are unsupported by this platform adapter",
+        ))
+    }
+}
+
+pub(crate) fn write_access_control_file(file: &std::fs::File, text: &str) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    return macos::write_access_control_file(file, text);
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (file, text);
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "access-control metadata is unsupported by this platform adapter",

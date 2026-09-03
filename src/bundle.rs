@@ -531,25 +531,26 @@ fn write_bundle(
                 .ok()
                 .flatten();
         }
-        let outcome = if item.kind == MigrationItemKind::SymbolicLink {
-            match capture_symbolic_link(source_adapter, &root.join(&item.relative_path)) {
-                Some(target) => {
-                    included_items += 1;
-                    symlink_target = Some(target.to_string_lossy().into_owned());
-                    CaptureOutcome::Included
-                }
-                None => {
-                    unverified_items += 1;
-                    CaptureOutcome::Unverified
-                }
-            }
-        } else if item.kind == MigrationItemKind::Special {
+        let outcome = if item.kind == MigrationItemKind::Special {
             unsupported_items += 1;
             CaptureOutcome::Unsupported
         } else if item.disposition == Disposition::Included {
             included_items += 1;
             match item.kind {
                 MigrationItemKind::Directory => CaptureOutcome::Included,
+                MigrationItemKind::SymbolicLink => {
+                    match capture_symbolic_link(source_adapter, &root.join(&item.relative_path)) {
+                        Some(target) => {
+                            symlink_target = Some(target.to_string_lossy().into_owned());
+                            CaptureOutcome::Included
+                        }
+                        None => {
+                            included_items -= 1;
+                            unverified_items += 1;
+                            CaptureOutcome::Unverified
+                        }
+                    }
+                }
                 MigrationItemKind::RegularFile => {
                     let captured = capture_regular_file(
                         source_adapter,
@@ -582,7 +583,9 @@ fn write_bundle(
                         CaptureOutcome::Unverified
                     }
                 }
-                _ => {
+                MigrationItemKind::Special => unreachable!("handled above"),
+                MigrationItemKind::Unknown => {
+                    included_items -= 1;
                     unsupported_items += 1;
                     CaptureOutcome::Unsupported
                 }
@@ -1187,25 +1190,50 @@ struct OpenedBundle {
     authenticated_chunks: u64,
     authenticated_bytes: u64,
     restore_plan: AuthenticatedRestorePlan,
+    bundle_hash: [u8; 32],
 }
 
 #[derive(Debug)]
 pub(crate) struct AuthenticatedRestorePlan {
     pub(crate) items: Vec<AuthenticatedRestoreItem>,
+    pub(crate) bundle_hash: [u8; 32],
 }
 
 #[derive(Debug)]
 pub(crate) struct AuthenticatedRestoreItem {
     pub(crate) ordinal: u32,
     pub(crate) relative_path: String,
-    pub(crate) kind: String,
+    pub(crate) kind: AuthenticatedRestoreKind,
     pub(crate) estimated_size: u64,
+    pub(crate) content_hash: Option<String>,
     pub(crate) selected: bool,
     pub(crate) posix_mode: Option<u32>,
     pub(crate) symlink_target: Option<String>,
     pub(crate) extended_attributes: Option<Vec<ExtendedAttribute>>,
     pub(crate) access_control_captured: Option<bool>,
     pub(crate) access_control: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AuthenticatedRestoreKind {
+    Directory,
+    RegularFile,
+    SymbolicLink,
+    Special,
+    Unknown,
+}
+
+fn authenticated_restore_kind(value: &str) -> Result<AuthenticatedRestoreKind, CoreError> {
+    match value {
+        "Directory" => Ok(AuthenticatedRestoreKind::Directory),
+        "RegularFile" => Ok(AuthenticatedRestoreKind::RegularFile),
+        "SymbolicLink" => Ok(AuthenticatedRestoreKind::SymbolicLink),
+        "Special" => Ok(AuthenticatedRestoreKind::Special),
+        "Unknown" => Ok(AuthenticatedRestoreKind::Unknown),
+        _ => Err(invalid_bundle(
+            "Bundle manifest contains an unknown Migration Item kind",
+        )),
+    }
 }
 
 pub(crate) trait AuthenticatedContentSink {
@@ -1217,40 +1245,101 @@ pub(crate) trait AuthenticatedContentSink {
     ) -> Result<(), CoreError>;
 }
 
-pub(crate) fn authenticate_restore_plan(
-    source: &Path,
-    recovery_secret: &RecoverySecret,
-) -> Result<AuthenticatedRestorePlan, CoreError> {
-    let mut events = None;
-    let mut content_sink = None;
-    Ok(open_bundle(
-        source,
-        recovery_secret,
-        false,
-        &mut events,
-        &mut content_sink,
-    )?
-    .restore_plan)
+pub(crate) struct RestoreBundleReader {
+    source: PathBuf,
+    input: fs::File,
 }
 
-pub(crate) fn stream_authenticated_content(
-    source: &Path,
-    recovery_secret: &RecoverySecret,
-    sink: &mut dyn AuthenticatedContentSink,
-) -> Result<u64, CoreError> {
-    let mut events = None;
-    let mut content_sink = Some(sink);
-    Ok(open_bundle(
-        source,
-        recovery_secret,
-        true,
-        &mut events,
-        &mut content_sink,
-    )?
-    .authenticated_bytes)
+pub(crate) struct AuthenticatedRestoreContent {
+    pub(crate) authenticated_bytes: u64,
+    pub(crate) bundle_hash: [u8; 32],
+}
+
+impl RestoreBundleReader {
+    pub(crate) fn open(source: &Path) -> Result<Self, CoreError> {
+        Ok(Self {
+            source: source.to_path_buf(),
+            input: open_bundle_file(source)?,
+        })
+    }
+
+    pub(crate) fn authenticate_plan(
+        &mut self,
+        recovery_secret: &RecoverySecret,
+    ) -> Result<AuthenticatedRestorePlan, CoreError> {
+        let mut events = None;
+        let mut content_sink = None;
+        let opened = open_bundle_from(
+            &mut self.input,
+            &self.source,
+            recovery_secret,
+            false,
+            &mut events,
+            &mut content_sink,
+        )?;
+        Ok(AuthenticatedRestorePlan {
+            items: opened.restore_plan.items,
+            bundle_hash: opened.bundle_hash,
+        })
+    }
+
+    pub(crate) fn stream_authenticated_content(
+        &mut self,
+        recovery_secret: &RecoverySecret,
+        sink: &mut dyn AuthenticatedContentSink,
+    ) -> Result<AuthenticatedRestoreContent, CoreError> {
+        let mut events = None;
+        let mut content_sink = Some(sink);
+        let opened = open_bundle_from(
+            &mut self.input,
+            &self.source,
+            recovery_secret,
+            true,
+            &mut events,
+            &mut content_sink,
+        )?;
+        Ok(AuthenticatedRestoreContent {
+            authenticated_bytes: opened.authenticated_bytes,
+            bundle_hash: opened.bundle_hash,
+        })
+    }
 }
 
 fn open_bundle(
+    source: &Path,
+    recovery_secret: &RecoverySecret,
+    verify_content: bool,
+    events: &mut Option<&mut dyn BundleEventSink>,
+    content_sink: &mut Option<&mut dyn AuthenticatedContentSink>,
+) -> Result<OpenedBundle, CoreError> {
+    let mut input = open_bundle_file(source)?;
+    open_bundle_from(
+        &mut input,
+        source,
+        recovery_secret,
+        verify_content,
+        events,
+        content_sink,
+    )
+}
+
+fn open_bundle_file(source: &Path) -> Result<fs::File, CoreError> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    options.open(source).map_err(|source_error| CoreError::Io {
+        action: "open Bundle",
+        path: source.to_path_buf(),
+        source: source_error,
+    })
+}
+
+fn open_bundle_from(
+    input: &mut fs::File,
     source: &Path,
     recovery_secret: &RecoverySecret,
     verify_content: bool,
@@ -1261,11 +1350,13 @@ fn open_bundle(
         emit_event(events, BundleEvent::VerificationStarted);
     }
     reject_partial_path(source)?;
-    let mut input = fs::File::open(source).map_err(|source_error| CoreError::Io {
-        action: "open Bundle",
-        path: source.to_path_buf(),
-        source: source_error,
-    })?;
+    input
+        .seek(SeekFrom::Start(0))
+        .map_err(|source_error| CoreError::Io {
+            action: "rewind opened Bundle",
+            path: source.to_path_buf(),
+            source: source_error,
+        })?;
     let file_length = input
         .metadata()
         .map_err(|source_error| CoreError::Io {
@@ -1294,6 +1385,8 @@ fn open_bundle(
     };
     let mut prefix_hasher = blake3::Hasher::new();
     prefix_hasher.update(&header);
+    let mut bundle_hasher = blake3::Hasher::new();
+    bundle_hasher.update(&header);
     let mut previous_sequence = None;
     let mut record_count = 0_u64;
     let mut content_entries = Vec::new();
@@ -1331,6 +1424,8 @@ fn open_bundle(
         input
             .read_exact(&mut ciphertext)
             .map_err(|_| invalid_bundle("Bundle record ciphertext is truncated"))?;
+        bundle_hasher.update(&raw_header);
+        bundle_hasher.update(&ciphertext);
 
         if record.kind == RECORD_COMPLETION {
             if saw_completion {
@@ -1469,8 +1564,9 @@ fn open_bundle(
                     ordinal: u32::try_from(ordinal)
                         .map_err(|_| invalid_bundle("Bundle contains too many Migration Items"))?,
                     relative_path: item.relative_path.clone(),
-                    kind: item.kind.clone(),
+                    kind: authenticated_restore_kind(&item.kind)?,
                     estimated_size: item.estimated_size,
+                    content_hash: item.content_hash.clone(),
                     selected: matches!(
                         item.outcome,
                         CaptureOutcome::Included | CaptureOutcome::Changed
@@ -1483,6 +1579,7 @@ fn open_bundle(
                 })
             })
             .collect::<Result<Vec<_>, CoreError>>()?,
+        bundle_hash: *bundle_hasher.finalize().as_bytes(),
     };
     Ok(OpenedBundle {
         summary: AuthenticatedBundleSummary {
@@ -1498,6 +1595,7 @@ fn open_bundle(
         authenticated_chunks,
         authenticated_bytes,
         restore_plan,
+        bundle_hash: *bundle_hasher.finalize().as_bytes(),
     })
 }
 
