@@ -36,22 +36,21 @@ A resumed attempt writes `<destination>.partial.resume`. A second pause advances
 
 Before checkpointing or final publication, the visible partial path must still identify the opened regular file. Failure cleanup checks that the path identifies the file this attempt created, rather than deleting a competing file created after preflight. These checks cover tested substitution points, not arbitrary check-to-use races.
 
-This multi-file handoff is not yet a crash-reconciled transaction. Interruption between the pair's renames can leave mixed or previous artifacts, and an abandoned resumed attempt can block retry. Such artifacts must be preserved; they must not be manually promoted or deleted on the assumption that they are authenticated progress.
+An interruption after a resumed checkpoint becomes durable but before pair promotion leaves both the older canonical pair and newer resumed pair. Before moving either pair, Pack writes and synchronizes an encrypted, authenticated promotion journal bound to the approved Plan, the advanced checkpoint, and the device and inode identities of all four progress artifacts. Each exclusive rename and cleanup is synchronized separately. On the next Resume, Pack authenticates the available checkpoint pair and the journal, recognizes every durable promotion state, revalidates the recorded identities, and continues from the first unfinished transition. A corrupted newer pair or journal cannot displace the older authenticated progress.
 
-Successful Resume currently cleans up the old partial pair by pathname. Replacement of those saved paths during Resume is therefore an unresolved ownership-safety gap, separate from the new-output identity checks above. Closing that gap and retaining authenticated recovery state across cleanup errors are required before this issue can be complete.
+Successful Resume checks the opened device and inode identities before removing either saved artifact. Checkpoint promotion makes the same checks before moving saved paths. These checks reject the tested replacement cases and preserve unrelated bytes. Retained capability-relative cleanup, arbitrary check-to-use races, and recovery from cleanup errors remain required before this issue can be complete.
 
 ## Evidence and unresolved gates
 
-The public-interface tests cover cooperative pause, repeated pause and Resume, exact protected-byte recovery through both Recovery Methods, source-identity change, changed Plan, wrong context, checkpoint and ciphertext tampering, incompatible headers, unrelated final output, redacted results, preflight partial conflicts, and child-process termination at the exposed start, captured-item, checkpoint, and completion events. Capacity loss immediately before checkpoint creation must preserve the earlier authenticated checkpoint for a later successful Resume.
+The public-interface tests cover cooperative pause, repeated pause and Resume, exact protected-byte recovery through both Recovery Methods, source-identity change, changed Plan, wrong context, checkpoint and ciphertext tampering, incompatible headers, unrelated final output, redacted results, preflight partial conflicts, saved-path replacement, and child-process termination at the exposed start, captured-item, initial-checkpoint, resumed-checkpoint, every journal and promotion transition, and completion events. Capacity loss immediately before checkpoint creation must preserve the earlier authenticated checkpoint for a later successful Resume. A corrupted interrupted Resume must not displace older authenticated progress.
 
 The issue remains In Progress. Completion still requires:
 
 1. Fault injection before and after every persistent operation, including actual write, synchronization, rename, publication, and cleanup failures. Existing event tests do not cover every persistent transition.
-2. Authenticated reconciliation of interrupted checkpoint-pair advancement and abandoned resumed attempts.
-3. Destination-capability and output-identity protection through publication and cleanup; pathname checks alone are insufficient for arbitrary concurrent replacement.
-4. Explicit repeated-interrupt behavior and complete retry, Resume, or restart guidance for error results.
-5. Review of the both-Recovery-Methods Resume requirement, item-boundary cancellation latency, and additional disk space needed for re-encryption.
-6. Full verification, independent security review, and the remaining Owner Dogfood gates. Passing this issue's tests alone does not establish migration readiness.
+2. Destination-capability protection through publication and cleanup; the promotion transaction retains a directory capability and checks device and inode identity, but arbitrary final-component replacement races remain outside the tested owner-only operating model.
+3. Explicit repeated-interrupt behavior and complete retry, Resume, or restart guidance for error results.
+4. Review of the both-Recovery-Methods Resume requirement, item-boundary cancellation latency, and additional disk space needed for re-encryption.
+5. Full verification, independent security review, and the remaining Owner Dogfood gates. Passing this issue's tests alone does not establish migration readiness.
 
 ## Proposed next testing seam, awaiting owner confirmation
 

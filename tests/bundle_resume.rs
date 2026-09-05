@@ -6,9 +6,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use iniza::{
     BundleEngine, BundleEvent, BundleEventSink, DestinationCapacity, InspectRequest,
-    LocalBundleSource, PackCancellation, PackRecoveryContext, PackRequest, PackState, Plan,
-    PlanEngine, RecoveryMethod, RecoverySecret, RestoreEngine, RestoreRequest, ScanRequest,
-    VerifyRequest,
+    LocalBundleSource, PackCancellation, PackCheckpointPromotionStep, PackRecoveryContext,
+    PackRequest, PackState, Plan, PlanEngine, RecoveryMethod, RecoverySecret, RestoreEngine,
+    RestoreRequest, ScanRequest, VerifyRequest,
 };
 use zeroize::Zeroizing;
 
@@ -826,6 +826,566 @@ fn pack_rejects_a_replaced_partial_before_checkpoint_or_publication() {
         assert_eq!(
             fs::read(&partial).unwrap(),
             b"unrelated replacement must remain untouched\n"
+        );
+    }
+}
+
+struct ReplaceSavedPartialOnResume {
+    partial: PathBuf,
+}
+
+impl BundleEventSink for ReplaceSavedPartialOnResume {
+    fn emit(&mut self, event: BundleEvent) {
+        if event == BundleEvent::PackStarted {
+            fs::rename(
+                &self.partial,
+                self.partial.with_extension("authenticated-saved"),
+            )
+            .unwrap();
+            fs::write(
+                &self.partial,
+                b"unrelated saved-path replacement must remain untouched\n",
+            )
+            .unwrap();
+        }
+    }
+}
+
+#[test]
+fn completed_resume_never_removes_an_unrelated_saved_path_replacement() {
+    let directory = TestDirectory::new();
+    let plan = approved_plan(&directory);
+    let destination = directory.path().join("migration.iniza");
+    let partial = directory.path().join("migration.iniza.partial");
+    let cancellation = PackCancellation::default();
+    let mut stop = StopAfterCapture {
+        cancellation: &cancellation,
+        events: Vec::new(),
+    };
+    let paused = BundleEngine::local()
+        .pack(
+            PackRequest::new(&plan, &destination)
+                .with_cancellation(&cancellation)
+                .with_event_sink(&mut stop),
+        )
+        .unwrap();
+    let mut replacement = ReplaceSavedPartialOnResume {
+        partial: partial.clone(),
+    };
+
+    let completed = BundleEngine::local()
+        .pack(
+            PackRequest::resume(&plan, &destination, paused.recovery_context())
+                .with_event_sink(&mut replacement),
+        )
+        .expect("Resume remains bound to the authenticated opened progress");
+
+    assert_eq!(completed.state(), PackState::Complete);
+    assert_eq!(
+        fs::read(&partial).expect("cleanup must preserve an unrelated replacement"),
+        b"unrelated saved-path replacement must remain untouched\n"
+    );
+    assert_eq!(
+        BundleEngine::local()
+            .verify(VerifyRequest::new(
+                &destination,
+                completed.offline_recovery_key(),
+            ))
+            .unwrap()
+            .authenticated_bytes,
+        43
+    );
+}
+
+struct ReplaceSavedCheckpointOnResume {
+    checkpoint: PathBuf,
+}
+
+impl BundleEventSink for ReplaceSavedCheckpointOnResume {
+    fn emit(&mut self, event: BundleEvent) {
+        if event == BundleEvent::PackStarted {
+            fs::rename(
+                &self.checkpoint,
+                self.checkpoint.with_extension("authenticated-saved"),
+            )
+            .unwrap();
+            fs::write(
+                &self.checkpoint,
+                b"unrelated checkpoint-path replacement must remain untouched\n",
+            )
+            .unwrap();
+        }
+    }
+}
+
+#[test]
+fn completed_resume_never_removes_an_unrelated_checkpoint_path_replacement() {
+    let directory = TestDirectory::new();
+    let plan = approved_plan(&directory);
+    let destination = directory.path().join("migration.iniza");
+    let checkpoint = directory.path().join("migration.iniza.partial.checkpoint");
+    let cancellation = PackCancellation::default();
+    let mut stop = StopAfterCapture {
+        cancellation: &cancellation,
+        events: Vec::new(),
+    };
+    let paused = BundleEngine::local()
+        .pack(
+            PackRequest::new(&plan, &destination)
+                .with_cancellation(&cancellation)
+                .with_event_sink(&mut stop),
+        )
+        .unwrap();
+    let mut replacement = ReplaceSavedCheckpointOnResume {
+        checkpoint: checkpoint.clone(),
+    };
+
+    let completed = BundleEngine::local()
+        .pack(
+            PackRequest::resume(&plan, &destination, paused.recovery_context())
+                .with_event_sink(&mut replacement),
+        )
+        .expect("Resume remains bound to the authenticated checkpoint bytes");
+
+    assert_eq!(completed.state(), PackState::Complete);
+    assert_eq!(
+        fs::read(&checkpoint).expect("cleanup must preserve an unrelated replacement"),
+        b"unrelated checkpoint-path replacement must remain untouched\n"
+    );
+    assert_eq!(
+        BundleEngine::local()
+            .verify(VerifyRequest::new(
+                &destination,
+                completed.offline_recovery_key(),
+            ))
+            .unwrap()
+            .authenticated_bytes,
+        43
+    );
+}
+
+struct ReplaceSavedPartialAndPause<'a> {
+    partial: PathBuf,
+    cancellation: &'a PackCancellation,
+}
+
+impl BundleEventSink for ReplaceSavedPartialAndPause<'_> {
+    fn emit(&mut self, event: BundleEvent) {
+        match event {
+            BundleEvent::PackStarted => {
+                fs::rename(
+                    &self.partial,
+                    self.partial.with_extension("authenticated-saved"),
+                )
+                .unwrap();
+                fs::write(
+                    &self.partial,
+                    b"unrelated saved path must survive failed promotion\n",
+                )
+                .unwrap();
+            }
+            BundleEvent::ItemCaptured { bytes, .. } if bytes > 0 => {
+                self.cancellation.request_stop();
+            }
+            _ => {}
+        }
+    }
+}
+
+#[test]
+fn paused_resume_never_promotes_through_a_replaced_saved_partial() {
+    let directory = TestDirectory::new();
+    let plan = approved_plan(&directory);
+    let destination = directory.path().join("migration.iniza");
+    let partial = directory.path().join("migration.iniza.partial");
+    let cancellation = PackCancellation::default();
+    let mut stop = StopAfterCapture {
+        cancellation: &cancellation,
+        events: Vec::new(),
+    };
+    let paused = BundleEngine::local()
+        .pack(
+            PackRequest::new(&plan, &destination)
+                .with_cancellation(&cancellation)
+                .with_event_sink(&mut stop),
+        )
+        .unwrap();
+    let second_cancellation = PackCancellation::default();
+    let mut replacement = ReplaceSavedPartialAndPause {
+        partial: partial.clone(),
+        cancellation: &second_cancellation,
+    };
+
+    let error = BundleEngine::local()
+        .pack(
+            PackRequest::resume(&plan, &destination, paused.recovery_context())
+                .with_cancellation(&second_cancellation)
+                .with_event_sink(&mut replacement),
+        )
+        .expect_err("changed saved progress paths must prevent checkpoint promotion");
+
+    assert!(error.to_string().contains("identity changed"));
+    assert!(!destination.exists());
+    assert_eq!(
+        fs::read(&partial).unwrap(),
+        b"unrelated saved path must survive failed promotion\n"
+    );
+    assert!(
+        directory
+            .path()
+            .join("migration.iniza.partial.resume")
+            .is_file()
+    );
+    assert!(
+        directory
+            .path()
+            .join("migration.iniza.partial.resume.checkpoint")
+            .is_file()
+    );
+}
+
+struct ReplaceSavedCheckpointAndPause<'a> {
+    checkpoint: PathBuf,
+    cancellation: &'a PackCancellation,
+}
+
+impl BundleEventSink for ReplaceSavedCheckpointAndPause<'_> {
+    fn emit(&mut self, event: BundleEvent) {
+        match event {
+            BundleEvent::PackStarted => {
+                fs::rename(
+                    &self.checkpoint,
+                    self.checkpoint.with_extension("authenticated-saved"),
+                )
+                .unwrap();
+                fs::write(
+                    &self.checkpoint,
+                    b"unrelated checkpoint path must survive failed promotion\n",
+                )
+                .unwrap();
+            }
+            BundleEvent::ItemCaptured { bytes, .. } if bytes > 0 => {
+                self.cancellation.request_stop();
+            }
+            _ => {}
+        }
+    }
+}
+
+#[test]
+fn paused_resume_never_promotes_through_a_replaced_saved_checkpoint() {
+    let directory = TestDirectory::new();
+    let plan = approved_plan(&directory);
+    let destination = directory.path().join("migration.iniza");
+    let checkpoint = directory.path().join("migration.iniza.partial.checkpoint");
+    let cancellation = PackCancellation::default();
+    let mut stop = StopAfterCapture {
+        cancellation: &cancellation,
+        events: Vec::new(),
+    };
+    let paused = BundleEngine::local()
+        .pack(
+            PackRequest::new(&plan, &destination)
+                .with_cancellation(&cancellation)
+                .with_event_sink(&mut stop),
+        )
+        .unwrap();
+    let second_cancellation = PackCancellation::default();
+    let mut replacement = ReplaceSavedCheckpointAndPause {
+        checkpoint: checkpoint.clone(),
+        cancellation: &second_cancellation,
+    };
+
+    let error = BundleEngine::local()
+        .pack(
+            PackRequest::resume(&plan, &destination, paused.recovery_context())
+                .with_cancellation(&second_cancellation)
+                .with_event_sink(&mut replacement),
+        )
+        .expect_err("changed saved checkpoint paths must prevent promotion");
+
+    assert!(error.to_string().contains("identity changed"));
+    assert!(!destination.exists());
+    assert_eq!(
+        fs::read(&checkpoint).unwrap(),
+        b"unrelated checkpoint path must survive failed promotion\n"
+    );
+    assert!(
+        directory
+            .path()
+            .join("migration.iniza.partial.resume")
+            .is_file()
+    );
+    assert!(
+        directory
+            .path()
+            .join("migration.iniza.partial.resume.checkpoint")
+            .is_file()
+    );
+}
+
+#[test]
+fn resumed_pack_checkpoint_termination_child() {
+    let Some(root) = std::env::var_os("INIZA_SYNTHETIC_RESUMED_PACK_CHILD") else {
+        return;
+    };
+    let root = PathBuf::from(root);
+    let plan = Plan::read_from(&root.join("reviewed-plan.toml")).unwrap();
+    let cancellation = PackCancellation::default();
+    let mut events = TerminatePack {
+        phase: "checkpoint".to_owned(),
+        cancellation: &cancellation,
+    };
+    let context = synthetic_recovery_context();
+    BundleEngine::local()
+        .pack(
+            PackRequest::resume(&plan, root.join("migration.iniza"), &context)
+                .with_cancellation(&cancellation)
+                .with_event_sink(&mut events),
+        )
+        .unwrap();
+    panic!("resumed Pack did not reach its durable checkpoint");
+}
+
+#[test]
+fn owner_can_resume_after_termination_at_a_resumed_pack_checkpoint() {
+    let directory = TestDirectory::new();
+    let plan = approved_plan(&directory);
+    plan.write_to(&directory.path().join("reviewed-plan.toml"))
+        .unwrap();
+    let destination = directory.path().join("migration.iniza");
+    let context = synthetic_recovery_context();
+    let cancellation = PackCancellation::default();
+    let mut stop = StopAfterCapture {
+        cancellation: &cancellation,
+        events: Vec::new(),
+    };
+    BundleEngine::local()
+        .pack(
+            PackRequest::new(&plan, &destination)
+                .with_recovery_context(&context)
+                .with_cancellation(&cancellation)
+                .with_event_sink(&mut stop),
+        )
+        .unwrap();
+
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "resumed_pack_checkpoint_termination_child",
+            "--nocapture",
+        ])
+        .env("INIZA_SYNTHETIC_RESUMED_PACK_CHILD", directory.path())
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(73));
+    assert!(!destination.exists());
+    assert!(directory.path().join("migration.iniza.partial").is_file());
+    assert!(
+        directory
+            .path()
+            .join("migration.iniza.partial.resume")
+            .is_file()
+    );
+
+    let complete = BundleEngine::local()
+        .pack(PackRequest::resume(&plan, &destination, &context))
+        .expect("the latest authenticated checkpoint should remain resumable");
+
+    assert_eq!(complete.state(), PackState::Complete);
+    assert_eq!(
+        BundleEngine::local()
+            .verify(VerifyRequest::new(
+                &destination,
+                context.offline_recovery_key(),
+            ))
+            .unwrap()
+            .authenticated_bytes,
+        43
+    );
+    assert_eq!(
+        fs::read(directory.path().join("synthetic-source/first.txt")).unwrap(),
+        b"first protected item\n"
+    );
+    assert_eq!(
+        fs::read(directory.path().join("synthetic-source/second.txt")).unwrap(),
+        b"second protected item\n"
+    );
+}
+
+#[test]
+fn corrupted_interrupted_resume_never_displaces_older_authenticated_progress() {
+    let directory = TestDirectory::new();
+    let plan = approved_plan(&directory);
+    plan.write_to(&directory.path().join("reviewed-plan.toml"))
+        .unwrap();
+    let destination = directory.path().join("migration.iniza");
+    let partial = directory.path().join("migration.iniza.partial");
+    let checkpoint = directory.path().join("migration.iniza.partial.checkpoint");
+    let resumed_partial = directory.path().join("migration.iniza.partial.resume");
+    let context = synthetic_recovery_context();
+    let cancellation = PackCancellation::default();
+    let mut stop = StopAfterCapture {
+        cancellation: &cancellation,
+        events: Vec::new(),
+    };
+    BundleEngine::local()
+        .pack(
+            PackRequest::new(&plan, &destination)
+                .with_recovery_context(&context)
+                .with_cancellation(&cancellation)
+                .with_event_sink(&mut stop),
+        )
+        .unwrap();
+    let saved_partial = fs::read(&partial).unwrap();
+    let saved_checkpoint = fs::read(&checkpoint).unwrap();
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "resumed_pack_checkpoint_termination_child",
+            "--nocapture",
+        ])
+        .env("INIZA_SYNTHETIC_RESUMED_PACK_CHILD", directory.path())
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(73));
+    let mut corrupted = fs::read(&resumed_partial).unwrap();
+    *corrupted.last_mut().unwrap() ^= 0xff;
+    fs::write(&resumed_partial, corrupted).unwrap();
+
+    BundleEngine::local()
+        .pack(PackRequest::resume(&plan, &destination, &context))
+        .expect_err("corrupted newer progress must not displace authenticated saved progress");
+
+    assert!(!destination.exists());
+    assert_eq!(fs::read(&partial).unwrap(), saved_partial);
+    assert_eq!(fs::read(&checkpoint).unwrap(), saved_checkpoint);
+}
+
+struct TerminateCheckpointPromotion<'a> {
+    step: PackCheckpointPromotionStep,
+    cancellation: &'a PackCancellation,
+}
+
+impl BundleEventSink for TerminateCheckpointPromotion<'_> {
+    fn emit(&mut self, event: BundleEvent) {
+        match event {
+            BundleEvent::ItemCaptured { bytes, .. } if bytes > 0 => {
+                self.cancellation.request_stop();
+            }
+            BundleEvent::CheckpointPromotionAdvanced { step } if step == self.step => {
+                // Deliberately bypass unwinding and destructors in this disposable child.
+                std::process::exit(73);
+            }
+            _ => {}
+        }
+    }
+}
+
+#[test]
+fn pack_checkpoint_promotion_termination_child() {
+    let Some(root) = std::env::var_os("INIZA_SYNTHETIC_PROMOTION_CHILD") else {
+        return;
+    };
+    let step = match std::env::var("INIZA_SYNTHETIC_PROMOTION_STEP")
+        .unwrap()
+        .as_str()
+    {
+        "promotion-journal-written" => PackCheckpointPromotionStep::PromotionJournalWritten,
+        "saved-partial-retained" => PackCheckpointPromotionStep::SavedPartialRetained,
+        "saved-checkpoint-retained" => PackCheckpointPromotionStep::SavedCheckpointRetained,
+        "resumed-partial-activated" => PackCheckpointPromotionStep::ResumedPartialActivated,
+        "resumed-checkpoint-activated" => PackCheckpointPromotionStep::ResumedCheckpointActivated,
+        "superseded-partial-removed" => PackCheckpointPromotionStep::SupersededPartialRemoved,
+        "superseded-checkpoint-removed" => PackCheckpointPromotionStep::SupersededCheckpointRemoved,
+        "promotion-journal-removed" => PackCheckpointPromotionStep::PromotionJournalRemoved,
+        unexpected => panic!("unexpected promotion step {unexpected}"),
+    };
+    let root = PathBuf::from(root);
+    let plan = Plan::read_from(&root.join("reviewed-plan.toml")).unwrap();
+    let context = synthetic_recovery_context();
+    let cancellation = PackCancellation::default();
+    let mut events = TerminateCheckpointPromotion {
+        step,
+        cancellation: &cancellation,
+    };
+    BundleEngine::local()
+        .pack(
+            PackRequest::resume(&plan, root.join("migration.iniza"), &context)
+                .with_cancellation(&cancellation)
+                .with_event_sink(&mut events),
+        )
+        .unwrap();
+    panic!("resumed Pack did not reach the requested durable promotion step");
+}
+
+#[test]
+fn owner_can_resume_after_termination_at_every_checkpoint_promotion_step() {
+    for step in [
+        "promotion-journal-written",
+        "promotion-journal-removed",
+        "superseded-partial-removed",
+        "superseded-checkpoint-removed",
+        "saved-partial-retained",
+        "saved-checkpoint-retained",
+        "resumed-partial-activated",
+        "resumed-checkpoint-activated",
+    ] {
+        let directory = TestDirectory::new();
+        let plan = approved_plan(&directory);
+        plan.write_to(&directory.path().join("reviewed-plan.toml"))
+            .unwrap();
+        let destination = directory.path().join("migration.iniza");
+        let context = synthetic_recovery_context();
+        let cancellation = PackCancellation::default();
+        let mut stop = StopAfterCapture {
+            cancellation: &cancellation,
+            events: Vec::new(),
+        };
+        BundleEngine::local()
+            .pack(
+                PackRequest::new(&plan, &destination)
+                    .with_recovery_context(&context)
+                    .with_cancellation(&cancellation)
+                    .with_event_sink(&mut stop),
+            )
+            .unwrap();
+
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "pack_checkpoint_promotion_termination_child",
+                "--nocapture",
+            ])
+            .env("INIZA_SYNTHETIC_PROMOTION_CHILD", directory.path())
+            .env("INIZA_SYNTHETIC_PROMOTION_STEP", step)
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(73), "{step} child failed unexpectedly");
+        assert!(!destination.exists());
+
+        let completed = BundleEngine::local()
+            .pack(PackRequest::resume(&plan, &destination, &context))
+            .unwrap_or_else(|error| panic!("Resume after {step} failed: {error}"));
+
+        assert_eq!(completed.state(), PackState::Complete);
+        assert_eq!(
+            BundleEngine::local()
+                .verify(VerifyRequest::new(
+                    &destination,
+                    context.offline_recovery_key(),
+                ))
+                .unwrap()
+                .authenticated_bytes,
+            43
+        );
+        assert_eq!(
+            fs::read(directory.path().join("synthetic-source/first.txt")).unwrap(),
+            b"first protected item\n"
+        );
+        assert_eq!(
+            fs::read(directory.path().join("synthetic-source/second.txt")).unwrap(),
+            b"second protected item\n"
         );
     }
 }

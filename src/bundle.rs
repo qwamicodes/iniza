@@ -33,6 +33,7 @@ const MAX_MANIFEST_PLAINTEXT: usize = 16 * 1024 * 1024;
 const MAX_INDEX_PLAINTEXT: usize = 64 * 1024 * 1024;
 const MAX_COMPLETION_PLAINTEXT: usize = 64;
 const MAX_PACK_CHECKPOINT: u64 = 128 * 1024 * 1024;
+const MAX_PACK_PROMOTION_JOURNAL: u64 = 4096;
 
 const RECORD_CONTENT: u8 = 1;
 const RECORD_MANIFEST: u8 = 2;
@@ -263,6 +264,9 @@ pub enum BundleEvent {
         captured_items: u64,
         captured_bytes: u64,
     },
+    CheckpointPromotionAdvanced {
+        step: PackCheckpointPromotionStep,
+    },
     ItemCaptured {
         item_id: String,
         bytes: u64,
@@ -283,6 +287,19 @@ pub enum BundleEvent {
         authenticated_chunks: u64,
         authenticated_bytes: u64,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PackCheckpointPromotionStep {
+    PromotionJournalWritten,
+    SavedPartialRetained,
+    SavedCheckpointRetained,
+    ResumedPartialActivated,
+    ResumedCheckpointActivated,
+    SupersededPartialRemoved,
+    SupersededCheckpointRemoved,
+    PromotionJournalRemoved,
 }
 
 impl BundleEvent {
@@ -496,17 +513,68 @@ impl<S: BundleSource, C: DestinationCapacity> BundleEngine<S, C> {
         let plan = request.plan;
         let destination = request.destination;
         let partial = partial_path(&destination);
+        let resumed_partial = resumed_partial_path(&partial);
+        if let Some(recovery) = request.resume {
+            reconcile_interrupted_pack_promotion(
+                plan,
+                &partial,
+                recovery,
+                &self.source,
+                &mut event_sink,
+            )?;
+        }
+        if let Some(recovery) = request.resume
+            && resumed_partial.exists()
+        {
+            let saved = authenticate_pack_checkpoint(plan, &partial, recovery, &self.source)?;
+            let advanced =
+                authenticate_pack_checkpoint(plan, &resumed_partial, recovery, &self.source)?;
+            if advanced.checkpoint.captured_items < saved.checkpoint.captured_items {
+                return Err(invalid_bundle(
+                    "interrupted resumed checkpoint is older than saved progress; restart required while preserving all artifacts",
+                ));
+            }
+            let saved_identity = pack_progress_identity(&saved, &partial)?;
+            let advanced_identity = pack_progress_identity(&advanced, &resumed_partial)?;
+            let journal_identity = write_pack_promotion_journal(
+                plan,
+                &partial,
+                saved_identity,
+                advanced_identity,
+                &advanced,
+                &mut event_sink,
+            )?;
+            promote_paused_pack(
+                &partial,
+                &resumed_partial,
+                &saved_identity,
+                &advanced_identity,
+                journal_identity,
+                &mut event_sink,
+            )?;
+        }
         let resume = request
             .resume
             .map(|recovery| authenticate_pack_checkpoint(plan, &partial, recovery, &self.source))
             .transpose()?;
+        let resumed_partial_identity = resume
+            .as_ref()
+            .map(|progress| {
+                progress.file.metadata().map_err(|source| CoreError::Io {
+                    action: "identify authenticated partial Bundle",
+                    path: partial.clone(),
+                    source,
+                })
+            })
+            .transpose()?;
+        let resumed_checkpoint_identity = resume
+            .as_ref()
+            .map(|progress| progress.checkpoint_identity.clone());
         if resume.is_none() && partial.exists() {
             return Err(CoreError::DestinationAlreadyExists(partial));
         }
         let output_partial = if resume.is_some() {
-            let mut path = partial.as_os_str().to_os_string();
-            path.push(".resume");
-            PathBuf::from(path)
+            resumed_partial
         } else {
             partial.clone()
         };
@@ -572,12 +640,58 @@ impl<S: BundleSource, C: DestinationCapacity> BundleEngine<S, C> {
             let _ = fs::remove_file(&output_partial);
         }
         let state = write_result?;
-        if request.resume.is_some() && state == PackState::Paused {
-            promote_paused_pack(&partial, &output_partial)?;
+        if let (Some(recovery), PackState::Paused) = (request.resume, state) {
+            let advanced =
+                authenticate_pack_checkpoint(plan, &output_partial, recovery, &self.source)?;
+            let saved_identity = PackProgressIdentity {
+                partial: pack_file_identity(
+                    resumed_partial_identity
+                        .as_ref()
+                        .expect("Resume authenticated partial identity"),
+                )?,
+                checkpoint: pack_file_identity(
+                    resumed_checkpoint_identity
+                        .as_ref()
+                        .expect("Resume authenticated checkpoint identity"),
+                )?,
+            };
+            let advanced_identity = pack_progress_identity(&advanced, &output_partial)?;
+            let journal_identity = write_pack_promotion_journal(
+                plan,
+                &partial,
+                saved_identity,
+                advanced_identity,
+                &advanced,
+                &mut event_sink,
+            )?;
+            promote_paused_pack(
+                &partial,
+                &output_partial,
+                &saved_identity,
+                &advanced_identity,
+                journal_identity,
+                &mut event_sink,
+            )?;
         }
         if request.resume.is_some() && state == PackState::Complete {
-            let _ = fs::remove_file(&partial);
-            let _ = fs::remove_file(pack_checkpoint_path(&partial));
+            if resumed_partial_identity.as_ref().is_some_and(|expected| {
+                fs::symlink_metadata(&partial)
+                    .ok()
+                    .is_some_and(|current| same_pack_file(expected, &current))
+            }) {
+                let _ = fs::remove_file(&partial);
+            }
+            let checkpoint = pack_checkpoint_path(&partial);
+            if resumed_checkpoint_identity
+                .as_ref()
+                .is_some_and(|expected| {
+                    fs::symlink_metadata(&checkpoint)
+                        .ok()
+                        .is_some_and(|current| same_pack_file(expected, &current))
+                })
+            {
+                let _ = fs::remove_file(checkpoint);
+            }
         }
 
         Ok(PackReport {
@@ -991,6 +1105,7 @@ struct PackCheckpoint {
 
 struct AuthenticatedPackCheckpoint {
     file: fs::File,
+    checkpoint_identity: fs::Metadata,
     checkpoint: PackCheckpoint,
     keys: BundleKeys,
     context: RecordContext,
@@ -1000,6 +1115,22 @@ struct AuthenticatedPackCheckpoint {
 fn authenticate_pack_checkpoint(
     plan: &Plan,
     partial: &Path,
+    recovery: &PackRecoveryContext,
+    source_adapter: &impl BundleSource,
+) -> Result<AuthenticatedPackCheckpoint, CoreError> {
+    authenticate_pack_checkpoint_at(
+        plan,
+        partial,
+        &pack_checkpoint_path(partial),
+        recovery,
+        source_adapter,
+    )
+}
+
+fn authenticate_pack_checkpoint_at(
+    plan: &Plan,
+    partial: &Path,
+    checkpoint_path: &Path,
     recovery: &PackRecoveryContext,
     source_adapter: &impl BundleSource,
 ) -> Result<AuthenticatedPackCheckpoint, CoreError> {
@@ -1032,20 +1163,25 @@ fn authenticate_pack_checkpoint(
         bundle_identifier: opened.bundle_identifier,
         nonce_prefix: opened.nonce_prefix,
     };
-    let checkpoint_path = pack_checkpoint_path(partial);
     let mut bytes = Vec::new();
-    open_bundle_file(&checkpoint_path)
+    let checkpoint_file = open_bundle_file(checkpoint_path)
         .map_err(|error| match error {
             CoreError::Io { ref source, .. } if source.kind() == io::ErrorKind::NotFound => {
                 invalid_bundle("Pack checkpoint is missing; restart required at a new destination, preserving partial output")
             }
             other => other,
-        })?
+        })?;
+    let checkpoint_identity = checkpoint_file.metadata().map_err(|source| CoreError::Io {
+        action: "identify authenticated Pack checkpoint",
+        path: checkpoint_path.to_path_buf(),
+        source,
+    })?;
+    checkpoint_file
         .take(MAX_PACK_CHECKPOINT + 49)
         .read_to_end(&mut bytes)
         .map_err(|source| CoreError::Io {
             action: "read authenticated Pack checkpoint",
-            path: checkpoint_path,
+            path: checkpoint_path.to_path_buf(),
             source,
         })?;
     if bytes.len() < 48
@@ -1080,6 +1216,44 @@ fn authenticate_pack_checkpoint(
             "Pack checkpoint does not match the approved Plan or partial Bundle; restart required",
         ));
     }
+    file.seek(SeekFrom::Start(0))
+        .map_err(|source| CoreError::Io {
+            action: "rewind authenticated partial Bundle",
+            path: partial.to_path_buf(),
+            source,
+        })?;
+    let mut prefix_hasher = blake3::Hasher::new();
+    let mut remaining = checkpoint.partial_length;
+    let mut buffer = [0_u8; 64 * 1024];
+    while remaining > 0 {
+        let requested = usize::try_from(remaining.min(buffer.len() as u64))
+            .expect("bounded partial Bundle hash buffer");
+        let read = file
+            .read(&mut buffer[..requested])
+            .map_err(|source| CoreError::Io {
+                action: "hash authenticated partial Bundle",
+                path: partial.to_path_buf(),
+                source,
+            })?;
+        if read == 0 {
+            return Err(invalid_bundle(
+                "Pack checkpoint partial Bundle is truncated; restart required",
+            ));
+        }
+        prefix_hasher.update(&buffer[..read]);
+        remaining -= read as u64;
+    }
+    if prefix_hasher.finalize().to_hex().as_str() != checkpoint.partial_hash {
+        return Err(invalid_bundle(
+            "Pack checkpoint partial Bundle changed; restart required while preserving older progress",
+        ));
+    }
+    file.seek(SeekFrom::Start(HEADER_LENGTH as u64))
+        .map_err(|source| CoreError::Io {
+            action: "position authenticated partial Bundle content",
+            path: partial.to_path_buf(),
+            source,
+        })?;
     encode_index(&checkpoint.index)?;
     for (captured, planned) in checkpoint.manifest_items.iter().zip(plan.items()) {
         if captured.id != planned.id
@@ -1118,6 +1292,7 @@ fn authenticate_pack_checkpoint(
     }
     Ok(AuthenticatedPackCheckpoint {
         file,
+        checkpoint_identity,
         checkpoint,
         keys,
         context,
@@ -1291,7 +1466,388 @@ fn pack_checkpoint_path(partial: &Path) -> PathBuf {
     PathBuf::from(path)
 }
 
-fn promote_paused_pack(partial: &Path, resumed: &Path) -> Result<(), CoreError> {
+fn resumed_partial_path(partial: &Path) -> PathBuf {
+    let mut path = partial.as_os_str().to_os_string();
+    path.push(".resume");
+    PathBuf::from(path)
+}
+
+fn previous_partial_path(partial: &Path) -> PathBuf {
+    let mut path = partial.as_os_str().to_os_string();
+    path.push(".previous");
+    PathBuf::from(path)
+}
+
+fn pack_promotion_journal_path(partial: &Path) -> PathBuf {
+    let mut path = partial.as_os_str().to_os_string();
+    path.push(".promotion");
+    PathBuf::from(path)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PackFileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PackProgressIdentity {
+    partial: PackFileIdentity,
+    checkpoint: PackFileIdentity,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PackPromotionJournal {
+    schema_version: u32,
+    plan_hash: String,
+    saved: PackProgressIdentity,
+    advanced: PackProgressIdentity,
+}
+
+fn pack_promotion_journal_aad(context: &RecordContext) -> Vec<u8> {
+    let mut aad = b"INIZA-PACK-PROMOTION-V1".to_vec();
+    aad.extend_from_slice(&context.header_hash);
+    aad
+}
+
+fn write_pack_promotion_journal(
+    plan: &Plan,
+    partial: &Path,
+    saved: PackProgressIdentity,
+    advanced: PackProgressIdentity,
+    advanced_progress: &AuthenticatedPackCheckpoint,
+    events: &mut Option<&mut dyn BundleEventSink>,
+) -> Result<PackFileIdentity, CoreError> {
+    let journal = PackPromotionJournal {
+        schema_version: 1,
+        plan_hash: plan.approval_hash()?,
+        saved,
+        advanced,
+    };
+    let plaintext = Zeroizing::new(
+        serde_json::to_vec(&journal)
+            .map_err(|_| invalid_bundle("Pack promotion journal cannot be encoded"))?,
+    );
+    if plaintext.len() as u64 > MAX_PACK_PROMOTION_JOURNAL {
+        return Err(invalid_bundle(
+            "Pack promotion journal exceeds its size limit",
+        ));
+    }
+    let nonce = random_array::<24>()?;
+    let ciphertext = encrypt(
+        &advanced_progress.keys.checkpoint,
+        &nonce,
+        &pack_promotion_journal_aad(&advanced_progress.context),
+        &plaintext,
+    )?;
+    let path = pack_promotion_journal_path(partial);
+    let mut output = create_private_pack_file(&path).map_err(|source| CoreError::Io {
+        action: "create authenticated Pack promotion journal",
+        path: path.clone(),
+        source,
+    })?;
+    output
+        .write_all(b"IZ2PROM1")
+        .and_then(|()| output.write_all(&nonce))
+        .and_then(|()| output.write_all(&ciphertext))
+        .and_then(|()| output.sync_all())
+        .map_err(|source| CoreError::Io {
+            action: "synchronize authenticated Pack promotion journal",
+            path: path.clone(),
+            source,
+        })?;
+    let identity = pack_file_identity(&output.metadata().map_err(|source| CoreError::Io {
+        action: "identify authenticated Pack promotion journal",
+        path: path.clone(),
+        source,
+    })?)?;
+    let parent = partial
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|source| CoreError::Io {
+            action: "synchronize Pack promotion journal directory",
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    emit_event(
+        events,
+        BundleEvent::CheckpointPromotionAdvanced {
+            step: PackCheckpointPromotionStep::PromotionJournalWritten,
+        },
+    );
+    Ok(identity)
+}
+
+fn read_pack_promotion_journal(
+    plan: &Plan,
+    partial: &Path,
+    advanced_progress: &AuthenticatedPackCheckpoint,
+) -> Result<(PackPromotionJournal, PackFileIdentity), CoreError> {
+    let path = pack_promotion_journal_path(partial);
+    let file = open_bundle_file(&path)?;
+    let identity = pack_file_identity(&file.metadata().map_err(|source| CoreError::Io {
+        action: "identify authenticated Pack promotion journal",
+        path: path.clone(),
+        source,
+    })?)?;
+    let mut bytes = Vec::new();
+    file.take(MAX_PACK_PROMOTION_JOURNAL + 49)
+        .read_to_end(&mut bytes)
+        .map_err(|source| CoreError::Io {
+            action: "read authenticated Pack promotion journal",
+            path: path.clone(),
+            source,
+        })?;
+    if bytes.len() < 48
+        || bytes.len() as u64 > MAX_PACK_PROMOTION_JOURNAL + 48
+        || &bytes[..8] != b"IZ2PROM1"
+    {
+        return Err(invalid_bundle(
+            "Pack promotion journal is missing, oversized, or incompatible",
+        ));
+    }
+    let nonce: [u8; 24] = bytes[8..32].try_into().expect("bounded journal nonce");
+    let plaintext = Zeroizing::new(decrypt(
+        &advanced_progress.keys.checkpoint,
+        &nonce,
+        &pack_promotion_journal_aad(&advanced_progress.context),
+        &bytes[32..],
+    )?);
+    let journal: PackPromotionJournal = serde_json::from_slice(&plaintext)
+        .map_err(|_| invalid_bundle("Pack promotion journal encoding is invalid"))?;
+    let canonical = Zeroizing::new(
+        serde_json::to_vec(&journal)
+            .map_err(|_| invalid_bundle("Pack promotion journal cannot be canonicalized"))?,
+    );
+    if *canonical != *plaintext
+        || journal.schema_version != 1
+        || journal.plan_hash != plan.approval_hash()?
+    {
+        return Err(invalid_bundle(
+            "Pack promotion journal does not match the approved Plan",
+        ));
+    }
+    Ok((journal, identity))
+}
+
+fn pack_progress_identity(
+    progress: &AuthenticatedPackCheckpoint,
+    partial: &Path,
+) -> Result<PackProgressIdentity, CoreError> {
+    Ok(PackProgressIdentity {
+        partial: pack_file_identity(&progress.file.metadata().map_err(|source| {
+            CoreError::Io {
+                action: "identify authenticated partial Bundle",
+                path: partial.to_path_buf(),
+                source,
+            }
+        })?)?,
+        checkpoint: pack_file_identity(&progress.checkpoint_identity)?,
+    })
+}
+
+fn pack_file_identity(metadata: &fs::Metadata) -> Result<PackFileIdentity, CoreError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(PackFileIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        Err(invalid_bundle(
+            "Pack checkpoint promotion requires stable file identities on this platform",
+        ))
+    }
+}
+
+fn same_pack_identity(expected: PackFileIdentity, current: &fs::Metadata) -> bool {
+    current.is_file()
+        && pack_file_identity(current)
+            .map(|identity| identity == expected)
+            .unwrap_or(false)
+}
+
+fn pack_artifact_exists(path: &Path) -> Result<bool, CoreError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(CoreError::Io {
+            action: "inspect interrupted Pack checkpoint promotion",
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+fn reconcile_interrupted_pack_promotion(
+    plan: &Plan,
+    partial: &Path,
+    recovery: &PackRecoveryContext,
+    source_adapter: &impl BundleSource,
+    events: &mut Option<&mut dyn BundleEventSink>,
+) -> Result<(), CoreError> {
+    let checkpoint = pack_checkpoint_path(partial);
+    let resumed = resumed_partial_path(partial);
+    let resumed_checkpoint = pack_checkpoint_path(&resumed);
+    let previous = previous_partial_path(partial);
+    let previous_checkpoint = pack_checkpoint_path(&previous);
+    let journal_path = pack_promotion_journal_path(partial);
+    let state = [
+        pack_artifact_exists(partial)?,
+        pack_artifact_exists(&checkpoint)?,
+        pack_artifact_exists(&resumed)?,
+        pack_artifact_exists(&resumed_checkpoint)?,
+        pack_artifact_exists(&previous)?,
+        pack_artifact_exists(&previous_checkpoint)?,
+        pack_artifact_exists(&journal_path)?,
+    ];
+    if !state[4] && !state[5] && !state[6] {
+        return Ok(());
+    }
+
+    let (saved_paths, advanced_paths, completed_steps) = match state {
+        [true, true, true, true, false, false, true] => (
+            Some((partial, checkpoint.as_path())),
+            (resumed.as_path(), resumed_checkpoint.as_path()),
+            0,
+        ),
+        [false, true, true, true, true, false, _] => (
+            Some((previous.as_path(), checkpoint.as_path())),
+            (resumed.as_path(), resumed_checkpoint.as_path()),
+            1,
+        ),
+        [false, false, true, true, true, true, _] => (
+            Some((previous.as_path(), previous_checkpoint.as_path())),
+            (resumed.as_path(), resumed_checkpoint.as_path()),
+            2,
+        ),
+        [true, false, false, true, true, true, _] => (
+            Some((previous.as_path(), previous_checkpoint.as_path())),
+            (partial, resumed_checkpoint.as_path()),
+            3,
+        ),
+        [true, true, false, false, true, true, _] => (
+            Some((previous.as_path(), previous_checkpoint.as_path())),
+            (partial, checkpoint.as_path()),
+            4,
+        ),
+        [true, true, false, false, false, true, true] => (None, (partial, checkpoint.as_path()), 5),
+        [true, true, false, false, false, false, true] => {
+            (None, (partial, checkpoint.as_path()), 6)
+        }
+        _ => {
+            return Err(invalid_bundle(
+                "interrupted Pack checkpoint promotion is ambiguous; restart at a new destination while preserving all artifacts",
+            ));
+        }
+    };
+    let advanced = authenticate_pack_checkpoint_at(
+        plan,
+        advanced_paths.0,
+        advanced_paths.1,
+        recovery,
+        source_adapter,
+    )?;
+    let advanced_identity = pack_progress_identity(&advanced, advanced_paths.0)?;
+    let saved = saved_paths
+        .map(|paths| {
+            authenticate_pack_checkpoint_at(plan, paths.0, paths.1, recovery, source_adapter)
+                .map(|progress| (progress, paths.0))
+        })
+        .transpose()?;
+    let saved_identity = saved
+        .as_ref()
+        .map(|(progress, path)| pack_progress_identity(progress, path))
+        .transpose()?;
+    if saved.as_ref().is_some_and(|(progress, _)| {
+        advanced.checkpoint.captured_items < progress.checkpoint.captured_items
+    }) {
+        return Err(invalid_bundle(
+            "interrupted resumed checkpoint is older than saved progress; restart required while preserving all artifacts",
+        ));
+    }
+    let (journal, journal_identity) = if state[6] {
+        read_pack_promotion_journal(plan, partial, &advanced)?
+    } else {
+        let saved_identity = saved_identity.ok_or_else(|| {
+            invalid_bundle(
+                "interrupted Pack checkpoint cleanup has no authenticated promotion journal; restart at a new destination while preserving all artifacts",
+            )
+        })?;
+        let journal_identity = write_pack_promotion_journal(
+            plan,
+            partial,
+            saved_identity,
+            advanced_identity,
+            &advanced,
+            events,
+        )?;
+        (
+            PackPromotionJournal {
+                schema_version: 1,
+                plan_hash: plan.approval_hash()?,
+                saved: saved_identity,
+                advanced: advanced_identity,
+            },
+            journal_identity,
+        )
+    };
+    if journal.advanced != advanced_identity
+        || saved_identity.is_some_and(|identity| identity != journal.saved)
+    {
+        return Err(invalid_bundle(
+            "Pack promotion journal does not identify the authenticated progress artifacts",
+        ));
+    }
+    continue_pack_checkpoint_promotion(
+        partial,
+        &resumed,
+        &journal.saved,
+        &journal.advanced,
+        journal_identity,
+        completed_steps,
+        events,
+    )
+}
+
+fn promote_paused_pack(
+    partial: &Path,
+    resumed: &Path,
+    saved: &PackProgressIdentity,
+    advanced: &PackProgressIdentity,
+    journal_identity: PackFileIdentity,
+    events: &mut Option<&mut dyn BundleEventSink>,
+) -> Result<(), CoreError> {
+    continue_pack_checkpoint_promotion(
+        partial,
+        resumed,
+        saved,
+        advanced,
+        journal_identity,
+        0,
+        events,
+    )
+}
+
+fn continue_pack_checkpoint_promotion(
+    partial: &Path,
+    resumed: &Path,
+    saved: &PackProgressIdentity,
+    advanced: &PackProgressIdentity,
+    journal_identity: PackFileIdentity,
+    completed_steps: usize,
+    events: &mut Option<&mut dyn BundleEventSink>,
+) -> Result<(), CoreError> {
     let parent = partial
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -1304,31 +1860,64 @@ fn promote_paused_pack(partial: &Path, resumed: &Path) -> Result<(), CoreError> 
                 source,
             }
         })?;
-    let mut previous = partial.as_os_str().to_os_string();
-    previous.push(".previous");
-    let previous = PathBuf::from(previous);
+    let original_checkpoint = pack_checkpoint_path(partial);
+    let previous = previous_partial_path(partial);
     let previous_checkpoint = pack_checkpoint_path(&previous);
-    for path in [&previous, &previous_checkpoint] {
-        match directory.symlink_metadata(Path::new(path.file_name().expect("Pack artifact name"))) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Ok(_) => return Err(CoreError::DestinationAlreadyExists(path.to_path_buf())),
-            Err(source) => {
-                return Err(CoreError::Io {
-                    action: "inspect previous Pack checkpoint",
-                    path: path.to_path_buf(),
-                    source,
-                });
+    if completed_steps == 0 {
+        for path in [&previous, &previous_checkpoint] {
+            match directory
+                .symlink_metadata(Path::new(path.file_name().expect("Pack artifact name")))
+            {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Ok(_) => return Err(CoreError::DestinationAlreadyExists(path.to_path_buf())),
+                Err(source) => {
+                    return Err(CoreError::Io {
+                        action: "inspect previous Pack checkpoint",
+                        path: path.to_path_buf(),
+                        source,
+                    });
+                }
             }
         }
     }
-    let original_checkpoint = pack_checkpoint_path(partial);
     let resumed_checkpoint = pack_checkpoint_path(resumed);
-    for (from, to) in [
-        (partial, previous.as_path()),
-        (original_checkpoint.as_path(), previous_checkpoint.as_path()),
-        (resumed, partial),
-        (resumed_checkpoint.as_path(), original_checkpoint.as_path()),
-    ] {
+    let transitions = [
+        (
+            partial,
+            previous.as_path(),
+            &saved.partial,
+            PackCheckpointPromotionStep::SavedPartialRetained,
+        ),
+        (
+            original_checkpoint.as_path(),
+            previous_checkpoint.as_path(),
+            &saved.checkpoint,
+            PackCheckpointPromotionStep::SavedCheckpointRetained,
+        ),
+        (
+            resumed,
+            partial,
+            &advanced.partial,
+            PackCheckpointPromotionStep::ResumedPartialActivated,
+        ),
+        (
+            resumed_checkpoint.as_path(),
+            original_checkpoint.as_path(),
+            &advanced.checkpoint,
+            PackCheckpointPromotionStep::ResumedCheckpointActivated,
+        ),
+    ];
+    for (from, to, expected, step) in transitions.into_iter().skip(completed_steps) {
+        let current = fs::symlink_metadata(from).map_err(|source| CoreError::Io {
+            action: "revalidate Pack progress before promotion",
+            path: from.to_path_buf(),
+            source,
+        })?;
+        if !same_pack_identity(*expected, &current) {
+            return Err(invalid_bundle(
+                "saved Pack progress identity changed; restart required while preserving all artifacts",
+            ));
+        }
         directory
             .exclusive_rename(
                 Path::new(from.file_name().expect("Pack artifact name")),
@@ -1341,8 +1930,33 @@ fn promote_paused_pack(partial: &Path, resumed: &Path) -> Result<(), CoreError> 
                 path: to.to_path_buf(),
                 source,
             })?;
+        emit_event(events, BundleEvent::CheckpointPromotionAdvanced { step });
     }
-    for path in [&previous, &previous_checkpoint] {
+    for (path, expected, step) in [
+        (
+            &previous,
+            &saved.partial,
+            PackCheckpointPromotionStep::SupersededPartialRemoved,
+        ),
+        (
+            &previous_checkpoint,
+            &saved.checkpoint,
+            PackCheckpointPromotionStep::SupersededCheckpointRemoved,
+        ),
+    ]
+    .into_iter()
+    .skip(completed_steps.saturating_sub(4))
+    {
+        let current = fs::symlink_metadata(path).map_err(|source| CoreError::Io {
+            action: "revalidate superseded Pack progress before cleanup",
+            path: path.to_path_buf(),
+            source,
+        })?;
+        if !same_pack_identity(*expected, &current) {
+            return Err(invalid_bundle(
+                "superseded Pack progress identity changed; cleanup stopped while preserving all artifacts",
+            ));
+        }
         directory
             .remove_file(Path::new(path.file_name().expect("Pack artifact name")))
             .map_err(|source| CoreError::Io {
@@ -1350,12 +1964,41 @@ fn promote_paused_pack(partial: &Path, resumed: &Path) -> Result<(), CoreError> 
                 path: path.to_path_buf(),
                 source,
             })?;
+        directory.sync().map_err(|source| CoreError::Io {
+            action: "synchronize superseded Pack checkpoint cleanup",
+            path: parent.to_path_buf(),
+            source,
+        })?;
+        emit_event(events, BundleEvent::CheckpointPromotionAdvanced { step });
     }
-    directory.sync().map_err(|source| CoreError::Io {
-        action: "synchronize advanced Pack checkpoint",
-        path: parent.to_path_buf(),
+    let journal = pack_promotion_journal_path(partial);
+    let current = fs::symlink_metadata(&journal).map_err(|source| CoreError::Io {
+        action: "revalidate Pack promotion journal before cleanup",
+        path: journal.clone(),
         source,
-    })
+    })?;
+    if !same_pack_identity(journal_identity, &current) {
+        return Err(invalid_bundle(
+            "Pack promotion journal identity changed; cleanup stopped while preserving all artifacts",
+        ));
+    }
+    directory
+        .remove_file(Path::new(
+            journal.file_name().expect("Pack promotion journal name"),
+        ))
+        .and_then(|()| directory.sync())
+        .map_err(|source| CoreError::Io {
+            action: "remove completed Pack promotion journal",
+            path: journal,
+            source,
+        })?;
+    emit_event(
+        events,
+        BundleEvent::CheckpointPromotionAdvanced {
+            step: PackCheckpointPromotionStep::PromotionJournalRemoved,
+        },
+    );
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

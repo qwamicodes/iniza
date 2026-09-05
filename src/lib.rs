@@ -17,8 +17,8 @@ mod restore_fs;
 pub use bundle::{
     BundleEngine, BundleEvent, BundleEventSink, BundleSource, BundleSourceObservation,
     BundleVerification, DestinationCapacity, InspectRequest, LocalBundleSource,
-    LocalDestinationCapacity, PackCancellation, PackRecoveryContext, PackReport, PackRequest,
-    PackState, VerifyRequest,
+    LocalDestinationCapacity, PackCancellation, PackCheckpointPromotionStep, PackRecoveryContext,
+    PackReport, PackRequest, PackState, VerifyRequest,
 };
 pub use iz1::{
     AuthenticatedBundleSummary, Iz1Prototype, RecoveryMethod, RecoverySecret, SealedBundle,
