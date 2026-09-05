@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
@@ -41,15 +41,69 @@ const RECORD_INDEX: u8 = 3;
 const RECORD_COMPLETION: u8 = 255;
 
 #[derive(Debug, Default)]
-pub struct PackCancellation(AtomicBool);
+pub struct PackCancellation(AtomicU8);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackStopAction {
+    FinishCurrentItem,
+    TerminateImmediately,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackPersistenceTransition {
+    CreatePromotionJournal,
+    WritePromotionJournal,
+    SynchronizePromotionJournal,
+    SynchronizePromotionJournalDirectory,
+    PublishPromotionJournal,
+    SynchronizePublishedPromotionJournal,
+    MoveSavedPartial,
+    SynchronizeSavedPartialMove,
+    MoveSavedCheckpoint,
+    SynchronizeSavedCheckpointMove,
+    MoveResumedPartial,
+    SynchronizeResumedPartialMove,
+    MoveResumedCheckpoint,
+    SynchronizeResumedCheckpointMove,
+    RemoveSupersededPartial,
+    SynchronizeSupersededPartialRemoval,
+    RemoveSupersededCheckpoint,
+    SynchronizeSupersededCheckpointRemoval,
+    RemovePromotionJournal,
+    SynchronizePromotionJournalRemoval,
+}
+
+pub trait PackPersistence: Send + Sync {
+    fn prepare_transition(&self, transition: PackPersistenceTransition) -> io::Result<()>;
+}
+
+#[derive(Debug, Default)]
+pub struct LocalPackPersistence;
+
+impl PackPersistence for LocalPackPersistence {
+    fn prepare_transition(&self, _transition: PackPersistenceTransition) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+static LOCAL_PACK_PERSISTENCE: LocalPackPersistence = LocalPackPersistence;
 
 impl PackCancellation {
-    pub fn request_stop(&self) {
-        self.0.store(true, Ordering::SeqCst);
+    pub fn request_stop(&self) -> PackStopAction {
+        if self
+            .0
+            .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            PackStopAction::FinishCurrentItem
+        } else {
+            self.0.store(2, Ordering::SeqCst);
+            PackStopAction::TerminateImmediately
+        }
     }
 
     fn is_requested(&self) -> bool {
-        self.0.load(Ordering::SeqCst)
+        self.0.load(Ordering::SeqCst) > 0
     }
 }
 
@@ -148,6 +202,7 @@ pub struct PackRequest<'a> {
     cancellation: Option<&'a PackCancellation>,
     resume: Option<&'a PackRecoveryContext>,
     recovery: Option<&'a PackRecoveryContext>,
+    persistence: &'a dyn PackPersistence,
 }
 
 impl<'a> PackRequest<'a> {
@@ -159,6 +214,7 @@ impl<'a> PackRequest<'a> {
             cancellation: None,
             resume: None,
             recovery: None,
+            persistence: &LOCAL_PACK_PERSISTENCE,
         }
     }
 
@@ -180,6 +236,11 @@ impl<'a> PackRequest<'a> {
 
     pub fn with_cancellation(mut self, cancellation: &'a PackCancellation) -> Self {
         self.cancellation = Some(cancellation);
+        self
+    }
+
+    pub fn with_persistence(mut self, persistence: &'a dyn PackPersistence) -> Self {
+        self.persistence = persistence;
         self
     }
 
@@ -510,6 +571,7 @@ impl<S: BundleSource, C: DestinationCapacity> BundleEngine<S, C> {
     pub fn pack(&self, mut request: PackRequest<'_>) -> Result<PackReport, CoreError> {
         validate_pack_request(&request)?;
         let mut event_sink = request.event_sink.take();
+        let persistence = request.persistence;
         let plan = request.plan;
         let destination = request.destination;
         let partial = partial_path(&destination);
@@ -520,6 +582,7 @@ impl<S: BundleSource, C: DestinationCapacity> BundleEngine<S, C> {
                 &partial,
                 recovery,
                 &self.source,
+                persistence,
                 &mut event_sink,
             )?;
         }
@@ -542,6 +605,7 @@ impl<S: BundleSource, C: DestinationCapacity> BundleEngine<S, C> {
                 saved_identity,
                 advanced_identity,
                 &advanced,
+                persistence,
                 &mut event_sink,
             )?;
             promote_paused_pack(
@@ -550,6 +614,7 @@ impl<S: BundleSource, C: DestinationCapacity> BundleEngine<S, C> {
                 &saved_identity,
                 &advanced_identity,
                 journal_identity,
+                persistence,
                 &mut event_sink,
             )?;
         }
@@ -662,6 +727,7 @@ impl<S: BundleSource, C: DestinationCapacity> BundleEngine<S, C> {
                 saved_identity,
                 advanced_identity,
                 &advanced,
+                persistence,
                 &mut event_sink,
             )?;
             promote_paused_pack(
@@ -670,6 +736,7 @@ impl<S: BundleSource, C: DestinationCapacity> BundleEngine<S, C> {
                 &saved_identity,
                 &advanced_identity,
                 journal_identity,
+                persistence,
                 &mut event_sink,
             )?;
         }
@@ -1484,6 +1551,13 @@ fn pack_promotion_journal_path(partial: &Path) -> PathBuf {
     PathBuf::from(path)
 }
 
+fn pack_promotion_journal_staging_path(partial: &Path, nonce: &[u8; 24]) -> PathBuf {
+    let mut path = partial.as_os_str().to_os_string();
+    path.push(".promotion.pending-");
+    path.push(blake3::hash(nonce).to_hex().as_str());
+    PathBuf::from(path)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PackFileIdentity {
@@ -1519,6 +1593,7 @@ fn write_pack_promotion_journal(
     saved: PackProgressIdentity,
     advanced: PackProgressIdentity,
     advanced_progress: &AuthenticatedPackCheckpoint,
+    persistence: &dyn PackPersistence,
     events: &mut Option<&mut dyn BundleEventSink>,
 ) -> Result<PackFileIdentity, CoreError> {
     let journal = PackPromotionJournal {
@@ -1544,30 +1619,63 @@ fn write_pack_promotion_journal(
         &plaintext,
     )?;
     let path = pack_promotion_journal_path(partial);
-    let mut output = create_private_pack_file(&path).map_err(|source| CoreError::Io {
+    let staging = pack_promotion_journal_staging_path(partial, &nonce);
+    persistence
+        .prepare_transition(PackPersistenceTransition::CreatePromotionJournal)
+        .map_err(|source| CoreError::Io {
+            action: "prepare authenticated Pack promotion journal creation",
+            path: staging.clone(),
+            source,
+        })?;
+    let mut output = create_private_pack_file(&staging).map_err(|source| CoreError::Io {
         action: "create authenticated Pack promotion journal",
-        path: path.clone(),
+        path: staging.clone(),
         source,
     })?;
+    persistence
+        .prepare_transition(PackPersistenceTransition::WritePromotionJournal)
+        .map_err(|source| CoreError::Io {
+            action: "prepare authenticated Pack promotion journal write",
+            path: staging.clone(),
+            source,
+        })?;
     output
         .write_all(b"IZ2PROM1")
         .and_then(|()| output.write_all(&nonce))
         .and_then(|()| output.write_all(&ciphertext))
-        .and_then(|()| output.sync_all())
         .map_err(|source| CoreError::Io {
-            action: "synchronize authenticated Pack promotion journal",
-            path: path.clone(),
+            action: "write authenticated Pack promotion journal",
+            path: staging.clone(),
             source,
         })?;
+    persistence
+        .prepare_transition(PackPersistenceTransition::SynchronizePromotionJournal)
+        .map_err(|source| CoreError::Io {
+            action: "prepare authenticated Pack promotion journal synchronization",
+            path: staging.clone(),
+            source,
+        })?;
+    output.sync_all().map_err(|source| CoreError::Io {
+        action: "synchronize authenticated Pack promotion journal",
+        path: staging.clone(),
+        source,
+    })?;
     let identity = pack_file_identity(&output.metadata().map_err(|source| CoreError::Io {
         action: "identify authenticated Pack promotion journal",
-        path: path.clone(),
+        path: staging.clone(),
         source,
     })?)?;
     let parent = partial
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
+    persistence
+        .prepare_transition(PackPersistenceTransition::SynchronizePromotionJournalDirectory)
+        .map_err(|source| CoreError::Io {
+            action: "prepare Pack promotion journal directory synchronization",
+            path: parent.to_path_buf(),
+            source,
+        })?;
     fs::File::open(parent)
         .and_then(|directory| directory.sync_all())
         .map_err(|source| CoreError::Io {
@@ -1575,6 +1683,44 @@ fn write_pack_promotion_journal(
             path: parent.to_path_buf(),
             source,
         })?;
+    let directory =
+        crate::restore_fs::RestoreDirectory::open_ambient(parent).map_err(|source| {
+            CoreError::Io {
+                action: "open Pack promotion journal directory",
+                path: parent.to_path_buf(),
+                source,
+            }
+        })?;
+    persistence
+        .prepare_transition(PackPersistenceTransition::PublishPromotionJournal)
+        .map_err(|source| CoreError::Io {
+            action: "prepare authenticated Pack promotion journal publication",
+            path: path.clone(),
+            source,
+        })?;
+    directory
+        .exclusive_rename(
+            Path::new(staging.file_name().expect("Pack journal staging name")),
+            &directory,
+            Path::new(path.file_name().expect("Pack promotion journal name")),
+        )
+        .map_err(|source| CoreError::Io {
+            action: "publish authenticated Pack promotion journal without overwrite",
+            path: path.clone(),
+            source,
+        })?;
+    persistence
+        .prepare_transition(PackPersistenceTransition::SynchronizePublishedPromotionJournal)
+        .map_err(|source| CoreError::Io {
+            action: "prepare published Pack promotion journal synchronization",
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    directory.sync().map_err(|source| CoreError::Io {
+        action: "synchronize published Pack promotion journal",
+        path: parent.to_path_buf(),
+        source,
+    })?;
     emit_event(
         events,
         BundleEvent::CheckpointPromotionAdvanced {
@@ -1694,6 +1840,7 @@ fn reconcile_interrupted_pack_promotion(
     partial: &Path,
     recovery: &PackRecoveryContext,
     source_adapter: &impl BundleSource,
+    persistence: &dyn PackPersistence,
     events: &mut Option<&mut dyn BundleEventSink>,
 ) -> Result<(), CoreError> {
     let checkpoint = pack_checkpoint_path(partial);
@@ -1790,6 +1937,7 @@ fn reconcile_interrupted_pack_promotion(
             saved_identity,
             advanced_identity,
             &advanced,
+            persistence,
             events,
         )?;
         (
@@ -1810,11 +1958,14 @@ fn reconcile_interrupted_pack_promotion(
         ));
     }
     continue_pack_checkpoint_promotion(
-        partial,
-        &resumed,
-        &journal.saved,
-        &journal.advanced,
-        journal_identity,
+        PackPromotionTransaction {
+            partial,
+            resumed: &resumed,
+            saved: &journal.saved,
+            advanced: &journal.advanced,
+            journal_identity,
+            persistence,
+        },
         completed_steps,
         events,
     )
@@ -1826,28 +1977,45 @@ fn promote_paused_pack(
     saved: &PackProgressIdentity,
     advanced: &PackProgressIdentity,
     journal_identity: PackFileIdentity,
+    persistence: &dyn PackPersistence,
     events: &mut Option<&mut dyn BundleEventSink>,
 ) -> Result<(), CoreError> {
     continue_pack_checkpoint_promotion(
-        partial,
-        resumed,
-        saved,
-        advanced,
-        journal_identity,
+        PackPromotionTransaction {
+            partial,
+            resumed,
+            saved,
+            advanced,
+            journal_identity,
+            persistence,
+        },
         0,
         events,
     )
 }
 
-fn continue_pack_checkpoint_promotion(
-    partial: &Path,
-    resumed: &Path,
-    saved: &PackProgressIdentity,
-    advanced: &PackProgressIdentity,
+struct PackPromotionTransaction<'a> {
+    partial: &'a Path,
+    resumed: &'a Path,
+    saved: &'a PackProgressIdentity,
+    advanced: &'a PackProgressIdentity,
     journal_identity: PackFileIdentity,
+    persistence: &'a dyn PackPersistence,
+}
+
+fn continue_pack_checkpoint_promotion(
+    transaction: PackPromotionTransaction<'_>,
     completed_steps: usize,
     events: &mut Option<&mut dyn BundleEventSink>,
 ) -> Result<(), CoreError> {
+    let PackPromotionTransaction {
+        partial,
+        resumed,
+        saved,
+        advanced,
+        journal_identity,
+        persistence,
+    } = transaction;
     let parent = partial
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -1887,27 +2055,37 @@ fn continue_pack_checkpoint_promotion(
             previous.as_path(),
             &saved.partial,
             PackCheckpointPromotionStep::SavedPartialRetained,
+            PackPersistenceTransition::MoveSavedPartial,
+            PackPersistenceTransition::SynchronizeSavedPartialMove,
         ),
         (
             original_checkpoint.as_path(),
             previous_checkpoint.as_path(),
             &saved.checkpoint,
             PackCheckpointPromotionStep::SavedCheckpointRetained,
+            PackPersistenceTransition::MoveSavedCheckpoint,
+            PackPersistenceTransition::SynchronizeSavedCheckpointMove,
         ),
         (
             resumed,
             partial,
             &advanced.partial,
             PackCheckpointPromotionStep::ResumedPartialActivated,
+            PackPersistenceTransition::MoveResumedPartial,
+            PackPersistenceTransition::SynchronizeResumedPartialMove,
         ),
         (
             resumed_checkpoint.as_path(),
             original_checkpoint.as_path(),
             &advanced.checkpoint,
             PackCheckpointPromotionStep::ResumedCheckpointActivated,
+            PackPersistenceTransition::MoveResumedCheckpoint,
+            PackPersistenceTransition::SynchronizeResumedCheckpointMove,
         ),
     ];
-    for (from, to, expected, step) in transitions.into_iter().skip(completed_steps) {
+    for (from, to, expected, step, move_transition, sync_transition) in
+        transitions.into_iter().skip(completed_steps)
+    {
         let current = fs::symlink_metadata(from).map_err(|source| CoreError::Io {
             action: "revalidate Pack progress before promotion",
             path: from.to_path_buf(),
@@ -1918,30 +2096,52 @@ fn continue_pack_checkpoint_promotion(
                 "saved Pack progress identity changed; restart required while preserving all artifacts",
             ));
         }
+        persistence
+            .prepare_transition(move_transition)
+            .map_err(|source| CoreError::Io {
+                action: "prepare authenticated Pack checkpoint move",
+                path: to.to_path_buf(),
+                source,
+            })?;
         directory
             .exclusive_rename(
                 Path::new(from.file_name().expect("Pack artifact name")),
                 &directory,
                 Path::new(to.file_name().expect("Pack artifact name")),
             )
-            .and_then(|()| directory.sync())
             .map_err(|source| CoreError::Io {
                 action: "advance authenticated Pack checkpoint without overwrite",
                 path: to.to_path_buf(),
                 source,
             })?;
+        persistence
+            .prepare_transition(sync_transition)
+            .map_err(|source| CoreError::Io {
+                action: "prepare authenticated Pack checkpoint directory synchronization",
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        directory.sync().map_err(|source| CoreError::Io {
+            action: "synchronize authenticated Pack checkpoint move",
+            path: parent.to_path_buf(),
+            source,
+        })?;
         emit_event(events, BundleEvent::CheckpointPromotionAdvanced { step });
     }
-    for (path, expected, step) in [
+    for (path, expected, step, remove_transition, sync_transition) in [
         (
             &previous,
             &saved.partial,
             PackCheckpointPromotionStep::SupersededPartialRemoved,
+            PackPersistenceTransition::RemoveSupersededPartial,
+            PackPersistenceTransition::SynchronizeSupersededPartialRemoval,
         ),
         (
             &previous_checkpoint,
             &saved.checkpoint,
             PackCheckpointPromotionStep::SupersededCheckpointRemoved,
+            PackPersistenceTransition::RemoveSupersededCheckpoint,
+            PackPersistenceTransition::SynchronizeSupersededCheckpointRemoval,
         ),
     ]
     .into_iter()
@@ -1957,11 +2157,25 @@ fn continue_pack_checkpoint_promotion(
                 "superseded Pack progress identity changed; cleanup stopped while preserving all artifacts",
             ));
         }
+        persistence
+            .prepare_transition(remove_transition)
+            .map_err(|source| CoreError::Io {
+                action: "prepare superseded Pack checkpoint cleanup",
+                path: path.to_path_buf(),
+                source,
+            })?;
         directory
             .remove_file(Path::new(path.file_name().expect("Pack artifact name")))
             .map_err(|source| CoreError::Io {
                 action: "remove superseded Pack checkpoint",
                 path: path.to_path_buf(),
+                source,
+            })?;
+        persistence
+            .prepare_transition(sync_transition)
+            .map_err(|source| CoreError::Io {
+                action: "prepare superseded Pack checkpoint cleanup synchronization",
+                path: parent.to_path_buf(),
                 source,
             })?;
         directory.sync().map_err(|source| CoreError::Io {
@@ -1982,16 +2196,34 @@ fn continue_pack_checkpoint_promotion(
             "Pack promotion journal identity changed; cleanup stopped while preserving all artifacts",
         ));
     }
+    persistence
+        .prepare_transition(PackPersistenceTransition::RemovePromotionJournal)
+        .map_err(|source| CoreError::Io {
+            action: "prepare completed Pack promotion journal cleanup",
+            path: journal.clone(),
+            source,
+        })?;
     directory
         .remove_file(Path::new(
             journal.file_name().expect("Pack promotion journal name"),
         ))
-        .and_then(|()| directory.sync())
         .map_err(|source| CoreError::Io {
             action: "remove completed Pack promotion journal",
-            path: journal,
+            path: journal.clone(),
             source,
         })?;
+    persistence
+        .prepare_transition(PackPersistenceTransition::SynchronizePromotionJournalRemoval)
+        .map_err(|source| CoreError::Io {
+            action: "prepare Pack promotion journal cleanup synchronization",
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    directory.sync().map_err(|source| CoreError::Io {
+        action: "synchronize Pack promotion journal cleanup",
+        path: parent.to_path_buf(),
+        source,
+    })?;
     emit_event(
         events,
         BundleEvent::CheckpointPromotionAdvanced {

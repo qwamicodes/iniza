@@ -65,6 +65,24 @@ Compilation should succeed. Every walkthrough command below creates its own isol
 
    Expect one passing test. Disposable children exit with code 73 after the promotion journal is synchronized, after each of the four synchronized exclusive renames, after each synchronized superseded-artifact removal, and after journal removal. Every following Resume must authenticate and finish the Bundle without changing the synthetic source.
 
+7. Exercise the repeated-interrupt escalation:
+
+   ```sh
+   cargo test --test bundle_resume repeated_interrupt_can_terminate_immediately_while_output_remains_partial -- --exact --nocapture
+   ```
+
+   Expect one passing test. The disposable child treats the first request as a checkpoint stop and the repeated request as immediate termination. No completed Bundle appears, the remaining artifact is visibly partial and rejected by verification, and Resume explains that a restart is required because no checkpoint became durable.
+
+8. Inject storage-full and permission-denied failures throughout checkpoint promotion:
+
+   ```sh
+   cargo test --test bundle_resume failure_preserves_resumable_progress -- --test-threads=4
+   cargo test --test bundle_resume journal_creation_failure_preserves_authenticated_progress_for_resume -- --exact
+   cargo test --test bundle_resume journal_write_failure_preserves_authenticated_progress_for_resume -- --exact
+   ```
+
+   Expect twenty passing tests in total. Every injected failure must leave the completed destination absent. A subsequent invocation authenticates the retained state, finishes Pack, and fully verifies all forty-three synthetic source bytes.
+
 ## Failure and safety checks
 
 ```sh
@@ -102,7 +120,7 @@ No personal state or external session is changed. Do not attempt to salvage real
 
 ## Known limitations
 
-- COKS-30 remains In Progress. The complete disk-full and permission-loss matrix and capability-relative publication and cleanup hardening are not complete. Process termination at every checkpoint-promotion persistence boundary is covered.
+- COKS-30 remains In Progress. The disk-full and permission-loss matrix still needs the partial-Bundle, Migration Item staging, checkpoint creation, and completed-Bundle publication operations. Promotion transaction storage failures and process termination are covered. Unique incomplete journal staging artifacts can remain after a failed write; they are visibly partial, ignored by recovery, and never accepted as Bundles.
 - A pause waits for a whole Migration Item, potentially a large file. Resume authenticates and re-encrypts saved progress and requires additional disk space.
 - Resume currently needs both Recovery Secrets in memory. Either one independently unlocks a completed Bundle.
 - Recovery Method storage and the supported command-line workflow remain dependent on COKS-33 and COKS-36. These tests use no real secret transport.

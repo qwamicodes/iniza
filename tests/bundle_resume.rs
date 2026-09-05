@@ -1,4 +1,5 @@
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -6,9 +7,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use iniza::{
     BundleEngine, BundleEvent, BundleEventSink, DestinationCapacity, InspectRequest,
-    LocalBundleSource, PackCancellation, PackCheckpointPromotionStep, PackRecoveryContext,
-    PackRequest, PackState, Plan, PlanEngine, RecoveryMethod, RecoverySecret, RestoreEngine,
-    RestoreRequest, ScanRequest, VerifyRequest,
+    LocalBundleSource, PackCancellation, PackCheckpointPromotionStep, PackPersistence,
+    PackPersistenceTransition, PackRecoveryContext, PackRequest, PackState, PackStopAction, Plan,
+    PlanEngine, RecoveryMethod, RecoverySecret, RestoreEngine, RestoreRequest, ScanRequest,
+    VerifyRequest,
 };
 use zeroize::Zeroizing;
 
@@ -67,6 +69,295 @@ impl BundleEventSink for StopAfterCapture<'_> {
         self.events.push(event);
     }
 }
+
+#[test]
+fn repeated_interrupt_escalates_from_checkpoint_stop_to_immediate_termination() {
+    let cancellation = PackCancellation::default();
+
+    assert_eq!(
+        cancellation.request_stop(),
+        PackStopAction::FinishCurrentItem
+    );
+    assert_eq!(
+        cancellation.request_stop(),
+        PackStopAction::TerminateImmediately
+    );
+    assert_eq!(
+        cancellation.request_stop(),
+        PackStopAction::TerminateImmediately
+    );
+}
+
+struct TerminateOnRepeatedInterrupt<'a> {
+    cancellation: &'a PackCancellation,
+}
+
+impl BundleEventSink for TerminateOnRepeatedInterrupt<'_> {
+    fn emit(&mut self, event: BundleEvent) {
+        if matches!(event, BundleEvent::ItemCaptured { bytes, .. } if bytes > 0) {
+            assert_eq!(
+                self.cancellation.request_stop(),
+                PackStopAction::FinishCurrentItem
+            );
+            if self.cancellation.request_stop() == PackStopAction::TerminateImmediately {
+                std::process::exit(73);
+            }
+        }
+    }
+}
+
+#[test]
+fn repeated_interrupt_termination_child() {
+    let Some(root) = std::env::var_os("INIZA_SYNTHETIC_REPEATED_INTERRUPT_CHILD") else {
+        return;
+    };
+    let root = PathBuf::from(root);
+    let plan = Plan::read_from(&root.join("reviewed-plan.toml")).unwrap();
+    let cancellation = PackCancellation::default();
+    let mut events = TerminateOnRepeatedInterrupt {
+        cancellation: &cancellation,
+    };
+    BundleEngine::local()
+        .pack(
+            PackRequest::new(&plan, root.join("migration.iniza"))
+                .with_recovery_context(&synthetic_recovery_context())
+                .with_cancellation(&cancellation)
+                .with_event_sink(&mut events),
+        )
+        .unwrap();
+    panic!("Pack did not terminate at the repeated interrupt");
+}
+
+#[test]
+fn repeated_interrupt_can_terminate_immediately_while_output_remains_partial() {
+    let directory = TestDirectory::new();
+    let plan = approved_plan(&directory);
+    plan.write_to(&directory.path().join("reviewed-plan.toml"))
+        .unwrap();
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "repeated_interrupt_termination_child",
+            "--nocapture",
+        ])
+        .env("INIZA_SYNTHETIC_REPEATED_INTERRUPT_CHILD", directory.path())
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(73));
+    let destination = directory.path().join("migration.iniza");
+    let partial = directory.path().join("migration.iniza.partial");
+    assert!(!destination.exists());
+    assert!(partial.is_file());
+    assert!(
+        !directory
+            .path()
+            .join("migration.iniza.partial.checkpoint")
+            .exists()
+    );
+    let context = synthetic_recovery_context();
+    assert!(
+        BundleEngine::local()
+            .verify(VerifyRequest::new(&partial, context.offline_recovery_key(),))
+            .is_err()
+    );
+    assert!(
+        BundleEngine::local()
+            .pack(PackRequest::resume(&plan, &destination, &context))
+            .unwrap_err()
+            .to_string()
+            .contains("restart required")
+    );
+}
+
+struct FailPackPersistenceOnce {
+    target: PackPersistenceTransition,
+    kind: io::ErrorKind,
+    failed: AtomicBool,
+}
+
+impl PackPersistence for FailPackPersistenceOnce {
+    fn prepare_transition(&self, transition: PackPersistenceTransition) -> io::Result<()> {
+        if transition == self.target && !self.failed.swap(true, Ordering::SeqCst) {
+            Err(io::Error::new(self.kind, "injected destination failure"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn assert_promotion_failure_is_resumable(
+    target: PackPersistenceTransition,
+    kind: io::ErrorKind,
+    saved_pair_must_be_unchanged: bool,
+) {
+    let directory = TestDirectory::new();
+    let plan = approved_plan(&directory);
+    let destination = directory.path().join("migration.iniza");
+    let partial = directory.path().join("migration.iniza.partial");
+    let checkpoint = directory.path().join("migration.iniza.partial.checkpoint");
+    let context = synthetic_recovery_context();
+    let cancellation = PackCancellation::default();
+    let mut stop = StopAfterCapture {
+        cancellation: &cancellation,
+        events: Vec::new(),
+    };
+    BundleEngine::local()
+        .pack(
+            PackRequest::new(&plan, &destination)
+                .with_recovery_context(&context)
+                .with_cancellation(&cancellation)
+                .with_event_sink(&mut stop),
+        )
+        .unwrap();
+    let saved_partial = fs::read(&partial).unwrap();
+    let saved_checkpoint = fs::read(&checkpoint).unwrap();
+    let second_cancellation = PackCancellation::default();
+    let mut second_stop = StopAfterCapture {
+        cancellation: &second_cancellation,
+        events: Vec::new(),
+    };
+    let persistence = FailPackPersistenceOnce {
+        target,
+        kind,
+        failed: AtomicBool::new(false),
+    };
+
+    BundleEngine::local()
+        .pack(
+            PackRequest::resume(&plan, &destination, &context)
+                .with_cancellation(&second_cancellation)
+                .with_event_sink(&mut second_stop)
+                .with_persistence(&persistence),
+        )
+        .expect_err("destination failure must stop checkpoint promotion");
+
+    assert!(persistence.failed.load(Ordering::SeqCst));
+    assert!(!destination.exists());
+    if saved_pair_must_be_unchanged {
+        assert_eq!(fs::read(&partial).unwrap(), saved_partial);
+        assert_eq!(fs::read(&checkpoint).unwrap(), saved_checkpoint);
+    }
+    let completed = BundleEngine::local()
+        .pack(PackRequest::resume(&plan, &destination, &context))
+        .expect("authenticated progress must remain resumable after a destination failure");
+    assert_eq!(completed.state(), PackState::Complete);
+    assert_eq!(
+        BundleEngine::local()
+            .verify(VerifyRequest::new(
+                &destination,
+                context.offline_recovery_key(),
+            ))
+            .unwrap()
+            .authenticated_bytes,
+        43
+    );
+}
+
+#[test]
+fn journal_creation_failure_preserves_authenticated_progress_for_resume() {
+    for kind in [io::ErrorKind::StorageFull, io::ErrorKind::PermissionDenied] {
+        assert_promotion_failure_is_resumable(
+            PackPersistenceTransition::CreatePromotionJournal,
+            kind,
+            true,
+        );
+    }
+}
+
+#[test]
+fn journal_write_failure_preserves_authenticated_progress_for_resume() {
+    for kind in [io::ErrorKind::StorageFull, io::ErrorKind::PermissionDenied] {
+        assert_promotion_failure_is_resumable(
+            PackPersistenceTransition::WritePromotionJournal,
+            kind,
+            true,
+        );
+    }
+}
+
+macro_rules! promotion_failure_recovery_test {
+    ($name:ident, $transition:expr) => {
+        #[test]
+        fn $name() {
+            for kind in [io::ErrorKind::StorageFull, io::ErrorKind::PermissionDenied] {
+                assert_promotion_failure_is_resumable($transition, kind, false);
+            }
+        }
+    };
+}
+
+promotion_failure_recovery_test!(
+    journal_sync_failure_preserves_resumable_progress,
+    PackPersistenceTransition::SynchronizePromotionJournal
+);
+promotion_failure_recovery_test!(
+    journal_directory_sync_failure_preserves_resumable_progress,
+    PackPersistenceTransition::SynchronizePromotionJournalDirectory
+);
+promotion_failure_recovery_test!(
+    journal_publication_failure_preserves_resumable_progress,
+    PackPersistenceTransition::PublishPromotionJournal
+);
+promotion_failure_recovery_test!(
+    published_journal_sync_failure_preserves_resumable_progress,
+    PackPersistenceTransition::SynchronizePublishedPromotionJournal
+);
+promotion_failure_recovery_test!(
+    saved_partial_move_failure_preserves_resumable_progress,
+    PackPersistenceTransition::MoveSavedPartial
+);
+promotion_failure_recovery_test!(
+    saved_partial_move_sync_failure_preserves_resumable_progress,
+    PackPersistenceTransition::SynchronizeSavedPartialMove
+);
+promotion_failure_recovery_test!(
+    saved_checkpoint_move_failure_preserves_resumable_progress,
+    PackPersistenceTransition::MoveSavedCheckpoint
+);
+promotion_failure_recovery_test!(
+    saved_checkpoint_move_sync_failure_preserves_resumable_progress,
+    PackPersistenceTransition::SynchronizeSavedCheckpointMove
+);
+promotion_failure_recovery_test!(
+    resumed_partial_move_failure_preserves_resumable_progress,
+    PackPersistenceTransition::MoveResumedPartial
+);
+promotion_failure_recovery_test!(
+    resumed_partial_move_sync_failure_preserves_resumable_progress,
+    PackPersistenceTransition::SynchronizeResumedPartialMove
+);
+promotion_failure_recovery_test!(
+    resumed_checkpoint_move_failure_preserves_resumable_progress,
+    PackPersistenceTransition::MoveResumedCheckpoint
+);
+promotion_failure_recovery_test!(
+    resumed_checkpoint_move_sync_failure_preserves_resumable_progress,
+    PackPersistenceTransition::SynchronizeResumedCheckpointMove
+);
+promotion_failure_recovery_test!(
+    superseded_partial_removal_failure_preserves_resumable_progress,
+    PackPersistenceTransition::RemoveSupersededPartial
+);
+promotion_failure_recovery_test!(
+    superseded_partial_removal_sync_failure_preserves_resumable_progress,
+    PackPersistenceTransition::SynchronizeSupersededPartialRemoval
+);
+promotion_failure_recovery_test!(
+    superseded_checkpoint_removal_failure_preserves_resumable_progress,
+    PackPersistenceTransition::RemoveSupersededCheckpoint
+);
+promotion_failure_recovery_test!(
+    superseded_checkpoint_removal_sync_failure_preserves_resumable_progress,
+    PackPersistenceTransition::SynchronizeSupersededCheckpointRemoval
+);
+promotion_failure_recovery_test!(
+    promotion_journal_removal_failure_preserves_resumable_progress,
+    PackPersistenceTransition::RemovePromotionJournal
+);
+promotion_failure_recovery_test!(
+    promotion_journal_removal_sync_failure_preserves_resumable_progress,
+    PackPersistenceTransition::SynchronizePromotionJournalRemoval
+);
 
 #[test]
 fn owner_can_interrupt_pack_at_a_checkpoint_without_publishing_a_bundle() {
