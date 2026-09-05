@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
@@ -31,16 +32,121 @@ const MAX_PLAINTEXT_CHUNK: usize = 1024 * 1024;
 const MAX_MANIFEST_PLAINTEXT: usize = 16 * 1024 * 1024;
 const MAX_INDEX_PLAINTEXT: usize = 64 * 1024 * 1024;
 const MAX_COMPLETION_PLAINTEXT: usize = 64;
+const MAX_PACK_CHECKPOINT: u64 = 128 * 1024 * 1024;
 
 const RECORD_CONTENT: u8 = 1;
 const RECORD_MANIFEST: u8 = 2;
 const RECORD_INDEX: u8 = 3;
 const RECORD_COMPLETION: u8 = 255;
 
+#[derive(Debug, Default)]
+pub struct PackCancellation(AtomicBool);
+
+impl PackCancellation {
+    pub fn request_stop(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    fn is_requested(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackState {
+    Complete,
+    Paused,
+}
+
+#[derive(Debug)]
+pub struct PackRecoveryContext(SealedBundle);
+
+impl PackRecoveryContext {
+    pub fn from_secrets(
+        vaultwarden: RecoverySecret,
+        offline: RecoverySecret,
+    ) -> Result<Self, CoreError> {
+        if vaultwarden.method() != RecoveryMethod::Vaultwarden
+            || offline.method() != RecoveryMethod::Offline
+            || vaultwarden.bytes == offline.bytes
+        {
+            return Err(invalid_bundle(
+                "Pack requires two distinct, correctly identified Recovery Methods",
+            ));
+        }
+        Ok(Self(SealedBundle {
+            vaultwarden_recovery_secret: vaultwarden,
+            offline_recovery_key: offline,
+        }))
+    }
+
+    pub fn vaultwarden_recovery_secret(&self) -> &RecoverySecret {
+        self.0.vaultwarden_recovery_secret()
+    }
+
+    pub fn offline_recovery_key(&self) -> &RecoverySecret {
+        self.0.offline_recovery_key()
+    }
+}
+
+#[derive(Debug)]
+pub struct PackReport {
+    state: PackState,
+    recovery: PackRecoveryContext,
+}
+
+impl PackReport {
+    pub fn state(&self) -> PackState {
+        self.state
+    }
+
+    pub fn vaultwarden_recovery_secret(&self) -> &RecoverySecret {
+        self.recovery.0.vaultwarden_recovery_secret()
+    }
+
+    pub fn offline_recovery_key(&self) -> &RecoverySecret {
+        self.recovery.0.offline_recovery_key()
+    }
+
+    pub fn recovery_context(&self) -> &PackRecoveryContext {
+        &self.recovery
+    }
+
+    pub fn exit_code(&self) -> u8 {
+        match self.state {
+            PackState::Complete => 0,
+            PackState::Paused => 70,
+        }
+    }
+
+    pub fn human_summary(&self) -> String {
+        match self.state {
+            PackState::Complete => "Pack completed. Fully verify the Bundle before relying on it.",
+            PackState::Paused => "Pack paused at an authenticated checkpoint. Resume requires the matching Plan, Recovery Methods, unchanged sources, and revalidated saved progress.",
+        }.to_owned()
+    }
+
+    pub fn machine_json_result(&self) -> String {
+        let (status, state, next_action) = match self.state {
+            PackState::Complete => ("success", "complete", "verify"),
+            PackState::Paused => ("interrupted", "paused", "resume-after-revalidation"),
+        };
+        serde_json::json!({
+            "schema_version": 1, "command": "pack", "status": status,
+            "data": { "state": state, "next_action": next_action },
+            "warnings": [], "errors": [],
+        })
+        .to_string()
+    }
+}
+
 pub struct PackRequest<'a> {
     plan: &'a Plan,
     destination: PathBuf,
     event_sink: Option<&'a mut dyn BundleEventSink>,
+    cancellation: Option<&'a PackCancellation>,
+    resume: Option<&'a PackRecoveryContext>,
+    recovery: Option<&'a PackRecoveryContext>,
 }
 
 impl<'a> PackRequest<'a> {
@@ -49,11 +155,35 @@ impl<'a> PackRequest<'a> {
             plan,
             destination: destination.into(),
             event_sink: None,
+            cancellation: None,
+            resume: None,
+            recovery: None,
+        }
+    }
+
+    pub fn resume(
+        plan: &'a Plan,
+        destination: impl Into<PathBuf>,
+        recovery: &'a PackRecoveryContext,
+    ) -> Self {
+        Self {
+            resume: Some(recovery),
+            ..Self::new(plan, destination)
         }
     }
 
     pub fn with_event_sink(mut self, event_sink: &'a mut dyn BundleEventSink) -> Self {
         self.event_sink = Some(event_sink);
+        self
+    }
+
+    pub fn with_cancellation(mut self, cancellation: &'a PackCancellation) -> Self {
+        self.cancellation = Some(cancellation);
+        self
+    }
+
+    pub fn with_recovery_context(mut self, recovery: &'a PackRecoveryContext) -> Self {
+        self.recovery = Some(recovery);
         self
     }
 }
@@ -129,6 +259,10 @@ impl BundleVerification {
 #[serde(tag = "event", rename_all = "kebab-case")]
 pub enum BundleEvent {
     PackStarted,
+    CheckpointWritten {
+        captured_items: u64,
+        captured_bytes: u64,
+    },
     ItemCaptured {
         item_id: String,
         bytes: u64,
@@ -167,7 +301,8 @@ pub trait BundleEventSink {
     fn emit(&mut self, event: BundleEvent);
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BundleSourceObservation {
     pub length: u64,
     pub identity: u64,
@@ -355,24 +490,45 @@ impl<S, C> BundleEngine<S, C> {
 }
 
 impl<S: BundleSource, C: DestinationCapacity> BundleEngine<S, C> {
-    pub fn pack(&self, mut request: PackRequest<'_>) -> Result<SealedBundle, CoreError> {
+    pub fn pack(&self, mut request: PackRequest<'_>) -> Result<PackReport, CoreError> {
         validate_pack_request(&request)?;
         let mut event_sink = request.event_sink.take();
         let plan = request.plan;
         let destination = request.destination;
         let partial = partial_path(&destination);
-        if partial.exists() {
+        let resume = request
+            .resume
+            .map(|recovery| authenticate_pack_checkpoint(plan, &partial, recovery, &self.source))
+            .transpose()?;
+        if resume.is_none() && partial.exists() {
             return Err(CoreError::DestinationAlreadyExists(partial));
+        }
+        let output_partial = if resume.is_some() {
+            let mut path = partial.as_os_str().to_os_string();
+            path.push(".resume");
+            PathBuf::from(path)
+        } else {
+            partial.clone()
+        };
+        if output_partial.exists() {
+            return Err(CoreError::DestinationAlreadyExists(output_partial));
         }
 
         let data_encryption_key = random_secret()?;
+        let recovery_context = request.resume.or(request.recovery);
         let vaultwarden_secret = RecoverySecret {
             method: RecoveryMethod::Vaultwarden,
-            bytes: random_secret()?,
+            bytes: match recovery_context {
+                Some(recovery) => Zeroizing::new(*recovery.0.vaultwarden_recovery_secret().bytes),
+                None => random_secret()?,
+            },
         };
         let offline_secret = RecoverySecret {
             method: RecoveryMethod::Offline,
-            bytes: random_secret()?,
+            bytes: match recovery_context {
+                Some(recovery) => Zeroizing::new(*recovery.0.offline_recovery_key().bytes),
+                None => random_secret()?,
+            },
         };
         let bundle_identifier = random_array()?;
         let hkdf_salt = random_array()?;
@@ -391,25 +547,45 @@ impl<S: BundleSource, C: DestinationCapacity> BundleEngine<S, C> {
             nonce_prefix,
         };
 
+        let mut created_partial = None;
         let write_result = write_bundle(
             plan,
             &self.source,
             &self.capacity,
-            &partial,
+            &output_partial,
             &destination,
             &header,
             &keys,
             &context,
             &mut event_sink,
+            request.cancellation,
+            resume,
+            &mut created_partial,
         );
-        if write_result.is_err() {
-            let _ = fs::remove_file(&partial);
+        if write_result.is_err()
+            && created_partial.as_ref().is_some_and(|created| {
+                fs::symlink_metadata(&output_partial)
+                    .ok()
+                    .is_some_and(|current| same_pack_file(created, &current))
+            })
+        {
+            let _ = fs::remove_file(&output_partial);
         }
-        write_result?;
+        let state = write_result?;
+        if request.resume.is_some() && state == PackState::Paused {
+            promote_paused_pack(&partial, &output_partial)?;
+        }
+        if request.resume.is_some() && state == PackState::Complete {
+            let _ = fs::remove_file(&partial);
+            let _ = fs::remove_file(pack_checkpoint_path(&partial));
+        }
 
-        Ok(SealedBundle {
-            vaultwarden_recovery_secret: vaultwarden_secret,
-            offline_recovery_key: offline_secret,
+        Ok(PackReport {
+            state,
+            recovery: PackRecoveryContext(SealedBundle {
+                vaultwarden_recovery_secret: vaultwarden_secret,
+                offline_recovery_key: offline_secret,
+            }),
         })
     }
 
@@ -448,6 +624,11 @@ impl<S: BundleSource, C: DestinationCapacity> BundleEngine<S, C> {
 }
 
 fn validate_pack_request(request: &PackRequest<'_>) -> Result<(), CoreError> {
+    if request.resume.is_some() && request.recovery.is_some() {
+        return Err(invalid_bundle(
+            "Pack Resume already specifies its recovery context",
+        ));
+    }
     if !request.plan.is_directory_plan() {
         return Err(CoreError::InvalidPlan(
             "Bundle Pack requires a directory Plan".to_owned(),
@@ -485,7 +666,10 @@ fn write_bundle(
     keys: &BundleKeys,
     context: &RecordContext,
     events: &mut Option<&mut dyn BundleEventSink>,
-) -> Result<(), CoreError> {
+    cancellation: Option<&PackCancellation>,
+    resume: Option<AuthenticatedPackCheckpoint>,
+    created_partial: &mut Option<fs::Metadata>,
+) -> Result<PackState, CoreError> {
     emit_event(events, BundleEvent::PackStarted);
     let estimated_required = plan
         .estimated_logical_size()
@@ -494,15 +678,16 @@ fn write_bundle(
         .and_then(|size| size.checked_add(MAX_PLAINTEXT_CHUNK as u64))
         .ok_or_else(|| invalid_bundle("Bundle capacity estimate overflowed"))?;
     ensure_capacity(capacity, destination, estimated_required)?;
-    let output = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(partial)
-        .map_err(|source| CoreError::Io {
-            action: "create partial Bundle",
-            path: partial.to_path_buf(),
-            source,
-        })?;
+    let output = create_private_pack_file(partial).map_err(|source| CoreError::Io {
+        action: "create partial Bundle",
+        path: partial.to_path_buf(),
+        source,
+    })?;
+    *created_partial = Some(output.metadata().map_err(|source| CoreError::Io {
+        action: "identify created partial Bundle",
+        path: partial.to_path_buf(),
+        source,
+    })?);
     let mut writer = StreamWriter::new(output, capacity, destination);
     writer.write_hashed(header, partial)?;
     let root = plan
@@ -517,8 +702,23 @@ fn write_bundle(
     let mut changed_items = 0_u64;
     let mut unsupported_items = 0_u64;
     let mut unverified_items = 0_u64;
+    let mut source_observations = BTreeMap::new();
 
-    for (item_ordinal, item) in plan.items().iter().enumerate() {
+    if let Some(resume) = resume {
+        let checkpoint = rekey_pack_prefix(resume, &mut writer, partial, keys, context)?;
+        sequence = checkpoint.index.len() as u64;
+        index = checkpoint.index;
+        manifest_items = checkpoint.manifest_items;
+        logical_size = checkpoint.captured_bytes;
+        included_items = checkpoint.included_items;
+        changed_items = checkpoint.changed_items;
+        unsupported_items = checkpoint.unsupported_items;
+        unverified_items = checkpoint.unverified_items;
+        source_observations = checkpoint.source_observations;
+    }
+
+    let first_uncaptured_item = manifest_items.len();
+    for (item_ordinal, item) in plan.items().iter().enumerate().skip(first_uncaptured_item) {
         let item_ordinal = u32::try_from(item_ordinal)
             .map_err(|_| invalid_bundle("Bundle contains too many Migration Items"))?;
         let mut chunk_sequences = Vec::new();
@@ -563,6 +763,7 @@ fn write_bundle(
                         context,
                         &mut index,
                     )?;
+                    source_observations.insert(item_ordinal, captured.observation);
                     if captured.changed {
                         changed_items += 1;
                     }
@@ -639,6 +840,36 @@ fn write_bundle(
                 outcome: capture_outcome_name(outcome).to_owned(),
             },
         );
+        if cancellation.is_some_and(PackCancellation::is_requested) {
+            write_pack_checkpoint(
+                plan,
+                &writer,
+                partial,
+                keys,
+                context,
+                sequence,
+                manifest_items.len() as u64,
+                logical_size,
+                &manifest_items,
+                &index,
+                [
+                    included_items,
+                    changed_items,
+                    unsupported_items,
+                    unverified_items,
+                ],
+                source_adapter,
+                &source_observations,
+            )?;
+            emit_event(
+                events,
+                BundleEvent::CheckpointWritten {
+                    captured_items: manifest_items.len() as u64,
+                    captured_bytes: logical_size,
+                },
+            );
+            return Ok(PackState::Paused);
+        }
     }
 
     let manifest = Manifest {
@@ -711,6 +942,7 @@ fn write_bundle(
         path: partial.to_path_buf(),
         source,
     })?;
+    require_pack_file_identity(&writer.file, partial)?;
     fs::hard_link(partial, destination).map_err(|source| {
         if source.kind() == io::ErrorKind::AlreadyExists {
             CoreError::DestinationAlreadyExists(destination.to_path_buf())
@@ -735,6 +967,488 @@ fn write_bundle(
             unverified_items,
         },
     );
+    Ok(PackState::Complete)
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PackCheckpoint {
+    schema_version: u32,
+    plan_hash: String,
+    partial_hash: String,
+    partial_length: u64,
+    next_sequence: u64,
+    captured_items: u64,
+    captured_bytes: u64,
+    manifest_items: Vec<ManifestItem>,
+    index: Vec<IndexEntry>,
+    included_items: u64,
+    changed_items: u64,
+    unsupported_items: u64,
+    unverified_items: u64,
+    source_observations: BTreeMap<u32, Option<BundleSourceObservation>>,
+}
+
+struct AuthenticatedPackCheckpoint {
+    file: fs::File,
+    checkpoint: PackCheckpoint,
+    keys: BundleKeys,
+    context: RecordContext,
+    header: [u8; HEADER_LENGTH],
+}
+
+fn authenticate_pack_checkpoint(
+    plan: &Plan,
+    partial: &Path,
+    recovery: &PackRecoveryContext,
+    source_adapter: &impl BundleSource,
+) -> Result<AuthenticatedPackCheckpoint, CoreError> {
+    let mut file = open_bundle_file(partial)?;
+    let metadata = file.metadata().map_err(|source| CoreError::Io {
+        action: "inspect partial Bundle for Resume",
+        path: partial.to_path_buf(),
+        source,
+    })?;
+    if !metadata.is_file() {
+        return Err(invalid_bundle(
+            "Pack Resume requires a regular partial Bundle",
+        ));
+    }
+    let mut header = [0_u8; HEADER_LENGTH];
+    file.read_exact(&mut header)
+        .map_err(|_| invalid_bundle("partial Bundle header is truncated"))?;
+    let opened = decode_header(&header, recovery.0.offline_recovery_key())?;
+    let other = decode_header(&header, recovery.0.vaultwarden_recovery_secret())?;
+    if opened.data_encryption_key != other.data_encryption_key {
+        return Err(CoreError::AuthenticationFailed);
+    }
+    let keys = derive_bundle_keys(
+        &opened.data_encryption_key,
+        &opened.hkdf_salt,
+        &opened.bundle_identifier,
+    )?;
+    let context = RecordContext {
+        header_hash: *blake3::hash(&header).as_bytes(),
+        bundle_identifier: opened.bundle_identifier,
+        nonce_prefix: opened.nonce_prefix,
+    };
+    let checkpoint_path = pack_checkpoint_path(partial);
+    let mut bytes = Vec::new();
+    open_bundle_file(&checkpoint_path)
+        .map_err(|error| match error {
+            CoreError::Io { ref source, .. } if source.kind() == io::ErrorKind::NotFound => {
+                invalid_bundle("Pack checkpoint is missing; restart required at a new destination, preserving partial output")
+            }
+            other => other,
+        })?
+        .take(MAX_PACK_CHECKPOINT + 49)
+        .read_to_end(&mut bytes)
+        .map_err(|source| CoreError::Io {
+            action: "read authenticated Pack checkpoint",
+            path: checkpoint_path,
+            source,
+        })?;
+    if bytes.len() < 48
+        || bytes.len() as u64 > MAX_PACK_CHECKPOINT + 48
+        || &bytes[..8] != b"IZ2PAUS1"
+    {
+        return Err(invalid_bundle(
+            "Pack checkpoint is missing, oversized, or incompatible; restart required",
+        ));
+    }
+    let nonce: [u8; 24] = bytes[8..32].try_into().expect("bounded checkpoint nonce");
+    let plaintext = Zeroizing::new(decrypt(
+        &keys.checkpoint,
+        &nonce,
+        &context.header_hash,
+        &bytes[32..],
+    )?);
+    let checkpoint: PackCheckpoint = serde_json::from_slice(&plaintext)
+        .map_err(|_| invalid_bundle("Pack checkpoint encoding is invalid"))?;
+    let canonical = Zeroizing::new(
+        serde_json::to_vec(&checkpoint)
+            .map_err(|_| invalid_bundle("Pack checkpoint cannot be canonicalized"))?,
+    );
+    if *canonical != *plaintext
+        || checkpoint.schema_version != 1
+        || checkpoint.plan_hash != plan.approval_hash()?
+        || checkpoint.partial_length != metadata.len()
+        || checkpoint.captured_items != checkpoint.manifest_items.len() as u64
+        || checkpoint.manifest_items.len() > plan.items().len()
+    {
+        return Err(invalid_bundle(
+            "Pack checkpoint does not match the approved Plan or partial Bundle; restart required",
+        ));
+    }
+    encode_index(&checkpoint.index)?;
+    for (captured, planned) in checkpoint.manifest_items.iter().zip(plan.items()) {
+        if captured.id != planned.id
+            || captured.relative_path != planned.relative_path.to_string_lossy()
+            || captured.kind != format!("{:?}", planned.kind)
+        {
+            return Err(invalid_bundle(
+                "Pack checkpoint Migration Items do not match the approved Plan",
+            ));
+        }
+    }
+    let root = plan
+        .approved_roots()
+        .first()
+        .ok_or_else(|| invalid_bundle("Pack Resume Plan has no root"))?;
+    for (ordinal, item) in plan.items().iter().enumerate().filter(|(_, item)| {
+        item.disposition == Disposition::Included && item.kind == MigrationItemKind::RegularFile
+    }) {
+        let expected = checkpoint
+            .source_observations
+            .get(&(ordinal as u32))
+            .and_then(Option::as_ref)
+            .ok_or_else(|| {
+                invalid_bundle("Pack Resume source identity was not verified; restart required")
+            })?;
+        if source_adapter
+            .observe(&root.join(&item.relative_path))
+            .ok()
+            .as_ref()
+            != Some(expected)
+        {
+            return Err(invalid_bundle(
+                "Pack Resume source changed; review a fresh Plan and restart",
+            ));
+        }
+    }
+    Ok(AuthenticatedPackCheckpoint {
+        file,
+        checkpoint,
+        keys,
+        context,
+        header,
+    })
+}
+
+fn rekey_pack_prefix(
+    mut resume: AuthenticatedPackCheckpoint,
+    writer: &mut StreamWriter<'_>,
+    partial: &Path,
+    keys: &BundleKeys,
+    context: &RecordContext,
+) -> Result<PackCheckpoint, CoreError> {
+    let mut prefix_hasher = blake3::Hasher::new();
+    prefix_hasher.update(&resume.header);
+    let mut offset = HEADER_LENGTH as u64;
+    let mut previous_sequence = None;
+    let mut content_hashers = BTreeMap::<u32, blake3::Hasher>::new();
+    let mut authenticated_bytes = 0_u64;
+    let mut new_index = Vec::new();
+    for (sequence, entry) in resume.checkpoint.index.iter().enumerate() {
+        if entry.offset != offset {
+            return Err(invalid_bundle("Pack checkpoint chunk offset is invalid"));
+        }
+        let mut raw_header = [0_u8; RECORD_HEADER_LENGTH];
+        resume
+            .file
+            .read_exact(&mut raw_header)
+            .map_err(|_| invalid_bundle("checkpointed Bundle chunk is truncated"))?;
+        let record = decode_record_header(&raw_header)?;
+        validate_record_limit(&record)?;
+        if record.kind != RECORD_CONTENT
+            || record.sequence != entry.sequence
+            || record.item_ordinal != entry.item_ordinal
+            || record.chunk_ordinal != entry.chunk_ordinal
+            || record.plaintext_length != entry.plaintext_length
+            || record.ciphertext_length != entry.ciphertext_length
+            || previous_sequence.is_some_and(|previous| record.sequence <= previous)
+            || record.sequence >= resume.checkpoint.next_sequence
+        {
+            return Err(invalid_bundle(
+                "Pack checkpoint does not match its authenticated chunk",
+            ));
+        }
+        previous_sequence = Some(record.sequence);
+        let item = resume
+            .checkpoint
+            .manifest_items
+            .get_mut(entry.item_ordinal as usize)
+            .ok_or_else(|| {
+                invalid_bundle("Pack checkpoint references an unknown Migration Item")
+            })?;
+        let expected_sequence = item
+            .chunk_sequences
+            .get_mut(entry.chunk_ordinal as usize)
+            .ok_or_else(|| invalid_bundle("Pack checkpoint chunk order is invalid"))?;
+        if *expected_sequence != record.sequence {
+            return Err(invalid_bundle("Pack checkpoint chunk mapping is invalid"));
+        }
+        let mut ciphertext = vec![0_u8; record.ciphertext_length as usize];
+        resume
+            .file
+            .read_exact(&mut ciphertext)
+            .map_err(|_| invalid_bundle("checkpointed Bundle ciphertext is truncated"))?;
+        let plaintext = decrypt_record(
+            &record,
+            &raw_header,
+            &ciphertext,
+            &resume.keys.content,
+            &resume.context,
+        )?;
+        prefix_hasher.update(&raw_header);
+        prefix_hasher.update(&ciphertext);
+        offset += RECORD_HEADER_LENGTH as u64 + ciphertext.len() as u64;
+        authenticated_bytes = authenticated_bytes
+            .checked_add(plaintext.len() as u64)
+            .ok_or_else(|| invalid_bundle("Pack checkpoint byte count overflowed"))?;
+        content_hashers
+            .entry(entry.item_ordinal)
+            .or_default()
+            .update(&plaintext);
+        let new_offset = writer.offset;
+        writer.write_record(
+            RECORD_CONTENT,
+            sequence as u64,
+            entry.item_ordinal,
+            entry.chunk_ordinal,
+            &keys.content,
+            context,
+            &plaintext,
+            partial,
+        )?;
+        *expected_sequence = sequence as u64;
+        new_index.push(IndexEntry {
+            sequence: sequence as u64,
+            offset: new_offset,
+            ..entry.clone()
+        });
+    }
+    if offset != resume.checkpoint.partial_length
+        || prefix_hasher.finalize().to_hex().as_str() != resume.checkpoint.partial_hash
+        || authenticated_bytes != resume.checkpoint.captured_bytes
+    {
+        return Err(invalid_bundle(
+            "checkpointed Bundle content changed; restart required",
+        ));
+    }
+    for (ordinal, item) in resume.checkpoint.manifest_items.iter().enumerate() {
+        if let Some(expected) = &item.content_hash {
+            let actual = content_hashers
+                .remove(&(ordinal as u32))
+                .ok_or_else(|| invalid_bundle("Pack checkpoint is missing protected content"))?;
+            if actual.finalize().to_hex().as_str() != expected {
+                return Err(invalid_bundle(
+                    "Pack checkpoint protected content does not authenticate",
+                ));
+            }
+        }
+    }
+    resume.checkpoint.index = new_index;
+    Ok(resume.checkpoint)
+}
+
+fn create_private_pack_file(path: &Path) -> io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    options.open(path)
+}
+
+fn same_pack_file(expected: &fs::Metadata, current: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        current.is_file() && expected.dev() == current.dev() && expected.ino() == current.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (expected, current);
+        false
+    }
+}
+
+fn require_pack_file_identity(file: &fs::File, path: &Path) -> Result<(), CoreError> {
+    let expected = file.metadata().map_err(|source| CoreError::Io {
+        action: "identify opened partial Bundle",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let current = fs::symlink_metadata(path).map_err(|source| CoreError::Io {
+        action: "revalidate partial Bundle identity",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !same_pack_file(&expected, &current) {
+        return Err(invalid_bundle(
+            "partial Bundle identity changed; restart required at a new destination, preserving existing artifacts",
+        ));
+    }
+    Ok(())
+}
+
+fn pack_checkpoint_path(partial: &Path) -> PathBuf {
+    let mut path = partial.as_os_str().to_os_string();
+    path.push(".checkpoint");
+    PathBuf::from(path)
+}
+
+fn promote_paused_pack(partial: &Path, resumed: &Path) -> Result<(), CoreError> {
+    let parent = partial
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let directory =
+        crate::restore_fs::RestoreDirectory::open_ambient(parent).map_err(|source| {
+            CoreError::Io {
+                action: "open Pack checkpoint directory",
+                path: parent.to_path_buf(),
+                source,
+            }
+        })?;
+    let mut previous = partial.as_os_str().to_os_string();
+    previous.push(".previous");
+    let previous = PathBuf::from(previous);
+    let previous_checkpoint = pack_checkpoint_path(&previous);
+    for path in [&previous, &previous_checkpoint] {
+        match directory.symlink_metadata(Path::new(path.file_name().expect("Pack artifact name"))) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Ok(_) => return Err(CoreError::DestinationAlreadyExists(path.to_path_buf())),
+            Err(source) => {
+                return Err(CoreError::Io {
+                    action: "inspect previous Pack checkpoint",
+                    path: path.to_path_buf(),
+                    source,
+                });
+            }
+        }
+    }
+    let original_checkpoint = pack_checkpoint_path(partial);
+    let resumed_checkpoint = pack_checkpoint_path(resumed);
+    for (from, to) in [
+        (partial, previous.as_path()),
+        (original_checkpoint.as_path(), previous_checkpoint.as_path()),
+        (resumed, partial),
+        (resumed_checkpoint.as_path(), original_checkpoint.as_path()),
+    ] {
+        directory
+            .exclusive_rename(
+                Path::new(from.file_name().expect("Pack artifact name")),
+                &directory,
+                Path::new(to.file_name().expect("Pack artifact name")),
+            )
+            .and_then(|()| directory.sync())
+            .map_err(|source| CoreError::Io {
+                action: "advance authenticated Pack checkpoint without overwrite",
+                path: to.to_path_buf(),
+                source,
+            })?;
+    }
+    for path in [&previous, &previous_checkpoint] {
+        directory
+            .remove_file(Path::new(path.file_name().expect("Pack artifact name")))
+            .map_err(|source| CoreError::Io {
+                action: "remove superseded Pack checkpoint",
+                path: path.to_path_buf(),
+                source,
+            })?;
+    }
+    directory.sync().map_err(|source| CoreError::Io {
+        action: "synchronize advanced Pack checkpoint",
+        path: parent.to_path_buf(),
+        source,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_pack_checkpoint(
+    plan: &Plan,
+    writer: &StreamWriter<'_>,
+    partial: &Path,
+    keys: &BundleKeys,
+    context: &RecordContext,
+    next_sequence: u64,
+    captured_items: u64,
+    captured_bytes: u64,
+    manifest_items: &[ManifestItem],
+    index: &[IndexEntry],
+    counts: [u64; 4],
+    source_adapter: &impl BundleSource,
+    captured_observations: &BTreeMap<u32, Option<BundleSourceObservation>>,
+) -> Result<(), CoreError> {
+    require_pack_file_identity(&writer.file, partial)?;
+    writer.file.sync_all().map_err(|source| CoreError::Io {
+        action: "synchronize partial Bundle before checkpoint",
+        path: partial.to_path_buf(),
+        source,
+    })?;
+    let root = plan
+        .approved_roots()
+        .first()
+        .ok_or_else(|| invalid_bundle("Pack Plan has no root"))?;
+    let mut source_observations = captured_observations.clone();
+    for (ordinal, item) in plan.items().iter().enumerate().filter(|(_, item)| {
+        item.disposition == Disposition::Included && item.kind == MigrationItemKind::RegularFile
+    }) {
+        source_observations
+            .entry(ordinal as u32)
+            .or_insert_with(|| source_adapter.observe(&root.join(&item.relative_path)).ok());
+    }
+    let checkpoint = PackCheckpoint {
+        schema_version: 1,
+        plan_hash: plan.approval_hash()?,
+        partial_hash: writer.hasher.finalize().to_hex().to_string(),
+        partial_length: writer.offset,
+        next_sequence,
+        captured_items,
+        captured_bytes,
+        manifest_items: manifest_items.to_vec(),
+        index: index.to_vec(),
+        included_items: counts[0],
+        changed_items: counts[1],
+        unsupported_items: counts[2],
+        unverified_items: counts[3],
+        source_observations,
+    };
+    let plaintext = Zeroizing::new(
+        serde_json::to_vec(&checkpoint)
+            .map_err(|_| invalid_bundle("Pack checkpoint cannot be encoded"))?,
+    );
+    if plaintext.len() as u64 > MAX_PACK_CHECKPOINT {
+        return Err(invalid_bundle("Pack checkpoint exceeds its size limit"));
+    }
+    let nonce = random_array::<24>()?;
+    let ciphertext = encrypt(&keys.checkpoint, &nonce, &context.header_hash, &plaintext)?;
+    ensure_capacity(
+        writer.capacity,
+        writer.capacity_destination,
+        32 + ciphertext.len() as u64,
+    )?;
+    let path = pack_checkpoint_path(partial);
+    let mut output = create_private_pack_file(&path).map_err(|source| CoreError::Io {
+        action: "create authenticated Pack checkpoint",
+        path: path.clone(),
+        source,
+    })?;
+    output
+        .write_all(b"IZ2PAUS1")
+        .and_then(|()| output.write_all(&nonce))
+        .and_then(|()| output.write_all(&ciphertext))
+        .and_then(|()| output.sync_all())
+        .map_err(|source| CoreError::Io {
+            action: "synchronize authenticated Pack checkpoint",
+            path: path.clone(),
+            source,
+        })?;
+    let parent = partial
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::File::open(parent)
+        .and_then(|file| file.sync_all())
+        .map_err(|source| CoreError::Io {
+            action: "synchronize Pack checkpoint directory",
+            path: parent.to_path_buf(),
+            source,
+        })?;
     Ok(())
 }
 
@@ -783,6 +1497,7 @@ struct CapturedFile {
     posix_mode: Option<u32>,
     changed: bool,
     verified: bool,
+    observation: Option<BundleSourceObservation>,
 }
 
 fn capture_symbolic_link(source_adapter: &impl BundleSource, source: &Path) -> Option<PathBuf> {
@@ -953,6 +1668,7 @@ fn capture_regular_file(
                 posix_mode: before.posix_mode,
                 changed,
                 verified: true,
+                observation: Some(before),
             });
         }
         changed = true;
@@ -966,6 +1682,7 @@ fn capture_regular_file(
         posix_mode: None,
         changed,
         verified: false,
+        observation: None,
     })
 }
 
@@ -1086,7 +1803,7 @@ struct Manifest {
     items: Vec<ManifestItem>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ManifestItem {
     id: String,
@@ -1118,7 +1835,8 @@ enum CaptureOutcome {
     Unverified,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct IndexEntry {
     sequence: u64,
     item_ordinal: u32,
@@ -1782,6 +2500,7 @@ struct BundleKeys {
     manifest: Zeroizing<[u8; 32]>,
     index: Zeroizing<[u8; 32]>,
     completion: Zeroizing<[u8; 32]>,
+    checkpoint: Zeroizing<[u8; 32]>,
 }
 
 struct RecordContext {
@@ -1801,6 +2520,11 @@ fn derive_bundle_keys(
         manifest: expand_key(&hkdf, b"iniza IZ1 manifest key", bundle_identifier)?,
         index: expand_key(&hkdf, b"iniza IZ1 index key", bundle_identifier)?,
         completion: expand_key(&hkdf, b"iniza IZ1 completion key", bundle_identifier)?,
+        checkpoint: expand_key(
+            &hkdf,
+            b"iniza IZ2 pack checkpoint key v1",
+            bundle_identifier,
+        )?,
     })
 }
 
@@ -2069,11 +2793,19 @@ fn partial_path(destination: &Path) -> PathBuf {
 }
 
 fn reject_partial_path(source: &Path) -> Result<(), CoreError> {
-    if source
-        .file_name()
-        .and_then(|value| value.to_str())
-        .is_some_and(|name| name.ends_with(".iniza.partial"))
-    {
+    if source.file_name().is_some_and(|name| {
+        let name = name.to_string_lossy();
+        [
+            ".iniza.partial",
+            ".iniza.partial.resume",
+            ".iniza.partial.previous",
+            ".iniza.partial.checkpoint",
+            ".iniza.partial.resume.checkpoint",
+            ".iniza.partial.previous.checkpoint",
+        ]
+        .iter()
+        .any(|suffix| name.ends_with(suffix))
+    }) {
         return Err(CoreError::BundleIncomplete(source.to_path_buf()));
     }
     Ok(())
