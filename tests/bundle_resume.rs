@@ -8,9 +8,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use iniza::{
     BundleEngine, BundleEvent, BundleEventSink, DestinationCapacity, InspectRequest,
     LocalBundleSource, PackCancellation, PackCheckpointPromotionStep, PackPersistence,
-    PackPersistenceTransition, PackRecoveryContext, PackRequest, PackState, PackStopAction, Plan,
-    PlanEngine, RecoveryMethod, RecoverySecret, RestoreEngine, RestoreRequest, ScanRequest,
-    VerifyRequest,
+    PackPersistenceTransition, PackRecoveryAdvice, PackRecoveryContext, PackRequest, PackState,
+    PackStopAction, Plan, PlanEngine, RecoveryMethod, RecoverySecret, RestoreEngine,
+    RestoreRequest, ScanRequest, VerifyRequest,
 };
 use zeroize::Zeroizing;
 
@@ -358,6 +358,435 @@ promotion_failure_recovery_test!(
     promotion_journal_removal_sync_failure_preserves_resumable_progress,
     PackPersistenceTransition::SynchronizePromotionJournalRemoval
 );
+
+fn assert_prepublication_failure_is_contained(
+    target: PackPersistenceTransition,
+    kind: io::ErrorKind,
+    request_checkpoint: bool,
+) {
+    let directory = TestDirectory::new();
+    let plan = approved_plan(&directory);
+    let destination = directory.path().join("migration.iniza");
+    let context = synthetic_recovery_context();
+    let cancellation = PackCancellation::default();
+    if request_checkpoint {
+        assert_eq!(
+            cancellation.request_stop(),
+            PackStopAction::FinishCurrentItem
+        );
+    }
+    let persistence = FailPackPersistenceOnce {
+        target,
+        kind,
+        failed: AtomicBool::new(false),
+    };
+
+    BundleEngine::local()
+        .pack(
+            PackRequest::new(&plan, &destination)
+                .with_recovery_context(&context)
+                .with_cancellation(&cancellation)
+                .with_persistence(&persistence),
+        )
+        .expect_err("injected prepublication failure must stop Pack");
+
+    assert!(persistence.failed.load(Ordering::SeqCst));
+    assert!(!destination.exists());
+    let retry_destination = directory.path().join("retry.iniza");
+    let completed = BundleEngine::local()
+        .pack(PackRequest::new(&plan, &retry_destination).with_recovery_context(&context))
+        .expect("a clean restart at a new destination must remain available");
+    assert_eq!(completed.state(), PackState::Complete);
+    assert_eq!(
+        BundleEngine::local()
+            .verify(VerifyRequest::new(
+                &retry_destination,
+                context.offline_recovery_key(),
+            ))
+            .unwrap()
+            .authenticated_bytes,
+        43
+    );
+}
+
+macro_rules! prepublication_failure_containment_test {
+    ($name:ident, $transition:expr, $request_checkpoint:expr) => {
+        #[test]
+        fn $name() {
+            for kind in [io::ErrorKind::StorageFull, io::ErrorKind::PermissionDenied] {
+                assert_prepublication_failure_is_contained($transition, kind, $request_checkpoint);
+            }
+        }
+    };
+}
+
+prepublication_failure_containment_test!(
+    partial_creation_failure_never_publishes,
+    PackPersistenceTransition::CreatePartialBundle,
+    false
+);
+prepublication_failure_containment_test!(
+    partial_write_failure_never_publishes,
+    PackPersistenceTransition::WritePartialBundle,
+    false
+);
+prepublication_failure_containment_test!(
+    migration_item_stage_creation_failure_never_publishes,
+    PackPersistenceTransition::CreateMigrationItemStage,
+    false
+);
+prepublication_failure_containment_test!(
+    migration_item_stage_write_failure_never_publishes,
+    PackPersistenceTransition::WriteMigrationItemStage,
+    false
+);
+prepublication_failure_containment_test!(
+    migration_item_stage_flush_failure_never_publishes,
+    PackPersistenceTransition::FlushMigrationItemStage,
+    false
+);
+prepublication_failure_containment_test!(
+    migration_item_stage_removal_failure_never_publishes,
+    PackPersistenceTransition::RemoveMigrationItemStage,
+    false
+);
+prepublication_failure_containment_test!(
+    partial_checkpoint_sync_failure_never_publishes,
+    PackPersistenceTransition::SynchronizePartialBeforeCheckpoint,
+    true
+);
+prepublication_failure_containment_test!(
+    checkpoint_creation_failure_never_publishes,
+    PackPersistenceTransition::CreateCheckpoint,
+    true
+);
+prepublication_failure_containment_test!(
+    checkpoint_write_failure_never_publishes,
+    PackPersistenceTransition::WriteCheckpoint,
+    true
+);
+prepublication_failure_containment_test!(
+    checkpoint_sync_failure_never_publishes,
+    PackPersistenceTransition::SynchronizeCheckpoint,
+    true
+);
+prepublication_failure_containment_test!(
+    checkpoint_directory_sync_failure_never_publishes,
+    PackPersistenceTransition::SynchronizeCheckpointDirectory,
+    true
+);
+prepublication_failure_containment_test!(
+    completed_partial_sync_failure_never_publishes,
+    PackPersistenceTransition::SynchronizeCompletedPartial,
+    false
+);
+prepublication_failure_containment_test!(
+    completed_bundle_publication_failure_never_publishes,
+    PackPersistenceTransition::PublishCompletedBundle,
+    false
+);
+
+#[test]
+fn completed_bundle_directory_sync_failure_returns_an_error_but_keeps_verifiable_output() {
+    for kind in [io::ErrorKind::StorageFull, io::ErrorKind::PermissionDenied] {
+        let directory = TestDirectory::new();
+        let plan = approved_plan(&directory);
+        let destination = directory.path().join("migration.iniza");
+        let context = synthetic_recovery_context();
+        let persistence = FailPackPersistenceOnce {
+            target: PackPersistenceTransition::SynchronizeCompletedBundleDirectory,
+            kind,
+            failed: AtomicBool::new(false),
+        };
+
+        BundleEngine::local()
+            .pack(
+                PackRequest::new(&plan, &destination)
+                    .with_recovery_context(&context)
+                    .with_persistence(&persistence),
+            )
+            .expect_err("directory synchronization failure must not report Pack success");
+
+        assert!(persistence.failed.load(Ordering::SeqCst));
+        assert_eq!(
+            BundleEngine::local()
+                .verify(VerifyRequest::new(
+                    &destination,
+                    context.offline_recovery_key(),
+                ))
+                .unwrap()
+                .authenticated_bytes,
+            43
+        );
+    }
+}
+
+#[test]
+fn completed_bundle_publication_atomically_removes_the_partial_name() {
+    let directory = TestDirectory::new();
+    let plan = approved_plan(&directory);
+    let destination = directory.path().join("migration.iniza");
+    let partial = directory.path().join("migration.iniza.partial");
+    let context = synthetic_recovery_context();
+
+    let completed = BundleEngine::local()
+        .pack(PackRequest::new(&plan, &destination).with_recovery_context(&context))
+        .unwrap();
+
+    assert_eq!(completed.state(), PackState::Complete);
+    assert!(destination.is_file());
+    assert!(!partial.exists());
+    assert_eq!(
+        BundleEngine::local()
+            .verify(VerifyRequest::new(
+                &destination,
+                context.offline_recovery_key(),
+            ))
+            .unwrap()
+            .authenticated_bytes,
+        43
+    );
+}
+
+struct TerminatePackPersistence {
+    target: PackPersistenceTransition,
+}
+
+impl PackPersistence for TerminatePackPersistence {
+    fn prepare_transition(&self, transition: PackPersistenceTransition) -> io::Result<()> {
+        if transition == self.target {
+            std::process::exit(73);
+        }
+        Ok(())
+    }
+}
+
+fn pack_persistence_transition_from_name(name: &str) -> PackPersistenceTransition {
+    match name {
+        "create-partial" => PackPersistenceTransition::CreatePartialBundle,
+        "write-partial" => PackPersistenceTransition::WritePartialBundle,
+        "create-item-stage" => PackPersistenceTransition::CreateMigrationItemStage,
+        "write-item-stage" => PackPersistenceTransition::WriteMigrationItemStage,
+        "flush-item-stage" => PackPersistenceTransition::FlushMigrationItemStage,
+        "remove-item-stage" => PackPersistenceTransition::RemoveMigrationItemStage,
+        "sync-partial-checkpoint" => PackPersistenceTransition::SynchronizePartialBeforeCheckpoint,
+        "create-checkpoint" => PackPersistenceTransition::CreateCheckpoint,
+        "write-checkpoint" => PackPersistenceTransition::WriteCheckpoint,
+        "sync-checkpoint" => PackPersistenceTransition::SynchronizeCheckpoint,
+        "sync-checkpoint-directory" => PackPersistenceTransition::SynchronizeCheckpointDirectory,
+        "sync-completed-partial" => PackPersistenceTransition::SynchronizeCompletedPartial,
+        "publish-completed" => PackPersistenceTransition::PublishCompletedBundle,
+        "sync-completed-directory" => {
+            PackPersistenceTransition::SynchronizeCompletedBundleDirectory
+        }
+        unexpected => panic!("unexpected Pack persistence transition {unexpected}"),
+    }
+}
+
+#[test]
+fn pack_persistence_termination_child() {
+    let Some(root) = std::env::var_os("INIZA_SYNTHETIC_PERSISTENCE_CHILD") else {
+        return;
+    };
+    let root = PathBuf::from(root);
+    let plan = Plan::read_from(&root.join("reviewed-plan.toml")).unwrap();
+    let transition = pack_persistence_transition_from_name(
+        &std::env::var("INIZA_SYNTHETIC_PERSISTENCE_TRANSITION").unwrap(),
+    );
+    let persistence = TerminatePackPersistence { target: transition };
+    let cancellation = PackCancellation::default();
+    if std::env::var_os("INIZA_SYNTHETIC_PERSISTENCE_CHECKPOINT").is_some() {
+        assert_eq!(
+            cancellation.request_stop(),
+            PackStopAction::FinishCurrentItem
+        );
+    }
+    BundleEngine::local()
+        .pack(
+            PackRequest::new(&plan, root.join("migration.iniza"))
+                .with_recovery_context(&synthetic_recovery_context())
+                .with_cancellation(&cancellation)
+                .with_persistence(&persistence),
+        )
+        .unwrap();
+    panic!("Pack did not terminate at the requested persistence transition");
+}
+
+#[test]
+fn process_termination_at_every_pack_write_transition_never_creates_false_completion() {
+    for (name, request_checkpoint, final_is_visible) in [
+        ("create-partial", false, false),
+        ("write-partial", false, false),
+        ("create-item-stage", false, false),
+        ("write-item-stage", false, false),
+        ("flush-item-stage", false, false),
+        ("remove-item-stage", false, false),
+        ("sync-partial-checkpoint", true, false),
+        ("create-checkpoint", true, false),
+        ("write-checkpoint", true, false),
+        ("sync-checkpoint", true, false),
+        ("sync-checkpoint-directory", true, false),
+        ("sync-completed-partial", false, false),
+        ("publish-completed", false, false),
+        ("sync-completed-directory", false, true),
+    ] {
+        let directory = TestDirectory::new();
+        let plan = approved_plan(&directory);
+        plan.write_to(&directory.path().join("reviewed-plan.toml"))
+            .unwrap();
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "pack_persistence_termination_child",
+                "--nocapture",
+            ])
+            .env("INIZA_SYNTHETIC_PERSISTENCE_CHILD", directory.path())
+            .env("INIZA_SYNTHETIC_PERSISTENCE_TRANSITION", name);
+        if request_checkpoint {
+            command.env("INIZA_SYNTHETIC_PERSISTENCE_CHECKPOINT", "1");
+        }
+        let status = command.status().unwrap();
+        assert_eq!(status.code(), Some(73), "{name} child failed unexpectedly");
+        let destination = directory.path().join("migration.iniza");
+        let context = synthetic_recovery_context();
+        if final_is_visible {
+            assert_eq!(
+                BundleEngine::local()
+                    .verify(VerifyRequest::new(
+                        &destination,
+                        context.offline_recovery_key(),
+                    ))
+                    .unwrap()
+                    .authenticated_bytes,
+                43,
+                "{name} left a final name that did not fully authenticate"
+            );
+        } else {
+            assert!(!destination.exists(), "{name} published false completion");
+            let restarted = directory.path().join("restarted.iniza");
+            let report = BundleEngine::local()
+                .pack(PackRequest::new(&plan, &restarted).with_recovery_context(&context))
+                .unwrap_or_else(|error| panic!("clean restart after {name} failed: {error}"));
+            assert_eq!(report.state(), PackState::Complete);
+            assert_eq!(
+                BundleEngine::local()
+                    .verify(VerifyRequest::new(
+                        &restarted,
+                        context.offline_recovery_key(),
+                    ))
+                    .unwrap()
+                    .authenticated_bytes,
+                43
+            );
+        }
+        assert_eq!(
+            fs::read(directory.path().join("synthetic-source/first.txt")).unwrap(),
+            b"first protected item\n"
+        );
+        assert_eq!(
+            fs::read(directory.path().join("synthetic-source/second.txt")).unwrap(),
+            b"second protected item\n"
+        );
+    }
+}
+
+fn assert_recovery_advice_contract(advice: PackRecoveryAdvice, action: &str) {
+    assert!(advice.human_summary().contains(action));
+    let machine: serde_json::Value = serde_json::from_str(&advice.machine_json_result()).unwrap();
+    assert_eq!(machine["schema_version"], 1);
+    assert_eq!(machine["command"], "pack recovery advice");
+    assert_eq!(machine["data"]["next_action"], action);
+    let output = format!("{}\n{}", advice.human_summary(), machine);
+    assert!(!output.contains("31313131"));
+    assert!(!output.contains("47474747"));
+}
+
+#[test]
+fn failed_pack_guidance_distinguishes_retry_resume_restart_and_verify() {
+    let retry_directory = TestDirectory::new();
+    let retry_plan = approved_plan(&retry_directory);
+    let retry_destination = retry_directory.path().join("migration.iniza");
+    let context = synthetic_recovery_context();
+    let retry_failure = FailPackPersistenceOnce {
+        target: PackPersistenceTransition::CreatePartialBundle,
+        kind: io::ErrorKind::PermissionDenied,
+        failed: AtomicBool::new(false),
+    };
+    BundleEngine::local()
+        .pack(
+            PackRequest::new(&retry_plan, &retry_destination)
+                .with_recovery_context(&context)
+                .with_persistence(&retry_failure),
+        )
+        .unwrap_err();
+    assert_recovery_advice_contract(
+        BundleEngine::local().advise_failed_pack(&retry_plan, &retry_destination, &context),
+        "retry",
+    );
+
+    let resume_directory = TestDirectory::new();
+    let resume_plan = approved_plan(&resume_directory);
+    let resume_destination = resume_directory.path().join("migration.iniza");
+    let cancellation = PackCancellation::default();
+    let mut stop = StopAfterCapture {
+        cancellation: &cancellation,
+        events: Vec::new(),
+    };
+    BundleEngine::local()
+        .pack(
+            PackRequest::new(&resume_plan, &resume_destination)
+                .with_recovery_context(&context)
+                .with_cancellation(&cancellation)
+                .with_event_sink(&mut stop),
+        )
+        .unwrap();
+    assert_recovery_advice_contract(
+        BundleEngine::local().advise_failed_pack(&resume_plan, &resume_destination, &context),
+        "resume-after-revalidation",
+    );
+
+    let restart_directory = TestDirectory::new();
+    let restart_plan = approved_plan(&restart_directory);
+    restart_plan
+        .write_to(&restart_directory.path().join("reviewed-plan.toml"))
+        .unwrap();
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "pack_termination_child", "--nocapture"])
+        .env("INIZA_SYNTHETIC_PACK_CHILD", restart_directory.path())
+        .env("INIZA_SYNTHETIC_PACK_PHASE", "captured")
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(73));
+    assert_recovery_advice_contract(
+        BundleEngine::local().advise_failed_pack(
+            &restart_plan,
+            &restart_directory.path().join("migration.iniza"),
+            &context,
+        ),
+        "restart-at-new-destination",
+    );
+
+    let verify_directory = TestDirectory::new();
+    let verify_plan = approved_plan(&verify_directory);
+    let verify_destination = verify_directory.path().join("migration.iniza");
+    let verify_failure = FailPackPersistenceOnce {
+        target: PackPersistenceTransition::SynchronizeCompletedBundleDirectory,
+        kind: io::ErrorKind::StorageFull,
+        failed: AtomicBool::new(false),
+    };
+    BundleEngine::local()
+        .pack(
+            PackRequest::new(&verify_plan, &verify_destination)
+                .with_recovery_context(&context)
+                .with_persistence(&verify_failure),
+        )
+        .unwrap_err();
+    assert_recovery_advice_contract(
+        BundleEngine::local().advise_failed_pack(&verify_plan, &verify_destination, &context),
+        "verify-published-bundle",
+    );
+}
 
 #[test]
 fn owner_can_interrupt_pack_at_a_checkpoint_without_publishing_a_bundle() {

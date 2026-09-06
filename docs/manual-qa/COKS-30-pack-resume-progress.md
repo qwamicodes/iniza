@@ -1,8 +1,8 @@
-# COKS-30 synthetic testing guide — issue still in progress
+# COKS-30 authenticated Pack pause and Resume — synthetic testing guide
 
 ## What is available
 
-The Rust core can pause Pack at a Migration Item boundary, save an encrypted authenticated checkpoint, revalidate it, and Resume into a completed Bundle. Both Recovery Methods independently verify and restore completed protected content. This is not yet a supported cross-process command-line migration workflow.
+The Rust core can pause Pack at a Migration Item boundary, save an encrypted authenticated checkpoint, revalidate it, and Resume into a completed Bundle. It escalates a repeated stop request to immediate termination, contains storage failures at every exposed persistence transition, publishes atomically without overwrite, and gives secret-free retry, Resume, restart, or verification guidance after failure. Both Recovery Methods independently verify and restore completed protected content. This is not yet a supported cross-process command-line migration workflow.
 
 ## Prerequisites and setup
 
@@ -83,6 +83,32 @@ Compilation should succeed. Every walkthrough command below creates its own isol
 
    Expect twenty passing tests in total. Every injected failure must leave the completed destination absent. A subsequent invocation authenticates the retained state, finishes Pack, and fully verifies all forty-three synthetic source bytes.
 
+9. Inject storage-full and permission-denied failures throughout ordinary Pack persistence:
+
+   ```sh
+   cargo test --test bundle_resume failure_never_publishes -- --test-threads=4
+   cargo test --test bundle_resume completed_bundle_directory_sync_failure_returns_an_error_but_keeps_verifiable_output -- --exact
+   ```
+
+   Expect fourteen passing tests. Failures before publication never expose the completed name and permit a clean restart at a new destination. A failure while synchronizing the directory after atomic publication reports failure, leaves no ordinary partial name, and leaves a completed Bundle that fully verifies before reliance.
+
+10. Terminate a disposable child at every Pack persistence transition:
+
+    ```sh
+    cargo test --test bundle_resume process_termination_at_every_pack_write_transition_never_creates_false_completion -- --exact --nocapture
+    ```
+
+    Expect one passing parent test. Every prepublication termination leaves the completed name absent and permits a clean restart at a new destination. Termination after atomic publication may leave the completed name, but that output must fully authenticate.
+
+11. Observe atomic publication and recovery guidance:
+
+    ```sh
+    cargo test --test bundle_resume completed_bundle_publication_atomically_removes_the_partial_name -- --exact
+    cargo test --test bundle_resume failed_pack_guidance_distinguishes_retry_resume_restart_and_verify -- --exact
+    ```
+
+    Expect two passing tests. Successful publication exposes only the completed name. Failed-attempt classification distinguishes retry, Resume after revalidation, restart at a new destination, and verify the published Bundle in both human and versioned machine-readable output without exposing Recovery Secrets.
+
 ## Failure and safety checks
 
 ```sh
@@ -120,9 +146,9 @@ No personal state or external session is changed. Do not attempt to salvage real
 
 ## Known limitations
 
-- COKS-30 remains In Progress. The disk-full and permission-loss matrix still needs the partial-Bundle, Migration Item staging, checkpoint creation, and completed-Bundle publication operations. Promotion transaction storage failures and process termination are covered. Unique incomplete journal staging artifacts can remain after a failed write; they are visibly partial, ignored by recovery, and never accepted as Bundles.
+- COKS-30 completes the authenticated core storage transaction, but it does not make Iniza ready for Owner Dogfood by itself. Unique incomplete journal staging artifacts can remain after a failed write; they are visibly partial, ignored by recovery, and never accepted as Bundles.
 - A pause waits for a whole Migration Item, potentially a large file. Resume authenticates and re-encrypts saved progress and requires additional disk space.
 - Resume currently needs both Recovery Secrets in memory. Either one independently unlocks a completed Bundle.
 - Recovery Method storage and the supported command-line workflow remain dependent on COKS-33 and COKS-36. These tests use no real secret transport.
-- There is no Verified Copy command, readiness Receipt, complete migration rehearsal, or erase-readiness claim in this slice.
+- There is no Verified Copy command, readiness Receipt, complete migration rehearsal, or erase-readiness claim in this slice. Verified Copy must add its own rejection tests for partial artifact names.
 - Keep independent conventional backups. These tests do not authorize using Iniza as the only protection for a machine move.

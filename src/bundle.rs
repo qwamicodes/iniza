@@ -50,7 +50,69 @@ pub enum PackStopAction {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackRecoveryAdvice {
+    Retry,
+    ResumeAfterRevalidation,
+    RestartAtNewDestination,
+    VerifyPublishedBundle,
+}
+
+impl PackRecoveryAdvice {
+    fn next_action(self) -> &'static str {
+        match self {
+            Self::Retry => "retry",
+            Self::ResumeAfterRevalidation => "resume-after-revalidation",
+            Self::RestartAtNewDestination => "restart-at-new-destination",
+            Self::VerifyPublishedBundle => "verify-published-bundle",
+        }
+    }
+
+    pub fn human_summary(self) -> &'static str {
+        match self {
+            Self::Retry => {
+                "Next action: retry. No Pack output artifact is visible at the requested destination."
+            }
+            Self::ResumeAfterRevalidation => {
+                "Next action: resume-after-revalidation. Resume must authenticate the Plan, Recovery Methods, sources, checkpoint, and destination state before writing."
+            }
+            Self::RestartAtNewDestination => {
+                "Next action: restart-at-new-destination while preserving every existing partial artifact for review."
+            }
+            Self::VerifyPublishedBundle => {
+                "Next action: verify-published-bundle. A completed name is visible, but it must pass full verification before reliance."
+            }
+        }
+    }
+
+    pub fn machine_json_result(self) -> String {
+        serde_json::json!({
+            "schema_version": 1,
+            "command": "pack recovery advice",
+            "status": "guidance",
+            "data": { "next_action": self.next_action() },
+            "warnings": [],
+            "errors": [],
+        })
+        .to_string()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PackPersistenceTransition {
+    CreatePartialBundle,
+    WritePartialBundle,
+    CreateMigrationItemStage,
+    WriteMigrationItemStage,
+    FlushMigrationItemStage,
+    RemoveMigrationItemStage,
+    SynchronizePartialBeforeCheckpoint,
+    CreateCheckpoint,
+    WriteCheckpoint,
+    SynchronizeCheckpoint,
+    SynchronizeCheckpointDirectory,
+    SynchronizeCompletedPartial,
+    PublishCompletedBundle,
+    SynchronizeCompletedBundleDirectory,
     CreatePromotionJournal,
     WritePromotionJournal,
     SynchronizePromotionJournal,
@@ -694,6 +756,7 @@ impl<S: BundleSource, C: DestinationCapacity> BundleEngine<S, C> {
             request.cancellation,
             resume,
             &mut created_partial,
+            persistence,
         );
         if write_result.is_err()
             && created_partial.as_ref().is_some_and(|created| {
@@ -802,6 +865,53 @@ impl<S: BundleSource, C: DestinationCapacity> BundleEngine<S, C> {
             authenticated_bytes: opened.authenticated_bytes,
         })
     }
+
+    pub fn advise_failed_pack(
+        &self,
+        plan: &Plan,
+        destination: &Path,
+        recovery: &PackRecoveryContext,
+    ) -> PackRecoveryAdvice {
+        if destination.exists()
+            && self
+                .verify(VerifyRequest::new(
+                    destination,
+                    recovery.offline_recovery_key(),
+                ))
+                .is_ok()
+        {
+            return PackRecoveryAdvice::VerifyPublishedBundle;
+        }
+        let partial = partial_path(destination);
+        if authenticate_pack_checkpoint(plan, &partial, recovery, &self.source).is_ok() {
+            return PackRecoveryAdvice::ResumeAfterRevalidation;
+        }
+        let resumed = resumed_partial_path(&partial);
+        let previous = previous_partial_path(&partial);
+        let promotion_artifact_exists = [
+            pack_promotion_journal_path(&partial),
+            previous.clone(),
+            pack_checkpoint_path(&previous),
+        ]
+        .iter()
+        .any(|path| pack_artifact_exists(path).unwrap_or(true));
+        if promotion_artifact_exists {
+            return PackRecoveryAdvice::ResumeAfterRevalidation;
+        }
+        let incomplete_artifact_exists = [
+            partial.clone(),
+            pack_checkpoint_path(&partial),
+            resumed.clone(),
+            pack_checkpoint_path(&resumed),
+        ]
+        .iter()
+        .any(|path| pack_artifact_exists(path).unwrap_or(true));
+        if incomplete_artifact_exists || destination.exists() {
+            PackRecoveryAdvice::RestartAtNewDestination
+        } else {
+            PackRecoveryAdvice::Retry
+        }
+    }
 }
 
 fn validate_pack_request(request: &PackRequest<'_>) -> Result<(), CoreError> {
@@ -850,6 +960,7 @@ fn write_bundle(
     cancellation: Option<&PackCancellation>,
     resume: Option<AuthenticatedPackCheckpoint>,
     created_partial: &mut Option<fs::Metadata>,
+    persistence: &dyn PackPersistence,
 ) -> Result<PackState, CoreError> {
     emit_event(events, BundleEvent::PackStarted);
     let estimated_required = plan
@@ -859,6 +970,13 @@ fn write_bundle(
         .and_then(|size| size.checked_add(MAX_PLAINTEXT_CHUNK as u64))
         .ok_or_else(|| invalid_bundle("Bundle capacity estimate overflowed"))?;
     ensure_capacity(capacity, destination, estimated_required)?;
+    persistence
+        .prepare_transition(PackPersistenceTransition::CreatePartialBundle)
+        .map_err(|source| CoreError::Io {
+            action: "prepare partial Bundle creation",
+            path: partial.to_path_buf(),
+            source,
+        })?;
     let output = create_private_pack_file(partial).map_err(|source| CoreError::Io {
         action: "create partial Bundle",
         path: partial.to_path_buf(),
@@ -869,7 +987,13 @@ fn write_bundle(
         path: partial.to_path_buf(),
         source,
     })?);
-    let mut writer = StreamWriter::new(output, capacity, destination);
+    let mut writer = StreamWriter::new(
+        output,
+        capacity,
+        destination,
+        persistence,
+        PackPersistenceTransition::WritePartialBundle,
+    );
     writer.write_hashed(header, partial)?;
     let root = plan
         .approved_roots()
@@ -1041,6 +1165,7 @@ fn write_bundle(
                 ],
                 source_adapter,
                 &source_observations,
+                persistence,
             )?;
             emit_event(
                 events,
@@ -1118,27 +1243,67 @@ fn write_bundle(
         &completion,
         partial,
     )?;
+    persistence
+        .prepare_transition(PackPersistenceTransition::SynchronizeCompletedPartial)
+        .map_err(|source| CoreError::Io {
+            action: "prepare completed partial Bundle synchronization",
+            path: partial.to_path_buf(),
+            source,
+        })?;
     writer.file.sync_all().map_err(|source| CoreError::Io {
         action: "synchronize completed partial Bundle",
         path: partial.to_path_buf(),
         source,
     })?;
     require_pack_file_identity(&writer.file, partial)?;
-    fs::hard_link(partial, destination).map_err(|source| {
-        if source.kind() == io::ErrorKind::AlreadyExists {
-            CoreError::DestinationAlreadyExists(destination.to_path_buf())
-        } else {
+    persistence
+        .prepare_transition(PackPersistenceTransition::PublishCompletedBundle)
+        .map_err(|source| CoreError::Io {
+            action: "prepare completed Bundle publication",
+            path: destination.to_path_buf(),
+            source,
+        })?;
+    let parent = destination
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let directory =
+        crate::restore_fs::RestoreDirectory::open_ambient(parent).map_err(|source| {
             CoreError::Io {
-                action: "publish completed Bundle without overwrite",
-                path: destination.to_path_buf(),
+                action: "open completed Bundle destination directory",
+                path: parent.to_path_buf(),
                 source,
             }
-        }
+        })?;
+    directory
+        .exclusive_rename(
+            Path::new(partial.file_name().expect("partial Bundle name")),
+            &directory,
+            Path::new(destination.file_name().expect("completed Bundle name")),
+        )
+        .map_err(|source| {
+            if source.kind() == io::ErrorKind::AlreadyExists {
+                CoreError::DestinationAlreadyExists(destination.to_path_buf())
+            } else {
+                CoreError::Io {
+                    action: "publish completed Bundle without overwrite",
+                    path: destination.to_path_buf(),
+                    source,
+                }
+            }
+        })?;
+    persistence
+        .prepare_transition(PackPersistenceTransition::SynchronizeCompletedBundleDirectory)
+        .map_err(|source| CoreError::Io {
+            action: "prepare completed Bundle directory synchronization",
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    directory.sync().map_err(|source| CoreError::Io {
+        action: "synchronize completed Bundle directory",
+        path: parent.to_path_buf(),
+        source,
     })?;
-    // Publication has already succeeded. A cleanup failure must not report the
-    // operation as failed when the authenticated final Bundle is now visible.
-    // A later housekeeping pass may remove the redundant hard-link name.
-    let _ = fs::remove_file(partial);
     emit_event(
         events,
         BundleEvent::PackCompleted {
@@ -2248,8 +2413,16 @@ fn write_pack_checkpoint(
     counts: [u64; 4],
     source_adapter: &impl BundleSource,
     captured_observations: &BTreeMap<u32, Option<BundleSourceObservation>>,
+    persistence: &dyn PackPersistence,
 ) -> Result<(), CoreError> {
     require_pack_file_identity(&writer.file, partial)?;
+    persistence
+        .prepare_transition(PackPersistenceTransition::SynchronizePartialBeforeCheckpoint)
+        .map_err(|source| CoreError::Io {
+            action: "prepare partial Bundle synchronization before checkpoint",
+            path: partial.to_path_buf(),
+            source,
+        })?;
     writer.file.sync_all().map_err(|source| CoreError::Io {
         action: "synchronize partial Bundle before checkpoint",
         path: partial.to_path_buf(),
@@ -2298,25 +2471,57 @@ fn write_pack_checkpoint(
         32 + ciphertext.len() as u64,
     )?;
     let path = pack_checkpoint_path(partial);
+    persistence
+        .prepare_transition(PackPersistenceTransition::CreateCheckpoint)
+        .map_err(|source| CoreError::Io {
+            action: "prepare authenticated Pack checkpoint creation",
+            path: path.clone(),
+            source,
+        })?;
     let mut output = create_private_pack_file(&path).map_err(|source| CoreError::Io {
         action: "create authenticated Pack checkpoint",
         path: path.clone(),
         source,
     })?;
+    persistence
+        .prepare_transition(PackPersistenceTransition::WriteCheckpoint)
+        .map_err(|source| CoreError::Io {
+            action: "prepare authenticated Pack checkpoint write",
+            path: path.clone(),
+            source,
+        })?;
     output
         .write_all(b"IZ2PAUS1")
         .and_then(|()| output.write_all(&nonce))
         .and_then(|()| output.write_all(&ciphertext))
-        .and_then(|()| output.sync_all())
         .map_err(|source| CoreError::Io {
-            action: "synchronize authenticated Pack checkpoint",
+            action: "write authenticated Pack checkpoint",
             path: path.clone(),
             source,
         })?;
+    persistence
+        .prepare_transition(PackPersistenceTransition::SynchronizeCheckpoint)
+        .map_err(|source| CoreError::Io {
+            action: "prepare authenticated Pack checkpoint synchronization",
+            path: path.clone(),
+            source,
+        })?;
+    output.sync_all().map_err(|source| CoreError::Io {
+        action: "synchronize authenticated Pack checkpoint",
+        path: path.clone(),
+        source,
+    })?;
     let parent = partial
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
+    persistence
+        .prepare_transition(PackPersistenceTransition::SynchronizeCheckpointDirectory)
+        .map_err(|source| CoreError::Io {
+            action: "prepare Pack checkpoint directory synchronization",
+            path: parent.to_path_buf(),
+            source,
+        })?;
     fs::File::open(parent)
         .and_then(|file| file.sync_all())
         .map_err(|source| CoreError::Io {
@@ -2432,6 +2637,14 @@ fn capture_regular_file(
             Err(_) => continue,
         };
         let stage_path = item_stage_path(partial, item_ordinal, attempt);
+        writer
+            .persistence
+            .prepare_transition(PackPersistenceTransition::CreateMigrationItemStage)
+            .map_err(|source_error| CoreError::Io {
+                action: "prepare encrypted Migration Item staging output creation",
+                path: stage_path.clone(),
+                source: source_error,
+            })?;
         let stage_file = fs::OpenOptions::new()
             .write(true)
             .read(true)
@@ -2442,7 +2655,13 @@ fn capture_regular_file(
                 path: stage_path.clone(),
                 source: source_error,
             })?;
-        let mut stage = StreamWriter::new(stage_file, writer.capacity, writer.capacity_destination);
+        let mut stage = StreamWriter::new(
+            stage_file,
+            writer.capacity,
+            writer.capacity_destination,
+            writer.persistence,
+            PackPersistenceTransition::WriteMigrationItemStage,
+        );
         let mut stage_index = Vec::new();
         let mut chunk_sequences = Vec::new();
         let mut content_hasher = blake3::Hasher::new();
@@ -2505,6 +2724,14 @@ fn capture_regular_file(
         let after = source_adapter.observe(source).ok();
         if after == Some(before) && logical_size == before.length {
             let base_offset = writer.offset;
+            writer
+                .persistence
+                .prepare_transition(PackPersistenceTransition::FlushMigrationItemStage)
+                .map_err(|source_error| CoreError::Io {
+                    action: "prepare encrypted Migration Item staging output flush",
+                    path: stage_path.clone(),
+                    source: source_error,
+                })?;
             stage.file.flush().map_err(|source_error| CoreError::Io {
                 action: "flush encrypted Migration Item staging output",
                 path: stage_path.clone(),
@@ -2531,6 +2758,14 @@ fn capture_regular_file(
                 index.push(entry);
             }
             drop(stage);
+            writer
+                .persistence
+                .prepare_transition(PackPersistenceTransition::RemoveMigrationItemStage)
+                .map_err(|source_error| CoreError::Io {
+                    action: "prepare encrypted Migration Item staging output cleanup",
+                    path: stage_path.clone(),
+                    source: source_error,
+                })?;
             fs::remove_file(&stage_path).map_err(|source_error| CoreError::Io {
                 action: "remove encrypted Migration Item staging output",
                 path: stage_path,
@@ -2595,6 +2830,8 @@ struct StreamWriter<'a> {
     record_count: u64,
     capacity: &'a dyn DestinationCapacity,
     capacity_destination: &'a Path,
+    persistence: &'a dyn PackPersistence,
+    write_transition: PackPersistenceTransition,
 }
 
 impl<'a> StreamWriter<'a> {
@@ -2602,6 +2839,8 @@ impl<'a> StreamWriter<'a> {
         file: fs::File,
         capacity: &'a dyn DestinationCapacity,
         capacity_destination: &'a Path,
+        persistence: &'a dyn PackPersistence,
+        write_transition: PackPersistenceTransition,
     ) -> Self {
         Self {
             file,
@@ -2610,11 +2849,20 @@ impl<'a> StreamWriter<'a> {
             record_count: 0,
             capacity,
             capacity_destination,
+            persistence,
+            write_transition,
         }
     }
 
     fn write_hashed(&mut self, bytes: &[u8], path: &Path) -> Result<(), CoreError> {
         ensure_capacity(self.capacity, self.capacity_destination, bytes.len() as u64)?;
+        self.persistence
+            .prepare_transition(self.write_transition)
+            .map_err(|source| CoreError::Io {
+                action: "prepare encrypted Bundle data write",
+                path: path.to_path_buf(),
+                source,
+            })?;
         self.file.write_all(bytes).map_err(|source| CoreError::Io {
             action: "write partial Bundle",
             path: path.to_path_buf(),

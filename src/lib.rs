@@ -18,8 +18,8 @@ pub use bundle::{
     BundleEngine, BundleEvent, BundleEventSink, BundleSource, BundleSourceObservation,
     BundleVerification, DestinationCapacity, InspectRequest, LocalBundleSource,
     LocalDestinationCapacity, LocalPackPersistence, PackCancellation, PackCheckpointPromotionStep,
-    PackPersistence, PackPersistenceTransition, PackRecoveryContext, PackReport, PackRequest,
-    PackState, PackStopAction, VerifyRequest,
+    PackPersistence, PackPersistenceTransition, PackRecoveryAdvice, PackRecoveryContext,
+    PackReport, PackRequest, PackState, PackStopAction, VerifyRequest,
 };
 pub use iz1::{
     AuthenticatedBundleSummary, Iz1Prototype, RecoveryMethod, RecoverySecret, SealedBundle,
