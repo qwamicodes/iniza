@@ -14,6 +14,7 @@ mod platform_metadata;
 mod project_audit;
 mod project_capsule;
 mod protection_candidates;
+mod push_plan;
 mod restore;
 mod restore_fs;
 
@@ -59,6 +60,12 @@ pub use protection_candidates::{
     CandidatePortability, CandidateSensitivity, CandidateSourceKind, CandidateValidation,
     InventoryCommand, ProtectionCandidate, ProtectionCandidateEngine, ProtectionCandidateReport,
     ProtectionCandidateRequest,
+};
+pub use push_plan::{
+    GitObjectIdentifier, GitPublicationOperation, GitPublicationOutput, GitPublicationProcess,
+    GitReference, GitRemoteName, InstalledGitPublication, PushAction, PushExecutionReport,
+    PushExecutionState, PushPlanApprovalReceipt, PushPlanApprovalRequest, PushPlanDocumentReport,
+    PushPlanDraftRequest, PushPlanEngine, PushPlanExecutionRequest,
 };
 pub use restore::{
     RestoreCancellation, RestoreEngine, RestoreEvent, RestoreEventSink, RestoreReport,

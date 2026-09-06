@@ -1,6 +1,6 @@
 # COKS-35 immutable Push Plan interface comparison
 
-- Status: Confirmed by the owner; ready for test-driven implementation
+- Status: Complete; interface and architecture decision accepted by the owner
 - Date: 2026-09-06
 - Issue: COKS-35
 
