@@ -50,7 +50,8 @@ pub use project_audit::{
     SanitizedRemote,
 };
 pub use project_capsule::{
-    ProjectCapsuleCandidateReport, ProjectCapsuleComparisonReport, ProjectCapsuleComparisonRequest,
+    ProjectCapsuleCandidateReport, ProjectCapsuleCaptureReport, ProjectCapsuleCaptureRequest,
+    ProjectCapsuleCaptureState, ProjectCapsuleComparisonReport, ProjectCapsuleComparisonRequest,
     ProjectCapsuleEngine, ProjectCapsuleRepresentation, ProjectCapsuleValidationReport,
     ProjectCapsuleValidationRequest,
 };

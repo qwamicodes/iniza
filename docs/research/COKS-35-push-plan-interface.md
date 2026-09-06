@@ -1,6 +1,6 @@
 # COKS-35 immutable Push Plan interface comparison
 
-- Status: Proposed; owner seam confirmation required before tests or implementation
+- Status: Confirmed by the owner; ready for test-driven implementation
 - Date: 2026-09-06
 - Issue: COKS-35
 

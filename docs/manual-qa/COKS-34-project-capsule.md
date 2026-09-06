@@ -4,6 +4,8 @@
 
 Iniza can compare a Git-native archive with overlay against a full repository snapshot by sending both synthetic candidates through encrypted Pack, full Verify, safe Restore, and independent Project validation.
 
+After owner acceptance of ADR 0012, Iniza can also capture one approved, freshly audited Project directly into the selected full repository snapshot Bundle. Capture fully verifies the completed Bundle, returns both in-memory Recovery Methods, and reports whether the Project stayed unchanged. Capture does not claim that a Restore Rehearsal or Git synchronization has occurred.
+
 The comparison proves the reviewed dirty Project state: fixed commits and local references, attached or detached current state, exact index, staged and unstaged files, binary bytes, untracked files, explicitly reviewed ignored files, symbolic links, reviewed executable modes, disabled Git hooks, selected empty directories, stashes, and repositories without remotes. A changed Project is marked Changed and Unverified. Human and machine results omit Project paths, protected names, remote addresses, credentials, content, and Recovery Secrets.
 
 ADR 0012 proposes the full repository snapshot because it enters direct encryption without the Git-native prototype's reusable plaintext archive and reconstruction format.
@@ -53,7 +55,15 @@ Expected result: Cargo completes successfully and builds the iniza library and c
    sed -n '1,260p' docs/adr/0012-select-full-repository-project-capsule.md
    ~~~
 
-   Expected result: the decision recommends the full repository snapshot, records representative size evidence for both candidates, explains why the smaller Git-native candidate is ineligible, and lists unsupported states as blockers.
+   Expected result: the accepted decision selects the full repository snapshot, records representative size evidence for both candidates, explains why the smaller Git-native candidate is ineligible, lists unsupported states as blockers, and records the owner's approval.
+
+4. Run the production-capture seam with synthetic data:
+
+   ~~~sh
+   cargo test --test project_capsule approved_verified_project_captures_directly_into_a_fully_verified_snapshot_bundle -- --exact
+   ~~~
+
+   Expected result: one test passes. An approved Plan and fresh verified Project audit produce a fully verified full-snapshot Bundle. A Restore using the in-memory Offline Recovery Method reproduces reviewed content, excludes unreviewed ignored data, and leaves Git hooks disabled.
 
 ## Failure and safety checks
 
@@ -89,6 +99,15 @@ Expected result: Cargo completes successfully and builds the iniza library and c
 
    Expected result: the test passes because an active Git lock blocks comparison before a workspace, partial artifact, or completed Bundle is created.
 
+5. Prove fresh-audit and post-Pack mutation handling:
+
+   ~~~sh
+   cargo test --test project_capsule production_capture_rejects_a_project_changed_after_its_verified_audit -- --exact
+   cargo test --test project_capsule production_capture_preserves_but_does_not_rely_on_a_bundle_when_the_project_changes -- --exact
+   ~~~
+
+   Expected result: both tests pass. A Project changed after audit is rejected before output. A Project changed after encrypted Pack retains its Bundle as evidence but receives Changed and Unverified state rather than a relied-on capture.
+
 ## Automated verification
 
 Run the focused suite:
@@ -97,7 +116,7 @@ Run the focused suite:
 cargo test --test project_capsule
 ~~~
 
-Expected result: 6 passed, 0 failed.
+Expected result: 9 passed, 0 failed.
 
 Run formatting, static analysis, and every repository test:
 
@@ -119,8 +138,7 @@ If a test process is forcibly terminated, inspect the operating-system temporary
 
 ## Known limitations
 
-- This issue is a representation comparison and architecture decision, not yet the supported personal-data capture command.
-- ProjectCapsuleEngine::capture and command-line integration remain gated on explicit owner acceptance of ADR 0012 and later COKS-38 integration.
+- The ProjectCapsuleEngine::capture library seam is implemented, but the supported personal-data command-line workflow remains part of later COKS-38 integration.
 - Bare repositories, linked worktrees, submodules, object alternates, incomplete Git Large File Storage state, sparse or partial clones, non-portable names, incompatible destination filesystem semantics, active Git locks, and changing Projects are not claimed as supported.
 - The size values in ADR 0012 come from the fixed synthetic fixture and are not estimates for a personal Project.
 - Passing this walkthrough does not establish Owner Dogfood readiness or authorize erasing the old Mac.

@@ -1,6 +1,6 @@
 # Select the full repository snapshot for Project Capsules
 
-- Status: Proposed; owner review and acceptance required
+- Status: Accepted
 - Date: 2026-09-06
 - Issue: COKS-34
 
@@ -72,3 +72,10 @@ These states must be reported as blocking and Unverified. They must not be silen
 - A completed Project Capsule does not by itself make a Project Synchronized or make the machine safe to erase.
 - COKS-38 must integrate the selected capture with approved Plans, verified Project audits, Recovery Methods, Receipts, and Restore Rehearsals.
 - Owner Dogfood still requires real Project selection, a real encrypted Bundle, verified independent copies, both Recovery Method rehearsals, and a successful Restore Rehearsal before any readiness conclusion.
+
+## Owner decision
+
+- [x] I approve the full repository snapshot as the Project Capsule representation.
+- Owner: Kwaame Ofori-adjekum
+- Decision date: 2026-09-06
+- Notes: Accepted in the implementation thread. This decision authorizes implementation of the production Project Capsule capture seam. It does not authorize capture of sole-copy personal data, Git publication, external writes, or erasing the old Mac.

@@ -36,6 +36,7 @@ pub struct ProjectLocalState {
     local_only_tags: Vec<String>,
     changed_during_audit: bool,
     verified: bool,
+    observation_hash: Option<String>,
 }
 
 impl ProjectLocalState {
@@ -85,6 +86,10 @@ impl ProjectLocalState {
 
     pub fn verified(&self) -> bool {
         self.verified
+    }
+
+    pub fn observation_hash(&self) -> Option<&str> {
+        self.observation_hash.as_deref()
     }
 }
 
@@ -1143,6 +1148,10 @@ fn audit_local_state(
     let changed_during_audit =
         matches!((&before, &after), (Some(before), Some(after)) if before != after);
     let verified = matches!((&before, &after), (Some(before), Some(after)) if before == after);
+    let observation_hash = match (&before, &after) {
+        (Some(before), Some(after)) if before == after => Some(local_observation_hash(before)),
+        _ => None,
+    };
 
     ProjectLocalState {
         head,
@@ -1157,6 +1166,7 @@ fn audit_local_state(
         local_only_tags,
         changed_during_audit,
         verified,
+        observation_hash,
     }
 }
 
@@ -1198,6 +1208,25 @@ fn observe_local_repository(
         ],
     )?;
     Some(LocalRepositoryObservation { status, references })
+}
+
+pub(crate) fn observe_local_repository_hash(
+    git: &impl GitProcess,
+    root: &Path,
+    kind: ProjectKind,
+) -> Option<String> {
+    observe_local_repository(git, root, kind)
+        .map(|observation| local_observation_hash(&observation))
+}
+
+fn local_observation_hash(observation: &LocalRepositoryObservation) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"iniza project audit observation v1\0");
+    hasher.update(&(observation.status.len() as u64).to_le_bytes());
+    hasher.update(&observation.status);
+    hasher.update(&(observation.references.len() as u64).to_le_bytes());
+    hasher.update(&observation.references);
+    hasher.finalize().to_hex().to_string()
 }
 
 fn run_optional(git: &impl GitProcess, root: &Path, arguments: &[&str]) -> Option<String> {

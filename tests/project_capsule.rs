@@ -2,15 +2,17 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
 use std::os::unix::fs::{PermissionsExt, symlink};
 
 use iniza::{
-    GitProcess, GitProcessOutput, InstalledGit, ProjectCapsuleComparisonRequest,
-    ProjectCapsuleEngine, ProjectCapsuleRepresentation, ProjectCapsuleValidationRequest,
+    GitProcess, GitProcessOutput, InstalledGit, PlanEngine, ProjectAuditEngine,
+    ProjectAuditRequest, ProjectCapsuleCaptureRequest, ProjectCapsuleCaptureState,
+    ProjectCapsuleComparisonRequest, ProjectCapsuleEngine, ProjectCapsuleRepresentation,
+    ProjectCapsuleValidationRequest, RestoreEngine, RestoreRequest, ScanRequest,
 };
 
 static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -502,6 +504,205 @@ fn active_git_lock_blocks_comparison_before_any_output_is_created() {
     assert!(!workspace.exists());
     assert!(!git_native_bundle.exists());
     assert!(!snapshot_bundle.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn approved_verified_project_captures_directly_into_a_fully_verified_snapshot_bundle() {
+    let directory = TestDirectory::new("production-capture");
+    let project = directory.path.join("owner-project");
+    let bundle = directory.path.join("project-capsule.iniza");
+    let restore = directory.path.join("restored-project");
+    create_dirty_project_fixture(
+        &project,
+        &directory.path.join("script-ran"),
+        &directory.path.join("hook-ran"),
+    );
+    let mut plan = PlanEngine::local()
+        .scan(ScanRequest::for_directory(&project))
+        .expect("Project Plan should scan");
+    let reviewed_hash = plan.approval_hash().expect("Project Plan should hash");
+    plan.approve(&reviewed_hash)
+        .expect("exact reviewed hash should approve the Project Plan");
+    let audit = ProjectAuditEngine::local()
+        .audit(ProjectAuditRequest::from_plan(&plan))
+        .expect("approved Project should audit");
+    let project_audit = audit.projects().first().expect("Project should be audited");
+
+    let report = ProjectCapsuleEngine::local()
+        .capture(
+            ProjectCapsuleCaptureRequest::new(&plan, project_audit, &bundle)
+                .with_reviewed_ignored_path(".env.local")
+                .with_reviewed_executable("scripts/rebuild.sh"),
+        )
+        .expect("approved verified Project should capture");
+
+    assert_eq!(report.state(), ProjectCapsuleCaptureState::Verified);
+    assert_eq!(
+        report.representation(),
+        ProjectCapsuleRepresentation::FullRepositorySnapshot
+    );
+    assert_eq!(report.pre_capture_hash(), report.post_capture_hash());
+    assert!(report.bundle_bytes() > 0);
+    assert_eq!(
+        report.verification().authenticated_bytes,
+        report.authenticated_project_bytes()
+    );
+    assert!(bundle.is_file());
+    assert!(!directory.path.join("project-capsule").exists());
+    assert!(
+        !report
+            .human_result()
+            .contains(&project.to_string_lossy().to_string())
+    );
+    assert!(!report.machine_json_result().contains("owner-project"));
+    assert!(!format!("{report:?}").contains("owner-project"));
+
+    RestoreEngine::local()
+        .restore(RestoreRequest::new(
+            &bundle,
+            &restore,
+            report.offline_recovery_key(),
+        ))
+        .expect("captured Project Capsule should restore with one Recovery Method");
+    assert_eq!(
+        fs::read(restore.join("staged.txt")).expect("reviewed staged content should restore"),
+        b"selected staged content\n"
+    );
+    assert!(
+        !restore.join("unreviewed.secret").exists(),
+        "unreviewed ignored data must not enter production capture"
+    );
+    assert_eq!(
+        fs::metadata(restore.join(".git/hooks/pre-commit"))
+            .expect("hook evidence should restore")
+            .permissions()
+            .mode()
+            & 0o111,
+        0,
+        "captured Git hooks must restore disabled"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn production_capture_preserves_but_does_not_rely_on_a_bundle_when_the_project_changes() {
+    let directory = TestDirectory::new("production-capture-change");
+    let project = directory.path.join("owner-project");
+    let bundle = directory.path.join("project-capsule.iniza");
+    create_dirty_project_fixture(
+        &project,
+        &directory.path.join("script-ran"),
+        &directory.path.join("hook-ran"),
+    );
+    let mut plan = PlanEngine::local()
+        .scan(ScanRequest::for_directory(&project))
+        .expect("Project Plan should scan");
+    let reviewed_hash = plan.approval_hash().expect("Project Plan should hash");
+    plan.approve(&reviewed_hash)
+        .expect("exact reviewed hash should approve the Project Plan");
+    let audit = ProjectAuditEngine::local()
+        .audit(ProjectAuditRequest::from_plan(&plan))
+        .expect("approved Project should audit");
+    let git = PostPackMutatingGit {
+        installed: InstalledGit::default(),
+        project: project.clone(),
+        head_observations: AtomicUsize::new(0),
+    };
+
+    let report = ProjectCapsuleEngine::with_git_process(git)
+        .capture(
+            ProjectCapsuleCaptureRequest::new(
+                &plan,
+                audit.projects().first().expect("Project should be audited"),
+                &bundle,
+            )
+            .with_reviewed_ignored_path(".env.local")
+            .with_reviewed_executable("scripts/rebuild.sh"),
+        )
+        .expect("changed capture should return bounded preservation evidence");
+
+    assert_eq!(
+        report.state(),
+        ProjectCapsuleCaptureState::ChangedAndUnverified
+    );
+    assert!(!report.is_verified());
+    assert_ne!(report.pre_capture_hash(), report.post_capture_hash());
+    assert!(
+        bundle.is_file(),
+        "the encrypted evidence should be preserved"
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&report.machine_json_result())
+            .expect("capture result should be JSON")["status"],
+        "changed-and-unverified"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn production_capture_rejects_a_project_changed_after_its_verified_audit() {
+    let directory = TestDirectory::new("stale-project-audit");
+    let project = directory.path.join("owner-project");
+    let bundle = directory.path.join("project-capsule.iniza");
+    create_dirty_project_fixture(
+        &project,
+        &directory.path.join("script-ran"),
+        &directory.path.join("hook-ran"),
+    );
+    let mut plan = PlanEngine::local()
+        .scan(ScanRequest::for_directory(&project))
+        .expect("Project Plan should scan");
+    let reviewed_hash = plan.approval_hash().expect("Project Plan should hash");
+    plan.approve(&reviewed_hash)
+        .expect("exact reviewed hash should approve the Project Plan");
+    let audit = ProjectAuditEngine::local()
+        .audit(ProjectAuditRequest::from_plan(&plan))
+        .expect("approved Project should audit");
+    fs::write(project.join("created-after-audit.txt"), "stale audit\n")
+        .expect("post-audit change should be written");
+
+    let error = ProjectCapsuleEngine::local()
+        .capture(
+            ProjectCapsuleCaptureRequest::new(
+                &plan,
+                audit.projects().first().expect("Project should be audited"),
+                &bundle,
+            )
+            .with_reviewed_ignored_path(".env.local")
+            .with_reviewed_executable("scripts/rebuild.sh"),
+        )
+        .expect_err("changed Project must require a fresh audit");
+
+    assert_eq!(
+        error.to_string(),
+        "Project Capsule capture requires a fresh Project audit"
+    );
+    assert!(!bundle.exists());
+}
+
+struct PostPackMutatingGit {
+    installed: InstalledGit,
+    project: PathBuf,
+    head_observations: AtomicUsize,
+}
+
+impl GitProcess for PostPackMutatingGit {
+    fn run(
+        &self,
+        repository: &Path,
+        arguments: &[std::ffi::OsString],
+    ) -> std::io::Result<GitProcessOutput> {
+        let observes_head = arguments.first().and_then(|value| value.to_str()) == Some("rev-parse")
+            && arguments.get(1).and_then(|value| value.to_str()) == Some("HEAD");
+        if observes_head && self.head_observations.fetch_add(1, Ordering::SeqCst) == 1 {
+            fs::write(
+                self.project.join("notes.txt"),
+                "changed after encrypted Pack\n",
+            )?;
+        }
+        self.installed.run(repository, arguments)
+    }
 }
 
 struct MutatingGit {

@@ -1,6 +1,6 @@
 # COKS-34 Project Capsule interface comparison
 
-- Status: Confirmed and implemented for comparison; ADR 0012 owner acceptance pending
+- Status: Confirmed and implemented; ADR 0012 accepted by the owner
 - Date: 2026-09-06
 - Issue: COKS-34
 
