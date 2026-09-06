@@ -32,6 +32,9 @@ Global options:
 
 ```text
 iniza scan <ROOT>
+  --list-protection-candidates
+  --candidate <IDENTIFIER>...
+  --raw-application-folder <HOME_RELATIVE_PATH>...
   --exclude <RELATIVE_PATH>...
   --optional <RELATIVE_PATH>...
   --recipe <NAME>...
@@ -42,6 +45,10 @@ iniza scan <ROOT>
 ```
 
 Directory scanning is read-only metadata discovery beneath exactly one explicit approved root. The filesystem root is rejected as too broad. Relative exclusions and Optional classifications remain visible in the Plan. Symbolic links are recorded but never followed. Mount boundaries are recorded and not crossed unless `--cross-mounts` is explicitly enabled. A regular-file source continues to create a development-only fixture Plan for the `fixture` workflow.
+
+`--list-protection-candidates` treats `<ROOT>` as the reviewed macOS home and reports curated Secure Shell, Git, Bash, Zsh, Visual Studio Code, Homebrew, language-tool, and regenerable-state candidates without reading candidate file contents. Human output identifies sources, sensitivity, portability, proposed Disposition, Protection Requirement, availability, validation, and unverified account-sync claims. Versioned JavaScript Object Notation output omits absolute paths and protected content.
+
+`--candidate <IDENTIFIER>` may be repeated with `--output-plan` to create a narrow filesystem Plan. Only the chosen candidate paths and the parent directories required to restore them are inspected; unrelated home content is not enumerated. Missing selected state remains an Unavailable Migration Item, so missing Must-Protect Items cannot disappear from coverage. Visual Studio Code state is unselected by default. A raw application folder must be a safe home-relative path and remains Optional with unsupported application-level Restore semantics explicitly visible. Inventory candidates describe deterministic, read-only inventory commands and do not include installed toolchains, caches, package registries, or build outputs as payloads; their command execution belongs to the supported capture orchestration rather than candidate discovery.
 
 ### `iniza plan`
 

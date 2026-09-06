@@ -3,7 +3,8 @@ use std::process::ExitCode;
 
 use iniza::{
     CoreError, InizaCore, Plan, PlanApprovalState, PlanEngine, ProjectAuditEngine,
-    ProjectAuditRequest, PublicationPolicy, ScanRequest,
+    ProjectAuditRequest, ProtectionCandidateEngine, ProtectionCandidateRequest, PublicationPolicy,
+    ScanRequest,
 };
 
 fn main() -> ExitCode {
@@ -270,7 +271,7 @@ fn run(
             unreachable!("encrypted Bundle inspection is not implemented")
         }
         _ => Err(CliError::Usage(
-            "usage: iniza scan <SOURCE> --output-plan <PLAN> [DIRECTORY PLAN OPTIONS] | iniza projects scan --plan <APPROVED_PLAN> [--remote-check] | iniza plan show --plan <PLAN> | iniza plan validate --plan <PLAN> | iniza plan approve --plan <PLAN> --approved-hash <HASH> | iniza plan diff <OLD> <NEW> | iniza inspect <BUNDLE> | iniza fixture pack --plan <PLAN> --output <PATH.iniza-fixture> | iniza fixture inspect <PATH.iniza-fixture> | iniza fixture restore <PATH.iniza-fixture> --to <NEW_DESTINATION>"
+            "usage: iniza scan <SOURCE> (--list-protection-candidates | --candidate <ID>... --output-plan <PLAN> | --output-plan <PLAN>) [SCAN OPTIONS] | iniza projects scan --plan <APPROVED_PLAN> [--remote-check] | iniza plan show --plan <PLAN> | iniza plan validate --plan <PLAN> | iniza plan approve --plan <PLAN> --approved-hash <HASH> | iniza plan diff <OLD> <NEW> | iniza inspect <BUNDLE> | iniza fixture pack --plan <PLAN> --output <PATH.iniza-fixture> | iniza fixture inspect <PATH.iniza-fixture> | iniza fixture restore <PATH.iniza-fixture> --to <NEW_DESTINATION>"
                 .to_owned(),
         )),
     }
@@ -292,6 +293,9 @@ fn run_scan(
     let mut destination = None;
     let mut publication_policy = PublicationPolicy::ProtectLocallyOnly;
     let mut cross_mounts = false;
+    let mut list_protection_candidates = false;
+    let mut raw_application_folders = Vec::new();
+    let mut selected_candidates = Vec::new();
     let mut index = 1;
     while index < arguments.len() {
         match arguments[index].as_str() {
@@ -335,8 +339,37 @@ fn run_scan(
                 cross_mounts = true;
                 index += 1;
             }
+            "--list-protection-candidates" => {
+                list_protection_candidates = true;
+                index += 1;
+            }
+            "--raw-application-folder" => {
+                raw_application_folders.push(PathBuf::from(
+                    arguments.get(index + 1).ok_or_else(scan_usage)?,
+                ));
+                index += 2;
+            }
+            "--candidate" => {
+                selected_candidates.push(arguments.get(index + 1).ok_or_else(scan_usage)?.clone());
+                index += 2;
+            }
             _ => return Err(scan_usage()),
         }
+    }
+    if list_protection_candidates {
+        let mut request = ProtectionCandidateRequest::for_home(&source);
+        for folder in raw_application_folders {
+            request = request.with_raw_application_folder(folder);
+        }
+        let report = ProtectionCandidateEngine::macos()
+            .discover(request)
+            .map_err(|error| CliError::Operation(error.to_string()))?;
+        if machine_output {
+            println!("{}", report.machine_json_result());
+        } else {
+            print!("{}", report.to_human_text());
+        }
+        return Ok(ExitCode::SUCCESS);
     }
     let plan_path = output_plan.ok_or_else(scan_usage)?;
     print_progress(
@@ -346,14 +379,21 @@ fn run_scan(
     if json_events {
         print_json_event("scan-started", serde_json::json!({}));
     }
-    let metadata = std::fs::symlink_metadata(&source).map_err(|error| {
-        CliError::Operation(format!(
-            "could not inspect approved source at {}: {error}",
-            source.display()
-        ))
-    })?;
-    let plan = if metadata.is_dir() {
-        let mut request = ScanRequest::for_directory(&source)
+    let plan = if !selected_candidates.is_empty() {
+        let mut candidate_request = ProtectionCandidateRequest::for_home(&source);
+        for folder in raw_application_folders {
+            candidate_request = candidate_request.with_raw_application_folder(folder);
+        }
+        let report = ProtectionCandidateEngine::macos()
+            .discover(candidate_request)
+            .map_err(|error| CliError::Operation(error.to_string()))?;
+        let selected = selected_candidates
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let mut request = report
+            .plan_request(&selected)
+            .map_err(|error| CliError::Operation(error.to_string()))?
             .with_cross_mounts(cross_mounts)
             .with_publication_policy(publication_policy);
         for exclusion in exclusions {
@@ -372,20 +412,50 @@ fn run_scan(
             .scan(request)
             .map_err(|error| CliError::Operation(error.to_string()))?
     } else {
-        if !exclusions.is_empty()
-            || !optional_items.is_empty()
-            || !recipes.is_empty()
-            || destination.is_some()
-            || publication_policy != PublicationPolicy::ProtectLocallyOnly
-            || cross_mounts
-        {
-            return Err(CliError::Usage(
-                "directory scan options require a directory source".to_owned(),
-            ));
+        if !raw_application_folders.is_empty() {
+            return Err(scan_usage());
         }
-        InizaCore
-            .scan_explicit_file(&source)
-            .map_err(|error| CliError::Operation(error.to_string()))?
+        let metadata = std::fs::symlink_metadata(&source).map_err(|error| {
+            CliError::Operation(format!(
+                "could not inspect approved source at {}: {error}",
+                source.display()
+            ))
+        })?;
+        if metadata.is_dir() {
+            let mut request = ScanRequest::for_directory(&source)
+                .with_cross_mounts(cross_mounts)
+                .with_publication_policy(publication_policy);
+            for exclusion in exclusions {
+                request = request.exclude(exclusion);
+            }
+            for optional_item in optional_items {
+                request = request.mark_optional(optional_item);
+            }
+            for recipe in recipes {
+                request = request.with_recipe(recipe);
+            }
+            if let Some(destination) = destination {
+                request = request.with_destination_preference(destination);
+            }
+            PlanEngine::local()
+                .scan(request)
+                .map_err(|error| CliError::Operation(error.to_string()))?
+        } else {
+            if !exclusions.is_empty()
+                || !optional_items.is_empty()
+                || !recipes.is_empty()
+                || destination.is_some()
+                || publication_policy != PublicationPolicy::ProtectLocallyOnly
+                || cross_mounts
+            {
+                return Err(CliError::Usage(
+                    "directory scan options require a directory source".to_owned(),
+                ));
+            }
+            InizaCore
+                .scan_explicit_file(&source)
+                .map_err(|error| CliError::Operation(error.to_string()))?
+        }
     };
     plan.write_to(&plan_path)
         .map_err(|error| CliError::Operation(error.to_string()))?;
@@ -474,7 +544,7 @@ fn project_audit_usage() -> CliError {
 
 fn scan_usage() -> CliError {
     CliError::Usage(
-        "usage: iniza scan <SOURCE> --output-plan <PLAN> [--exclude <RELATIVE_PATH>] [--optional <RELATIVE_PATH>] [--recipe <NAME>] [--destination <BUNDLE_PATH>] [--publication-policy <protect-locally-only|review-separately>] [--cross-mounts]"
+        "usage: iniza scan <SOURCE> (--list-protection-candidates [--raw-application-folder <HOME_RELATIVE_PATH>] | --candidate <ID>... --output-plan <PLAN> [--raw-application-folder <HOME_RELATIVE_PATH>] | --output-plan <PLAN> [--exclude <RELATIVE_PATH>] [--optional <RELATIVE_PATH>] [--recipe <NAME>] [--destination <BUNDLE_PATH>] [--publication-policy <protect-locally-only|review-separately>] [--cross-mounts])"
             .to_owned(),
     )
 }

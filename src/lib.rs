@@ -11,6 +11,7 @@ mod plan_document;
 mod plan_engine;
 mod platform_metadata;
 mod project_audit;
+mod protection_candidates;
 mod restore;
 mod restore_fs;
 
@@ -39,6 +40,11 @@ pub use project_audit::{
     InstalledGit, ProjectAudit, ProjectAuditEngine, ProjectAuditReport, ProjectAuditRequest,
     ProjectHead, ProjectKind, ProjectLocalState, ProjectSubmodule, RemoteCheckOutcome,
     SanitizedRemote,
+};
+pub use protection_candidates::{
+    CandidatePortability, CandidateSensitivity, CandidateSourceKind, CandidateValidation,
+    InventoryCommand, ProtectionCandidate, ProtectionCandidateEngine, ProtectionCandidateReport,
+    ProtectionCandidateRequest,
 };
 pub use restore::{
     RestoreCancellation, RestoreEngine, RestoreEvent, RestoreEventSink, RestoreReport,

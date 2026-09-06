@@ -200,6 +200,14 @@ pub struct ScanRequest {
     recipes: Vec<String>,
     destination_preference: Option<PathBuf>,
     publication_policy: PublicationPolicy,
+    selected_candidate_paths: Option<Vec<SelectedCandidatePath>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SelectedCandidatePath {
+    pub(crate) relative_path: PathBuf,
+    pub(crate) protection_requirement: ProtectionRequirement,
+    pub(crate) explanation: String,
 }
 
 impl ScanRequest {
@@ -212,6 +220,7 @@ impl ScanRequest {
             recipes: Vec::new(),
             destination_preference: None,
             publication_policy: PublicationPolicy::ProtectLocallyOnly,
+            selected_candidate_paths: None,
         }
     }
 
@@ -243,6 +252,16 @@ impl ScanRequest {
     pub fn with_publication_policy(mut self, policy: PublicationPolicy) -> Self {
         self.publication_policy = policy;
         self
+    }
+
+    pub(crate) fn for_selected_candidates(
+        root: impl Into<PathBuf>,
+        selected_candidate_paths: Vec<SelectedCandidatePath>,
+    ) -> Self {
+        Self {
+            selected_candidate_paths: Some(selected_candidate_paths),
+            ..Self::for_directory(root)
+        }
     }
 }
 
@@ -314,14 +333,26 @@ impl<F: SourceFilesystem> PlanEngine<F> {
             root_observation,
             "explicitly approved directory",
         )];
-        let root_was_readable = discover_children(
-            &self.source,
-            &root,
-            &root,
-            root_observation.device_id,
-            request.cross_mounts,
-            &mut items,
-        )?;
+        let root_was_readable = if let Some(selected_paths) = &request.selected_candidate_paths {
+            discover_selected_candidates(
+                &self.source,
+                &root,
+                root_observation.device_id,
+                request.cross_mounts,
+                selected_paths,
+                &mut items,
+            )?;
+            true
+        } else {
+            discover_children(
+                &self.source,
+                &root,
+                &root,
+                root_observation.device_id,
+                request.cross_mounts,
+                &mut items,
+            )?
+        };
         if !root_was_readable {
             mark_unavailable(&mut items[0], "source directory is not readable");
         }
@@ -367,6 +398,109 @@ impl<F: SourceFilesystem> PlanEngine<F> {
             approved_hash: None,
         })
     }
+}
+
+fn discover_selected_candidates<F: SourceFilesystem>(
+    source: &F,
+    root: &Path,
+    root_device_id: u64,
+    cross_mounts: bool,
+    selected_paths: &[SelectedCandidatePath],
+    items: &mut Vec<MigrationItem>,
+) -> Result<(), CoreError> {
+    let mut selected_paths = selected_paths.to_vec();
+    selected_paths.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    selected_paths.dedup_by(|left, right| left.relative_path == right.relative_path);
+    let mut retained = Vec::<SelectedCandidatePath>::new();
+    for selected in selected_paths {
+        if retained
+            .iter()
+            .any(|parent| selected.relative_path.starts_with(&parent.relative_path))
+        {
+            continue;
+        }
+        if !is_safe_relative_request_path(&selected.relative_path) {
+            return Err(CoreError::InvalidPlan(
+                "selected Protection Candidate must stay beneath its home root".to_owned(),
+            ));
+        }
+        let absolute = root.join(&selected.relative_path);
+        let first = match source.observe(&absolute) {
+            Ok(observation) => observation,
+            Err(_) => {
+                let mut unavailable =
+                    unavailable_unknown_item(root, selected.relative_path.clone());
+                unavailable.protection_requirement = selected.protection_requirement;
+                unavailable.explanation =
+                    format!("{}; source is unavailable", selected.explanation);
+                items.push(unavailable);
+                retained.push(selected);
+                continue;
+            }
+        };
+        add_selected_candidate_ancestors(
+            source,
+            root,
+            &selected.relative_path,
+            selected.protection_requirement,
+            &selected.explanation,
+            items,
+        )?;
+        let start = items.len();
+        let mut item = item_from_observation(
+            root,
+            selected.relative_path.clone(),
+            first,
+            &selected.explanation,
+        );
+        if first.kind == SourceEntryKind::Directory
+            && !discover_children(source, root, &absolute, root_device_id, cross_mounts, items)?
+        {
+            mark_unavailable(&mut item, "selected Protection Candidate is not readable");
+        }
+        item.protection_requirement = selected.protection_requirement;
+        for discovered in &mut items[start..] {
+            discovered.protection_requirement = selected.protection_requirement;
+            discovered.explanation = selected.explanation.clone();
+        }
+        items.push(item);
+        retained.push(selected);
+    }
+    Ok(())
+}
+
+fn add_selected_candidate_ancestors<F: SourceFilesystem>(
+    source: &F,
+    root: &Path,
+    selected_path: &Path,
+    protection_requirement: ProtectionRequirement,
+    explanation: &str,
+    items: &mut Vec<MigrationItem>,
+) -> Result<(), CoreError> {
+    let Some(parent) = selected_path.parent() else {
+        return Ok(());
+    };
+    let mut ancestor = PathBuf::new();
+    for component in parent.components() {
+        ancestor.push(component.as_os_str());
+        if items.iter().any(|item| item.relative_path == ancestor) {
+            continue;
+        }
+        let observation = source.observe(&root.join(&ancestor)).map_err(|_| {
+            CoreError::InvalidPlan(
+                "selected Protection Candidate has an unavailable parent directory".to_owned(),
+            )
+        })?;
+        if observation.kind != SourceEntryKind::Directory {
+            return Err(CoreError::InvalidPlan(
+                "selected Protection Candidate traverses a non-directory parent".to_owned(),
+            ));
+        }
+        let mut item = item_from_observation(root, ancestor.clone(), observation, explanation);
+        item.protection_requirement = protection_requirement;
+        items.push(item);
+    }
+    Ok(())
 }
 
 fn is_safe_relative_request_path(path: &Path) -> bool {
