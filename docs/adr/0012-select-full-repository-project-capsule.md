@@ -32,6 +32,8 @@ The full repository snapshot is larger but crosses the existing approved directo
 
 Mutation evidence is bound by a canonical BLAKE3 Project observation before and after each candidate reaches authenticated Completion. Any change withholds Restorable status and a recommendation. Human and machine results expose no Project path, protected name, raw remote address, credential, protected content, or Recovery Secret.
 
+An active Git lock is rejected before the disposable comparison workspace or either Bundle path is created. Lock files are never treated as repository state.
+
 ## Decision
 
 Select the full repository filesystem snapshot as the Project Capsule representation.

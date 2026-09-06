@@ -739,7 +739,33 @@ fn validate_request(request: &mut ProjectCapsuleComparisonRequest) -> Result<(),
             "Project Capsule comparison requires one working-tree Project".to_owned(),
         ));
     }
+    if repository_has_active_lock(&request.project_root.join(".git")).map_err(|_| {
+        CoreError::InvalidPlan(
+            "Project Capsule comparison could not verify repository lock state".to_owned(),
+        )
+    })? {
+        return Err(CoreError::InvalidPlan(
+            "Project Capsule comparison requires an unlocked repository".to_owned(),
+        ));
+    }
     Ok(())
+}
+
+fn repository_has_active_lock(git_directory: &Path) -> io::Result<bool> {
+    let mut pending = vec![git_directory.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let metadata = fs::symlink_metadata(entry.path())?;
+            if entry.file_name().to_string_lossy().ends_with(".lock") {
+                return Ok(true);
+            }
+            if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                pending.push(entry.path());
+            }
+        }
+    }
+    Ok(false)
 }
 
 fn validate_reviewed_paths(

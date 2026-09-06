@@ -81,6 +81,14 @@ Expected result: Cargo completes successfully and builds the iniza library and c
 
    Expected result: the test passes with hostile Project names and credential-bearing remote configuration absent from both result formats.
 
+4. Prove active-lock rejection:
+
+   ~~~sh
+   cargo test --test project_capsule active_git_lock_blocks_comparison_before_any_output_is_created -- --exact
+   ~~~
+
+   Expected result: the test passes because an active Git lock blocks comparison before a workspace, partial artifact, or completed Bundle is created.
+
 ## Automated verification
 
 Run the focused suite:
@@ -89,7 +97,7 @@ Run the focused suite:
 cargo test --test project_capsule
 ~~~
 
-Expected result: 5 passed, 0 failed.
+Expected result: 6 passed, 0 failed.
 
 Run formatting, static analysis, and every repository test:
 

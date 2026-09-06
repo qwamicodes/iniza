@@ -469,6 +469,41 @@ fn executable_mode_requires_the_exact_validation_hash_bound_to_the_restored_bund
     assert!(!hook_sentinel.exists());
 }
 
+#[cfg(unix)]
+#[test]
+fn active_git_lock_blocks_comparison_before_any_output_is_created() {
+    let directory = TestDirectory::new("active-lock");
+    let project = directory.path.join("owner-project");
+    let workspace = directory.path.join("comparison-workspace");
+    let git_native_bundle = directory.path.join("git-native.iniza");
+    let snapshot_bundle = directory.path.join("snapshot.iniza");
+    create_dirty_project_fixture(
+        &project,
+        &directory.path.join("script-ran"),
+        &directory.path.join("hook-ran"),
+    );
+    fs::write(project.join(".git/index.lock"), "synthetic active lock\n")
+        .expect("active lock fixture should be written");
+
+    let error = ProjectCapsuleEngine::local()
+        .compare(ProjectCapsuleComparisonRequest::new(
+            &project,
+            vec![PathBuf::from(".env.local")],
+            &workspace,
+            &git_native_bundle,
+            &snapshot_bundle,
+        ))
+        .expect_err("active repository locks must block Project Capsule comparison");
+
+    assert_eq!(
+        error.to_string(),
+        "Project Capsule comparison requires an unlocked repository"
+    );
+    assert!(!workspace.exists());
+    assert!(!git_native_bundle.exists());
+    assert!(!snapshot_bundle.exists());
+}
+
 struct MutatingGit {
     installed: InstalledGit,
     project: PathBuf,
