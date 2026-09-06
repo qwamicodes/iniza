@@ -146,6 +146,8 @@ iniza copy <BUNDLE> <DESTINATION>
 
 Existing final destinations are never overwritten in MVP. The command copies, flushes where supported, hashes, reopens, and authenticates the destination.
 
+COKS-31 implements this transaction in the reusable Rust core, including cancellation, explicit exact-prefix partial replacement, no-overwrite publication, durability warnings, and a secret-free Receipt. The supported cross-process command remains gated on loading a Recovery Method through the COKS-33 Offline Recovery Key or COKS-36 Vaultwarden flow; Recovery Secrets must not be passed through command arguments, environment variables, or ordinary files as an interim shortcut.
+
 ### `iniza restore`
 
 ```text

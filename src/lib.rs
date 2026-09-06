@@ -17,9 +17,12 @@ mod restore_fs;
 pub use bundle::{
     BundleEngine, BundleEvent, BundleEventSink, BundleSource, BundleSourceObservation,
     BundleVerification, DestinationCapacity, InspectRequest, LocalBundleSource,
-    LocalDestinationCapacity, LocalPackPersistence, PackCancellation, PackCheckpointPromotionStep,
-    PackPersistence, PackPersistenceTransition, PackRecoveryAdvice, PackRecoveryContext,
-    PackReport, PackRequest, PackState, PackStopAction, VerifyRequest,
+    LocalDestinationCapacity, LocalPackPersistence, LocalVerifiedCopyPersistence, PackCancellation,
+    PackCheckpointPromotionStep, PackPersistence, PackPersistenceTransition, PackRecoveryAdvice,
+    PackRecoveryContext, PackReport, PackRequest, PackState, PackStopAction,
+    VerifiedCopyCancellation, VerifiedCopyDurability, VerifiedCopyEvent, VerifiedCopyEventSink,
+    VerifiedCopyPersistence, VerifiedCopyPersistenceTransition, VerifiedCopyReceipt,
+    VerifiedCopyReport, VerifiedCopyRequest, VerifyRequest,
 };
 pub use iz1::{
     AuthenticatedBundleSummary, Iz1Prototype, RecoveryMethod, RecoverySecret, SealedBundle,
@@ -220,6 +223,7 @@ pub enum CoreError {
     AuthenticationFailed,
     BundleIncomplete(PathBuf),
     BundleInvalid(String),
+    CopyInterrupted(PathBuf),
     DestinationAlreadyExists(PathBuf),
     InsufficientSpace {
         path: PathBuf,
@@ -247,6 +251,11 @@ impl fmt::Display for CoreError {
                 write!(formatter, "Bundle output is incomplete: {}", path.display())
             }
             Self::BundleInvalid(message) => formatter.write_str(message),
+            Self::CopyInterrupted(path) => write!(
+                formatter,
+                "Verified Copy interrupted; partial output remains at {}",
+                path.display()
+            ),
             Self::DestinationAlreadyExists(path) => {
                 write!(formatter, "destination already exists: {}", path.display())
             }

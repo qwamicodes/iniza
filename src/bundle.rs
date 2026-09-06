@@ -2,7 +2,8 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
@@ -333,6 +334,116 @@ pub struct VerifyRequest<'a> {
     event_sink: Option<&'a mut dyn BundleEventSink>,
 }
 
+pub struct VerifiedCopyRequest<'a> {
+    source: PathBuf,
+    destination: PathBuf,
+    recovery_secret: &'a RecoverySecret,
+    replace_matching_partial: bool,
+    cancellation: Option<&'a VerifiedCopyCancellation>,
+    event_sink: Option<&'a mut dyn VerifiedCopyEventSink>,
+    persistence: &'a dyn VerifiedCopyPersistence,
+}
+
+impl<'a> VerifiedCopyRequest<'a> {
+    pub fn new(
+        source: impl Into<PathBuf>,
+        destination: impl Into<PathBuf>,
+        recovery_secret: &'a RecoverySecret,
+    ) -> Self {
+        Self {
+            source: source.into(),
+            destination: destination.into(),
+            recovery_secret,
+            replace_matching_partial: false,
+            cancellation: None,
+            event_sink: None,
+            persistence: &LOCAL_VERIFIED_COPY_PERSISTENCE,
+        }
+    }
+
+    pub fn replace_matching_partial(mut self) -> Self {
+        self.replace_matching_partial = true;
+        self
+    }
+
+    pub fn with_cancellation(mut self, cancellation: &'a VerifiedCopyCancellation) -> Self {
+        self.cancellation = Some(cancellation);
+        self
+    }
+
+    pub fn with_event_sink(mut self, event_sink: &'a mut dyn VerifiedCopyEventSink) -> Self {
+        self.event_sink = Some(event_sink);
+        self
+    }
+
+    pub fn with_persistence(mut self, persistence: &'a dyn VerifiedCopyPersistence) -> Self {
+        self.persistence = persistence;
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifiedCopyDurability {
+    Durable,
+    Weaker,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifiedCopyPersistenceTransition {
+    ReadSource,
+    CreatePartial,
+    WritePartial,
+    SynchronizePartial,
+    AuthenticatePartial,
+    PublishCompleted,
+    SynchronizeDirectory,
+    ReopenCompleted,
+}
+
+pub trait VerifiedCopyPersistence: Send + Sync {
+    fn prepare_transition(&self, transition: VerifiedCopyPersistenceTransition) -> io::Result<()>;
+
+    fn durability(&self) -> VerifiedCopyDurability {
+        VerifiedCopyDurability::Durable
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct LocalVerifiedCopyPersistence;
+
+impl VerifiedCopyPersistence for LocalVerifiedCopyPersistence {
+    fn prepare_transition(&self, _transition: VerifiedCopyPersistenceTransition) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+static LOCAL_VERIFIED_COPY_PERSISTENCE: LocalVerifiedCopyPersistence = LocalVerifiedCopyPersistence;
+
+#[derive(Debug, Default)]
+pub struct VerifiedCopyCancellation(AtomicBool);
+
+impl VerifiedCopyCancellation {
+    pub fn request_stop(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    fn is_requested(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerifiedCopyEvent {
+    CopyStarted,
+    BytesCopied { copied_bytes: u64 },
+    CopyPaused { copied_bytes: u64 },
+    CopyCompleted { copied_bytes: u64 },
+}
+
+pub trait VerifiedCopyEventSink {
+    fn emit(&mut self, event: VerifiedCopyEvent);
+}
+
 impl<'a> VerifyRequest<'a> {
     pub fn new(source: impl Into<PathBuf>, recovery_secret: &'a RecoverySecret) -> Self {
         Self {
@@ -374,6 +485,129 @@ impl BundleVerification {
             },
             "warnings": [],
             "errors": [],
+        })
+        .to_string()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedCopyReport {
+    source_digest: String,
+    destination_digest: String,
+    source_bundle_identity: String,
+    destination_bundle_identity: String,
+    receipt: VerifiedCopyReceipt,
+    durability: VerifiedCopyDurability,
+    warnings: Vec<String>,
+}
+
+impl VerifiedCopyReport {
+    pub fn is_verified(&self) -> bool {
+        self.source_digest == self.destination_digest
+            && self.source_bundle_identity == self.destination_bundle_identity
+    }
+
+    pub fn source_digest(&self) -> &str {
+        &self.source_digest
+    }
+
+    pub fn destination_digest(&self) -> &str {
+        &self.destination_digest
+    }
+
+    pub fn source_bundle_identity(&self) -> &str {
+        &self.source_bundle_identity
+    }
+
+    pub fn destination_bundle_identity(&self) -> &str {
+        &self.destination_bundle_identity
+    }
+
+    pub fn receipt(&self) -> &VerifiedCopyReceipt {
+        &self.receipt
+    }
+
+    pub fn durability(&self) -> VerifiedCopyDurability {
+        self.durability
+    }
+
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
+    }
+
+    pub fn human_summary(&self) -> &'static str {
+        "Verified Copy created."
+    }
+
+    pub fn machine_json_result(&self) -> String {
+        serde_json::json!({
+            "schema_version": 1,
+            "command": "copy",
+            "status": "success",
+            "data": {
+                "verified": self.is_verified(),
+                "source_bundle_identity": self.source_bundle_identity,
+                "destination_bundle_identity": self.destination_bundle_identity,
+                "whole_file_digest": self.destination_digest,
+                "verified_at_unix_seconds": self.receipt.verified_at_unix_seconds,
+                "durability": match self.durability {
+                    VerifiedCopyDurability::Durable => "durable",
+                    VerifiedCopyDurability::Weaker => "weaker",
+                },
+            },
+            "warnings": self.warnings,
+            "errors": [],
+        })
+        .to_string()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedCopyReceipt {
+    source_bundle_identity: String,
+    destination_bundle_identity: String,
+    whole_file_digest: String,
+    verified_at_unix_seconds: u64,
+}
+
+impl VerifiedCopyReceipt {
+    pub fn schema_version(&self) -> u32 {
+        1
+    }
+
+    pub fn operation(&self) -> &'static str {
+        "verified-copy"
+    }
+
+    pub fn result(&self) -> &'static str {
+        "verified"
+    }
+
+    pub fn source_bundle_identity(&self) -> &str {
+        &self.source_bundle_identity
+    }
+
+    pub fn destination_bundle_identity(&self) -> &str {
+        &self.destination_bundle_identity
+    }
+
+    pub fn whole_file_digest(&self) -> &str {
+        &self.whole_file_digest
+    }
+
+    pub fn verified_at_unix_seconds(&self) -> u64 {
+        self.verified_at_unix_seconds
+    }
+
+    pub fn machine_json_result(&self) -> String {
+        serde_json::json!({
+            "schema_version": self.schema_version(),
+            "operation": self.operation(),
+            "result": self.result(),
+            "source_bundle_identity": self.source_bundle_identity,
+            "destination_bundle_identity": self.destination_bundle_identity,
+            "whole_file_digest": self.whole_file_digest,
+            "verified_at_unix_seconds": self.verified_at_unix_seconds,
         })
         .to_string()
     }
@@ -863,6 +1097,290 @@ impl<S: BundleSource, C: DestinationCapacity> BundleEngine<S, C> {
             summary: opened.summary,
             authenticated_chunks: opened.authenticated_chunks,
             authenticated_bytes: opened.authenticated_bytes,
+        })
+    }
+
+    pub fn copy_verified(
+        &self,
+        mut request: VerifiedCopyRequest<'_>,
+    ) -> Result<VerifiedCopyReport, CoreError> {
+        if request
+            .destination
+            .extension()
+            .and_then(|value| value.to_str())
+            != Some("iniza")
+        {
+            return Err(invalid_bundle(
+                "Verified Copy destination must end with .iniza",
+            ));
+        }
+        let mut event_sink = request.event_sink.take();
+        prepare_verified_copy_transition(
+            request.persistence,
+            VerifiedCopyPersistenceTransition::ReadSource,
+            "read or materialize source Bundle for Verified Copy",
+            &request.source,
+        )?;
+        let mut source_file = open_bundle_file(&request.source)?;
+        let mut events = None;
+        let mut content_sink = None;
+        let source = open_bundle_from(
+            &mut source_file,
+            &request.source,
+            request.recovery_secret,
+            true,
+            &mut events,
+            &mut content_sink,
+            false,
+        )?;
+        if request.destination.exists() {
+            return Err(CoreError::DestinationAlreadyExists(request.destination));
+        }
+        let partial = partial_path(&request.destination);
+        let replaced_partial_identity = if partial.exists() {
+            if !request.replace_matching_partial {
+                return Err(CoreError::DestinationAlreadyExists(partial));
+            }
+            Some(require_matching_copy_prefix(
+                &mut source_file,
+                &request.source,
+                &partial,
+            )?)
+        } else {
+            None
+        };
+        let output_partial = if replaced_partial_identity.is_some() {
+            resumed_partial_path(&partial)
+        } else {
+            partial.clone()
+        };
+        if output_partial.exists() {
+            return Err(CoreError::DestinationAlreadyExists(output_partial));
+        }
+        emit_verified_copy_event(&mut event_sink, VerifiedCopyEvent::CopyStarted);
+        source_file
+            .seek(SeekFrom::Start(0))
+            .map_err(|source_error| CoreError::Io {
+                action: "rewind authenticated source Bundle for Verified Copy",
+                path: request.source.clone(),
+                source: source_error,
+            })?;
+        prepare_verified_copy_transition(
+            request.persistence,
+            VerifiedCopyPersistenceTransition::CreatePartial,
+            "create partial Verified Copy",
+            &output_partial,
+        )?;
+        let mut output =
+            create_private_pack_file(&output_partial).map_err(|source_error| CoreError::Io {
+                action: "create partial Verified Copy",
+                path: output_partial.clone(),
+                source: source_error,
+            })?;
+        let mut buffer = [0_u8; 64 * 1024];
+        let mut copied_bytes = 0_u64;
+        loop {
+            let read = source_file
+                .read(&mut buffer)
+                .map_err(|source_error| CoreError::Io {
+                    action: "read authenticated source Bundle for Verified Copy",
+                    path: request.source.clone(),
+                    source: source_error,
+                })?;
+            if read == 0 {
+                break;
+            }
+            prepare_verified_copy_transition(
+                request.persistence,
+                VerifiedCopyPersistenceTransition::WritePartial,
+                "write partial Verified Copy",
+                &output_partial,
+            )?;
+            output
+                .write_all(&buffer[..read])
+                .map_err(|source_error| CoreError::Io {
+                    action: "write partial Verified Copy",
+                    path: output_partial.clone(),
+                    source: source_error,
+                })?;
+            copied_bytes = copied_bytes
+                .checked_add(read as u64)
+                .ok_or_else(|| invalid_bundle("Verified Copy byte count overflowed"))?;
+            emit_verified_copy_event(
+                &mut event_sink,
+                VerifiedCopyEvent::BytesCopied { copied_bytes },
+            );
+            if request
+                .cancellation
+                .is_some_and(VerifiedCopyCancellation::is_requested)
+            {
+                prepare_verified_copy_transition(
+                    request.persistence,
+                    VerifiedCopyPersistenceTransition::SynchronizePartial,
+                    "synchronize interrupted partial Verified Copy",
+                    &output_partial,
+                )?;
+                output.sync_all().map_err(|source_error| CoreError::Io {
+                    action: "synchronize interrupted partial Verified Copy",
+                    path: output_partial.clone(),
+                    source: source_error,
+                })?;
+                emit_verified_copy_event(
+                    &mut event_sink,
+                    VerifiedCopyEvent::CopyPaused { copied_bytes },
+                );
+                return Err(CoreError::CopyInterrupted(output_partial));
+            }
+        }
+        prepare_verified_copy_transition(
+            request.persistence,
+            VerifiedCopyPersistenceTransition::SynchronizePartial,
+            "synchronize partial Verified Copy",
+            &output_partial,
+        )?;
+        output.sync_all().map_err(|source_error| CoreError::Io {
+            action: "synchronize partial Verified Copy",
+            path: output_partial.clone(),
+            source: source_error,
+        })?;
+        drop(output);
+
+        prepare_verified_copy_transition(
+            request.persistence,
+            VerifiedCopyPersistenceTransition::AuthenticatePartial,
+            "authenticate partial Verified Copy",
+            &output_partial,
+        )?;
+        let mut copied_file = open_bundle_file(&output_partial)?;
+        let copied = open_bundle_from(
+            &mut copied_file,
+            &output_partial,
+            request.recovery_secret,
+            true,
+            &mut events,
+            &mut content_sink,
+            true,
+        )?;
+        require_matching_verified_copy(&source, &copied)?;
+
+        let parent = request
+            .destination
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let directory =
+            crate::restore_fs::RestoreDirectory::open_ambient(parent).map_err(|source_error| {
+                CoreError::Io {
+                    action: "open Verified Copy destination directory",
+                    path: parent.to_path_buf(),
+                    source: source_error,
+                }
+            })?;
+        prepare_verified_copy_transition(
+            request.persistence,
+            VerifiedCopyPersistenceTransition::PublishCompleted,
+            "publish Verified Copy without overwrite",
+            &request.destination,
+        )?;
+        directory
+            .exclusive_rename(
+                Path::new(
+                    output_partial
+                        .file_name()
+                        .expect("partial Verified Copy name"),
+                ),
+                &directory,
+                Path::new(
+                    request
+                        .destination
+                        .file_name()
+                        .expect("completed Verified Copy name"),
+                ),
+            )
+            .map_err(|source_error| {
+                if source_error.kind() == io::ErrorKind::AlreadyExists {
+                    CoreError::DestinationAlreadyExists(request.destination.clone())
+                } else {
+                    CoreError::Io {
+                        action: "publish Verified Copy without overwrite",
+                        path: request.destination.clone(),
+                        source: source_error,
+                    }
+                }
+            })?;
+        prepare_verified_copy_transition(
+            request.persistence,
+            VerifiedCopyPersistenceTransition::SynchronizeDirectory,
+            "synchronize Verified Copy destination directory",
+            parent,
+        )?;
+        directory.sync().map_err(|source_error| CoreError::Io {
+            action: "synchronize Verified Copy destination directory",
+            path: parent.to_path_buf(),
+            source: source_error,
+        })?;
+
+        prepare_verified_copy_transition(
+            request.persistence,
+            VerifiedCopyPersistenceTransition::ReopenCompleted,
+            "reopen completed Verified Copy",
+            &request.destination,
+        )?;
+        let mut destination_file = open_bundle_file(&request.destination)?;
+        let destination = open_bundle_from(
+            &mut destination_file,
+            &request.destination,
+            request.recovery_secret,
+            true,
+            &mut events,
+            &mut content_sink,
+            false,
+        )?;
+        require_matching_verified_copy(&source, &destination)?;
+        if replaced_partial_identity.as_ref().is_some_and(|expected| {
+            fs::symlink_metadata(&partial)
+                .ok()
+                .is_some_and(|current| same_pack_file(expected, &current))
+        }) {
+            let _ = directory.remove_file(Path::new(
+                partial
+                    .file_name()
+                    .expect("saved partial Verified Copy name"),
+            ));
+            let _ = directory.sync();
+        }
+        let source_digest = bundle_hash_hex(&source.bundle_hash);
+        let destination_digest = bundle_hash_hex(&destination.bundle_hash);
+        let source_bundle_identity = bundle_identity_hex(&source.bundle_identifier);
+        let destination_bundle_identity = bundle_identity_hex(&destination.bundle_identifier);
+        let receipt = VerifiedCopyReceipt {
+            source_bundle_identity: source_bundle_identity.clone(),
+            destination_bundle_identity: destination_bundle_identity.clone(),
+            whole_file_digest: destination_digest.clone(),
+            verified_at_unix_seconds: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|_| invalid_bundle("system clock is before the Unix epoch"))?
+                .as_secs(),
+        };
+        let durability = request.persistence.durability();
+        let warnings = match durability {
+            VerifiedCopyDurability::Durable => Vec::new(),
+            VerifiedCopyDurability::Weaker => vec![
+                "Verified Copy completed with weaker filesystem durability guarantees".to_owned(),
+            ],
+        };
+        emit_verified_copy_event(
+            &mut event_sink,
+            VerifiedCopyEvent::CopyCompleted { copied_bytes },
+        );
+        Ok(VerifiedCopyReport {
+            source_digest,
+            destination_digest,
+            source_bundle_identity,
+            destination_bundle_identity,
+            receipt,
+            durability,
+            warnings,
         })
     }
 
@@ -3032,6 +3550,7 @@ struct OpenedBundle {
     authenticated_bytes: u64,
     restore_plan: AuthenticatedRestorePlan,
     bundle_hash: [u8; 32],
+    bundle_identifier: [u8; 16],
 }
 
 #[derive(Debug)]
@@ -3117,6 +3636,7 @@ impl RestoreBundleReader {
             false,
             &mut events,
             &mut content_sink,
+            false,
         )?;
         Ok(AuthenticatedRestorePlan {
             items: opened.restore_plan.items,
@@ -3138,6 +3658,7 @@ impl RestoreBundleReader {
             true,
             &mut events,
             &mut content_sink,
+            false,
         )?;
         Ok(AuthenticatedRestoreContent {
             authenticated_bytes: opened.authenticated_bytes,
@@ -3161,6 +3682,7 @@ fn open_bundle(
         verify_content,
         events,
         content_sink,
+        false,
     )
 }
 
@@ -3186,11 +3708,14 @@ fn open_bundle_from(
     verify_content: bool,
     events: &mut Option<&mut dyn BundleEventSink>,
     content_sink: &mut Option<&mut dyn AuthenticatedContentSink>,
+    allow_partial: bool,
 ) -> Result<OpenedBundle, CoreError> {
     if verify_content {
         emit_event(events, BundleEvent::VerificationStarted);
     }
-    reject_partial_path(source)?;
+    if !allow_partial {
+        reject_partial_path(source)?;
+    }
     input
         .seek(SeekFrom::Start(0))
         .map_err(|source_error| CoreError::Io {
@@ -3437,7 +3962,118 @@ fn open_bundle_from(
         authenticated_bytes,
         restore_plan,
         bundle_hash: *bundle_hasher.finalize().as_bytes(),
+        bundle_identifier: opened_header.bundle_identifier,
     })
+}
+
+fn require_matching_verified_copy(
+    source: &OpenedBundle,
+    destination: &OpenedBundle,
+) -> Result<(), CoreError> {
+    if source.bundle_hash != destination.bundle_hash
+        || source.bundle_identifier != destination.bundle_identifier
+    {
+        return Err(invalid_bundle(
+            "Verified Copy bytes or authenticated Bundle identity do not match the source",
+        ));
+    }
+    Ok(())
+}
+
+fn emit_verified_copy_event(
+    sink: &mut Option<&mut dyn VerifiedCopyEventSink>,
+    event: VerifiedCopyEvent,
+) {
+    if let Some(sink) = sink.as_deref_mut() {
+        sink.emit(event);
+    }
+}
+
+fn prepare_verified_copy_transition(
+    persistence: &dyn VerifiedCopyPersistence,
+    transition: VerifiedCopyPersistenceTransition,
+    action: &'static str,
+    path: &Path,
+) -> Result<(), CoreError> {
+    persistence
+        .prepare_transition(transition)
+        .map_err(|source| CoreError::Io {
+            action,
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
+fn require_matching_copy_prefix(
+    source: &mut fs::File,
+    source_path: &Path,
+    partial_path: &Path,
+) -> Result<fs::Metadata, CoreError> {
+    let mut partial = open_bundle_file(partial_path)?;
+    let partial_metadata = partial.metadata().map_err(|source_error| CoreError::Io {
+        action: "identify existing partial Verified Copy",
+        path: partial_path.to_path_buf(),
+        source: source_error,
+    })?;
+    let source_length = source
+        .metadata()
+        .map_err(|source_error| CoreError::Io {
+            action: "identify authenticated source Bundle",
+            path: source_path.to_path_buf(),
+            source: source_error,
+        })?
+        .len();
+    if partial_metadata.len() == 0 || partial_metadata.len() > source_length {
+        return Err(invalid_bundle(
+            "existing partial Verified Copy does not match the authenticated source Bundle",
+        ));
+    }
+    source
+        .seek(SeekFrom::Start(0))
+        .map_err(|source_error| CoreError::Io {
+            action: "rewind authenticated source Bundle for partial comparison",
+            path: source_path.to_path_buf(),
+            source: source_error,
+        })?;
+    let mut remaining = partial_metadata.len();
+    let mut source_buffer = [0_u8; 64 * 1024];
+    let mut partial_buffer = [0_u8; 64 * 1024];
+    while remaining > 0 {
+        let requested = usize::try_from(remaining.min(source_buffer.len() as u64))
+            .expect("bounded Verified Copy prefix buffer");
+        source
+            .read_exact(&mut source_buffer[..requested])
+            .map_err(|source_error| CoreError::Io {
+                action: "read authenticated source Bundle for partial comparison",
+                path: source_path.to_path_buf(),
+                source: source_error,
+            })?;
+        partial
+            .read_exact(&mut partial_buffer[..requested])
+            .map_err(|source_error| CoreError::Io {
+                action: "read existing partial Verified Copy",
+                path: partial_path.to_path_buf(),
+                source: source_error,
+            })?;
+        if source_buffer[..requested] != partial_buffer[..requested] {
+            return Err(invalid_bundle(
+                "existing partial Verified Copy does not match the authenticated source Bundle",
+            ));
+        }
+        remaining -= requested as u64;
+    }
+    Ok(partial_metadata)
+}
+
+fn bundle_hash_hex(bundle_hash: &[u8; 32]) -> String {
+    blake3::Hash::from_bytes(*bundle_hash).to_hex().to_string()
+}
+
+fn bundle_identity_hex(bundle_identifier: &[u8; 16]) -> String {
+    bundle_identifier
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn validate_manifest(manifest: &Manifest, index: &[IndexEntry]) -> Result<(), CoreError> {
