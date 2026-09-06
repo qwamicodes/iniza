@@ -6,6 +6,7 @@ use std::path::{Component, Path, PathBuf};
 
 mod bundle;
 mod iz1;
+mod offline_recovery;
 mod plan_comparison;
 mod plan_document;
 mod plan_engine;
@@ -27,6 +28,12 @@ pub use bundle::{
 };
 pub use iz1::{
     AuthenticatedBundleSummary, Iz1Prototype, RecoveryMethod, RecoverySecret, SealedBundle,
+};
+pub use offline_recovery::{
+    LoadedOfflineRecoveryKey, LocalOfflineRecoveryStorage, OfflineRecoveryDocumentReport,
+    OfflineRecoveryEngine, OfflineRecoveryLoadRequest, OfflineRecoveryPersistenceTransition,
+    OfflineRecoveryRehearsalReceipt, OfflineRecoveryRehearsalRequest, OfflineRecoveryStorage,
+    OfflineRecoveryWriteRequest,
 };
 pub use plan_comparison::{PlanChange, PlanChangeKind, PlanComparison};
 pub use plan_engine::{

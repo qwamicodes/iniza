@@ -118,6 +118,18 @@ iniza inspect <BUNDLE>
 
 Successful recovery is required before authenticated metadata is shown. Interactive mode may ask the user to select an available Recovery Method; `--non-interactive` and `--json` require `--recovery`. No content extraction occurs. `--show-paths` is ignored in redacted diagnostic contexts.
 
+### `iniza recovery offline rehearse`
+
+```text
+iniza recovery offline rehearse
+  --bundle <PATH.iniza>
+  --document <PATH.iniza-recovery>
+```
+
+The command opens the restrictive self-identifying recovery document without following a final symbolic link, reconstructs the Offline Recovery Key only in zeroizing memory, fully authenticates the completed Bundle, and requires the authenticated Bundle and Recovery Method identities to match the document. The key is never accepted through an argument or environment variable. Success emits a secret-free rehearsal Receipt; all wrong, truncated, modified, mismatched, symbolic-link, or overly permissive documents produce the same authentication failure without comparison details.
+
+The reusable write transaction is invoked in the same process that completes Pack, while the generated Offline Recovery Key is still in memory. It authenticates the completed Bundle before exclusively creating a `0600` document on an owner-selected separate mounted target, synchronizes the file and containing directory, and never overwrites an existing path. Supported Pack command orchestration remains gated on the Vaultwarden transaction so both required Recovery Methods are stored before Pack success is presented to the owner.
+
 ### `iniza fixture`
 
 ```text

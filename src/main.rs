@@ -2,9 +2,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use iniza::{
-    CoreError, InizaCore, Plan, PlanApprovalState, PlanEngine, ProjectAuditEngine,
-    ProjectAuditRequest, ProtectionCandidateEngine, ProtectionCandidateRequest, PublicationPolicy,
-    ScanRequest,
+    CoreError, InizaCore, OfflineRecoveryEngine, OfflineRecoveryRehearsalRequest, Plan,
+    PlanApprovalState, PlanEngine, ProjectAuditEngine, ProjectAuditRequest,
+    ProtectionCandidateEngine, ProtectionCandidateRequest, PublicationPolicy, ScanRequest,
 };
 
 fn main() -> ExitCode {
@@ -39,6 +39,34 @@ fn run(
             if namespace == "projects" && command == "scan" =>
         {
             run_project_audit(project_arguments, machine_output, json_events)
+        }
+        [namespace, method, command, bundle_flag, bundle, document_flag, document]
+            if namespace == "recovery"
+                && method == "offline"
+                && command == "rehearse"
+                && bundle_flag == "--bundle"
+                && document_flag == "--document" =>
+        {
+            let receipt = OfflineRecoveryEngine::local()
+                .rehearse(OfflineRecoveryRehearsalRequest::new(bundle, document))
+                .map_err(|error| match error {
+                    CoreError::AuthenticationFailed
+                    | CoreError::BundleIncomplete(_)
+                    | CoreError::BundleInvalid(_) => CliError::BundleInvalid(error.to_string()),
+                    _ => CliError::Operation(error.to_string()),
+                })?;
+            if machine_output {
+                println!("{}", receipt.machine_json_result());
+            } else {
+                println!("{}", receipt.human_summary());
+                println!("Bundle identity: {}", receipt.bundle_identity());
+                println!(
+                    "Recovery Method identity: {}",
+                    receipt.recovery_method_identity()
+                );
+                println!("Verified at: {}", receipt.verified_at_unix_seconds());
+            }
+            Ok(ExitCode::SUCCESS)
         }
         [command, subcommand, plan_flag, plan]
             if command == "plan" && subcommand == "show" && plan_flag == "--plan" =>
@@ -271,7 +299,7 @@ fn run(
             unreachable!("encrypted Bundle inspection is not implemented")
         }
         _ => Err(CliError::Usage(
-            "usage: iniza scan <SOURCE> (--list-protection-candidates | --candidate <ID>... --output-plan <PLAN> | --output-plan <PLAN>) [SCAN OPTIONS] | iniza projects scan --plan <APPROVED_PLAN> [--remote-check] | iniza plan show --plan <PLAN> | iniza plan validate --plan <PLAN> | iniza plan approve --plan <PLAN> --approved-hash <HASH> | iniza plan diff <OLD> <NEW> | iniza inspect <BUNDLE> | iniza fixture pack --plan <PLAN> --output <PATH.iniza-fixture> | iniza fixture inspect <PATH.iniza-fixture> | iniza fixture restore <PATH.iniza-fixture> --to <NEW_DESTINATION>"
+            "usage: iniza scan <SOURCE> (--list-protection-candidates | --candidate <ID>... --output-plan <PLAN> | --output-plan <PLAN>) [SCAN OPTIONS] | iniza projects scan --plan <APPROVED_PLAN> [--remote-check] | iniza recovery offline rehearse --bundle <BUNDLE> --document <RECOVERY_DOCUMENT> | iniza plan show --plan <PLAN> | iniza plan validate --plan <PLAN> | iniza plan approve --plan <PLAN> --approved-hash <HASH> | iniza plan diff <OLD> <NEW> | iniza inspect <BUNDLE> | iniza fixture pack --plan <PLAN> --output <PATH.iniza-fixture> | iniza fixture inspect <PATH.iniza-fixture> | iniza fixture restore <PATH.iniza-fixture> --to <NEW_DESTINATION>"
                 .to_owned(),
         )),
     }
@@ -670,6 +698,9 @@ fn print_machine_error(command: &str, error: &CliError) {
 
 fn machine_command_name(arguments: &[String]) -> String {
     match arguments {
+        [namespace, method, command, ..] if namespace == "recovery" => {
+            format!("{namespace} {method} {command}")
+        }
         [namespace, command, ..]
             if namespace == "plan" || namespace == "fixture" || namespace == "projects" =>
         {

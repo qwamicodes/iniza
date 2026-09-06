@@ -464,9 +464,14 @@ pub struct BundleVerification {
     pub summary: AuthenticatedBundleSummary,
     pub authenticated_chunks: u64,
     pub authenticated_bytes: u64,
+    bundle_identity: String,
 }
 
 impl BundleVerification {
+    pub fn bundle_identity(&self) -> &str {
+        &self.bundle_identity
+    }
+
     pub fn machine_json_result(&self) -> String {
         serde_json::json!({
             "schema_version": 1,
@@ -1097,6 +1102,7 @@ impl<S: BundleSource, C: DestinationCapacity> BundleEngine<S, C> {
             summary: opened.summary,
             authenticated_chunks: opened.authenticated_chunks,
             authenticated_bytes: opened.authenticated_bytes,
+            bundle_identity: bundle_identity_hex(&opened.bundle_identifier),
         })
     }
 
