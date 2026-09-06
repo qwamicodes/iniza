@@ -1,6 +1,6 @@
 # COKS-34 Project Capsule interface comparison
 
-- Status: Proposed; owner confirmation required before tests or implementation
+- Status: Confirmed and implemented for comparison; ADR 0012 owner acceptance pending
 - Date: 2026-09-06
 - Issue: COKS-34
 

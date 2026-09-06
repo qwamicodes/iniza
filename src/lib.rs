@@ -12,6 +12,7 @@ mod plan_document;
 mod plan_engine;
 mod platform_metadata;
 mod project_audit;
+mod project_capsule;
 mod protection_candidates;
 mod restore;
 mod restore_fs;
@@ -47,6 +48,11 @@ pub use project_audit::{
     InstalledGit, ProjectAudit, ProjectAuditEngine, ProjectAuditReport, ProjectAuditRequest,
     ProjectHead, ProjectKind, ProjectLocalState, ProjectSubmodule, RemoteCheckOutcome,
     SanitizedRemote,
+};
+pub use project_capsule::{
+    ProjectCapsuleCandidateReport, ProjectCapsuleComparisonReport, ProjectCapsuleComparisonRequest,
+    ProjectCapsuleEngine, ProjectCapsuleRepresentation, ProjectCapsuleValidationReport,
+    ProjectCapsuleValidationRequest,
 };
 pub use protection_candidates::{
     CandidatePortability, CandidateSensitivity, CandidateSourceKind, CandidateValidation,
