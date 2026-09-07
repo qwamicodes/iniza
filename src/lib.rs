@@ -47,9 +47,9 @@ pub use plan_engine::{
 pub use platform_metadata::ExtendedAttribute;
 pub use project_audit::{
     GitLargeFileStorageAudit, GitProcess, GitProcessOutput, IgnoredCandidate, IgnoredReview,
-    InstalledGit, ProjectAudit, ProjectAuditEngine, ProjectAuditReport, ProjectAuditRequest,
-    ProjectHead, ProjectKind, ProjectLocalState, ProjectSubmodule, RemoteCheckOutcome,
-    SanitizedRemote,
+    IgnoredStateInventory, IgnoredStateUnavailableReason, InstalledGit, ProjectAudit,
+    ProjectAuditEngine, ProjectAuditReport, ProjectAuditRequest, ProjectHead, ProjectKind,
+    ProjectLocalState, ProjectSubmodule, RemoteCheckOutcome, SanitizedRemote,
 };
 pub use project_capsule::{
     ProjectCapsuleBlockingFeature, ProjectCapsuleCandidateReport, ProjectCapsuleCaptureReport,

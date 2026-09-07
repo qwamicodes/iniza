@@ -5,6 +5,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
@@ -362,6 +363,7 @@ fn ignored_content_separates_regenerable_output_from_state_that_requires_review(
         .expect("ignored Project content should audit locally");
     let ignored = report.projects()[0]
         .ignored_candidates()
+        .expect("ignored-state inventory should be complete")
         .iter()
         .map(|candidate| (candidate.relative_path(), candidate.review()))
         .collect::<BTreeSet<_>>();
@@ -390,6 +392,216 @@ fn ignored_content_separates_regenerable_output_from_state_that_requires_review(
                 IgnoredReview::RequiresReview,
             ),
         ])
+    );
+}
+
+#[test]
+fn ignored_state_enumeration_failure_is_an_explicit_restorable_gap() {
+    let directory = TestDirectory::new("ignored-enumeration-failure");
+    let approved_root = directory.path.join("approved-projects");
+    let failed_project_root = approved_root.join("failed-project");
+    let complete_project_root = approved_root.join("complete-project");
+    init_repository(&failed_project_root);
+    init_repository(&complete_project_root);
+
+    let mut plan = PlanEngine::local()
+        .scan(ScanRequest::for_directory(&approved_root))
+        .expect("required Projects should scan");
+    let reviewed_hash = plan.approval_hash().expect("Plan should have a hash");
+    plan.approve(&reviewed_hash)
+        .expect("matching reviewed hash should approve the Plan");
+
+    let report = ProjectAuditEngine::with_git_process(IgnoredEnumerationFailingGit {
+        installed: InstalledGit::default(),
+        failed_repository: fs::canonicalize(&failed_project_root)
+            .expect("failed Project should have a canonical identity"),
+    })
+    .audit(ProjectAuditRequest::from_plan(&plan))
+    .expect("other verified Project observations should survive an ignored-state failure");
+
+    assert_eq!(report.projects().len(), 2);
+    assert!(
+        report
+            .projects()
+            .iter()
+            .all(|project| project.local_audit_verified())
+    );
+    let failed_project = report
+        .projects()
+        .iter()
+        .find(|project| project.root() == fs::canonicalize(&failed_project_root).unwrap())
+        .expect("failed Project should remain in the report");
+    let complete_project = report
+        .projects()
+        .iter()
+        .find(|project| project.root() == fs::canonicalize(&complete_project_root).unwrap())
+        .expect("unaffected Project should remain in the report");
+    assert!(failed_project.ignored_candidates().is_err());
+    assert_eq!(
+        complete_project
+            .ignored_candidates()
+            .expect("unaffected ignored-state inventory should remain complete")
+            .len(),
+        0
+    );
+    let human = report.to_human_text();
+    assert!(human.contains("ignored state: unavailable (git-enumeration-failed)"));
+    assert!(human.contains("Restorable gap: the ignored-state inventory is unavailable"));
+    let machine: serde_json::Value = serde_json::from_str(&report.machine_json_result())
+        .expect("machine Project audit should remain valid JavaScript Object Notation");
+    assert_eq!(
+        machine["data"]["projects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|project| project["project_id"] == failed_project.id())
+            .unwrap()["ignored_state"]["state"],
+        "unavailable"
+    );
+    assert_eq!(
+        machine["data"]["projects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|project| project["project_id"] == failed_project.id())
+            .unwrap()["ignored_state"]["reason_code"],
+        "git-enumeration-failed"
+    );
+}
+
+#[test]
+fn complete_ignored_state_omits_only_candidates_beneath_their_exact_plan_exclusion() {
+    let directory = TestDirectory::new("ignored-plan-exclusions");
+    let approved_root = directory.path.join("approved-projects");
+    let excluded_project = approved_root.join("excluded-project");
+    let retained_project = approved_root.join("retained-project");
+    init_repository(&excluded_project);
+    init_repository(&retained_project);
+    for project in [&excluded_project, &retained_project] {
+        fs::write(project.join(".gitignore"), "node_modules/\nscratch.log\n")
+            .expect("ignore rules should be written");
+        write_fixture(&project.join("node_modules/package/index.js"));
+        write_fixture(&project.join("scratch.log"));
+    }
+
+    let mut plan = PlanEngine::local()
+        .scan(ScanRequest::for_directory(&approved_root).exclude("excluded-project/node_modules"))
+        .expect("approved Projects should scan with an exact generated exclusion");
+    let reviewed_hash = plan.approval_hash().expect("Plan should have a hash");
+    plan.approve(&reviewed_hash)
+        .expect("matching reviewed hash should approve the Plan");
+
+    let report = ProjectAuditEngine::local()
+        .audit(ProjectAuditRequest::from_plan(&plan))
+        .expect("ignored-state inventories should honor the approved Plan");
+    let excluded = report
+        .projects()
+        .iter()
+        .find(|project| project.root() == fs::canonicalize(&excluded_project).unwrap())
+        .expect("excluded Project should be reported");
+    let retained = report
+        .projects()
+        .iter()
+        .find(|project| project.root() == fs::canonicalize(&retained_project).unwrap())
+        .expect("retained Project should be reported");
+
+    assert_eq!(
+        excluded.ignored_state_inventory().excluded_by_plan_count(),
+        Some(1)
+    );
+    assert_eq!(
+        excluded
+            .ignored_candidates()
+            .expect("excluded Project inventory should be complete")
+            .iter()
+            .map(|candidate| candidate.relative_path())
+            .collect::<Vec<_>>(),
+        vec![Path::new("scratch.log")]
+    );
+    assert_eq!(
+        retained
+            .ignored_candidates()
+            .expect("retained Project inventory should be complete")
+            .iter()
+            .map(|candidate| candidate.relative_path())
+            .collect::<Vec<_>>(),
+        vec![
+            Path::new("node_modules/package/index.js"),
+            Path::new("scratch.log")
+        ]
+    );
+    assert_eq!(
+        retained.ignored_state_inventory().excluded_by_plan_count(),
+        Some(0)
+    );
+    let human = report.to_human_text();
+    assert!(human.contains("ignored state: complete (1 pending, 1 excluded by Plan)"));
+    let machine: serde_json::Value = serde_json::from_str(&report.machine_json_result())
+        .expect("machine Project audit should be valid JavaScript Object Notation");
+    let excluded_machine = machine["data"]["projects"]
+        .as_array()
+        .expect("machine Projects should be an array")
+        .iter()
+        .find(|project| project["project_id"] == excluded.id())
+        .expect("excluded Project should be present in machine output");
+    assert_eq!(excluded_machine["ignored_state"]["state"], "complete");
+    assert_eq!(excluded_machine["ignored_state"]["candidate_count"], 1);
+    assert_eq!(
+        excluded_machine["ignored_state"]["excluded_by_plan_count"],
+        1
+    );
+    assert!(!report.machine_json_result().contains("scratch.log"));
+    assert!(!report.machine_json_result().contains("node_modules"));
+}
+
+#[test]
+fn malformed_ignored_state_output_is_unavailable_instead_of_partially_accepted() {
+    let directory = TestDirectory::new("malformed-ignored-output");
+    let project_root = directory.path.join("required-project");
+    init_repository(&project_root);
+    let mut plan = PlanEngine::local()
+        .scan(ScanRequest::for_directory(&project_root))
+        .expect("required Project should scan");
+    let reviewed_hash = plan.approval_hash().expect("Plan should have a hash");
+    plan.approve(&reviewed_hash)
+        .expect("matching reviewed hash should approve the Plan");
+
+    let report = ProjectAuditEngine::with_git_process(MalformedIgnoredEnumerationGit {
+        installed: InstalledGit::default(),
+    })
+    .audit(ProjectAuditRequest::from_plan(&plan))
+    .expect("malformed ignored-state output should remain a reportable gap");
+
+    assert!(
+        report
+            .to_human_text()
+            .contains("ignored state: unavailable (malformed-git-output)")
+    );
+}
+
+#[test]
+fn ignored_state_output_overflow_has_a_stable_unavailable_reason() {
+    let directory = TestDirectory::new("ignored-output-overflow");
+    let project_root = directory.path.join("required-project");
+    init_repository(&project_root);
+    let mut plan = PlanEngine::local()
+        .scan(ScanRequest::for_directory(&project_root))
+        .expect("required Project should scan");
+    let reviewed_hash = plan.approval_hash().expect("Plan should have a hash");
+    plan.approve(&reviewed_hash)
+        .expect("matching reviewed hash should approve the Plan");
+
+    let report = ProjectAuditEngine::with_git_process(IgnoredEnumerationOverflowingGit {
+        installed: InstalledGit::default(),
+    })
+    .audit(ProjectAuditRequest::from_plan(&plan))
+    .expect("ignored-state overflow should remain a reportable gap");
+    let machine: serde_json::Value = serde_json::from_str(&report.machine_json_result())
+        .expect("machine Project audit should be valid JavaScript Object Notation");
+
+    assert_eq!(
+        machine["data"]["projects"][0]["ignored_state"]["reason_code"],
+        "git-output-limit-exceeded"
     );
 }
 
@@ -730,6 +942,72 @@ fn installed_git_adapter_rejects_oversized_command_output() {
 
 #[cfg(unix)]
 #[test]
+fn installed_git_adapter_allows_a_larger_bounded_ignored_state_inventory() {
+    let directory = TestDirectory::new("installed-git-ignored-output-limit");
+    let executable = directory.path.join("synthetic-git");
+    fs::write(
+        &executable,
+        "#!/bin/sh\n/bin/dd if=/dev/zero bs=1048576 count=2 2>/dev/null\n",
+    )
+    .expect("synthetic Git executable should be written");
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))
+        .expect("synthetic Git executable should become executable");
+    let repository = directory.path.join("repository");
+    fs::create_dir(&repository).expect("synthetic repository directory should be created");
+
+    let output = InstalledGit::with_executable(&executable)
+        .run(
+            &repository,
+            &[
+                OsString::from("ls-files"),
+                OsString::from("--others"),
+                OsString::from("--ignored"),
+                OsString::from("--exclude-standard"),
+                OsString::from("-z"),
+            ],
+        )
+        .expect("ignored-state inventory may use its documented larger bound");
+
+    assert_eq!(output.stdout.len(), 2 * 1024 * 1024);
+}
+
+#[cfg(unix)]
+#[test]
+fn installed_git_adapter_rejects_ignored_state_output_above_its_larger_bound() {
+    let directory = TestDirectory::new("installed-git-ignored-output-overflow");
+    let executable = directory.path.join("synthetic-git");
+    fs::write(
+        &executable,
+        "#!/bin/sh\n/bin/dd if=/dev/zero bs=1048576 count=33 2>/dev/null\n",
+    )
+    .expect("synthetic Git executable should be written");
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))
+        .expect("synthetic Git executable should become executable");
+    let repository = directory.path.join("repository");
+    fs::create_dir(&repository).expect("synthetic repository directory should be created");
+
+    let error = InstalledGit::with_executable(&executable)
+        .run(
+            &repository,
+            &[
+                OsString::from("ls-files"),
+                OsString::from("--others"),
+                OsString::from("--ignored"),
+                OsString::from("--exclude-standard"),
+                OsString::from("-z"),
+            ],
+        )
+        .expect_err("ignored-state output above thirty-two mebibytes must fail closed");
+
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(
+        error.to_string(),
+        "Git command output exceeded the safe limit"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn hostile_git_transport_configuration_cannot_execute_a_local_program() {
     let directory = TestDirectory::new("hostile-transport");
     let project_root = directory.path.join("required-project");
@@ -811,7 +1089,7 @@ fn human_and_machine_reports_separately_explain_restorable_and_synchronized_gaps
     assert_eq!(machine.lines().count(), 1);
     let value: serde_json::Value = serde_json::from_str(&machine)
         .expect("machine report should be valid JavaScript Object Notation");
-    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["schema_version"], 2);
     assert_eq!(value["command"], "projects scan");
     assert_eq!(value["status"], "success-with-gaps");
     assert_eq!(value["data"]["projects"][0]["restorable"]["state"], "gap");
@@ -887,9 +1165,97 @@ fn default_project_audit_never_attempts_a_remote_command() {
     );
 }
 
+#[test]
+fn project_audit_uses_only_read_only_git_commands() {
+    let directory = TestDirectory::new("read-only-commands");
+    let project_root = directory.path.join("required-project");
+    init_repository(&project_root);
+    git(
+        &project_root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://example.invalid/private/repository.git",
+        ],
+    );
+    let mut plan = PlanEngine::local()
+        .scan(ScanRequest::for_directory(&project_root))
+        .expect("required Project should scan");
+    let reviewed_hash = plan.approval_hash().expect("Plan should have a hash");
+    plan.approve(&reviewed_hash)
+        .expect("matching reviewed hash should approve the Plan");
+    let commands = Arc::new(Mutex::new(Vec::new()));
+    let git = ReadOnlyRecordingGit {
+        installed: InstalledGit::default(),
+        commands: Arc::clone(&commands),
+    };
+
+    ProjectAuditEngine::with_git_process(git)
+        .audit(ProjectAuditRequest::from_plan(&plan).with_remote_check())
+        .expect("read-only local and remote observations should complete");
+
+    let commands = commands.lock().expect("recorded commands should unlock");
+    assert!(
+        commands
+            .iter()
+            .any(|command| command.first() == Some(&"ls-remote".to_owned()))
+    );
+    for forbidden in [
+        "fetch",
+        "pull",
+        "merge",
+        "rebase",
+        "commit",
+        "reset",
+        "push",
+        "checkout",
+        "switch",
+        "restore",
+        "add",
+        "rm",
+        "mv",
+        "clean",
+        "config-set",
+    ] {
+        assert!(
+            commands
+                .iter()
+                .all(|command| command.first().map(String::as_str) != Some(forbidden)),
+            "Project audit must not invoke mutating Git command {forbidden}",
+        );
+    }
+}
+
 struct NetworkRejectingGit {
     installed: InstalledGit,
     remote_attempts: AtomicU64,
+}
+
+struct ReadOnlyRecordingGit {
+    installed: InstalledGit,
+    commands: Arc<Mutex<Vec<Vec<String>>>>,
+}
+
+impl GitProcess for ReadOnlyRecordingGit {
+    fn run(&self, repository: &Path, arguments: &[OsString]) -> io::Result<GitProcessOutput> {
+        let command = arguments
+            .iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        self.commands
+            .lock()
+            .expect("recorded commands should lock")
+            .push(command.clone());
+        if command.first().map(String::as_str) == Some("ls-remote") {
+            return Ok(GitProcessOutput {
+                status_code: Some(0),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            });
+        }
+        self.installed.run(repository, arguments)
+    }
 }
 
 impl GitProcess for NetworkRejectingGit {
@@ -999,6 +1365,90 @@ struct ScriptedRemoteGit {
     remote_status: i32,
     remote_stdout: Vec<u8>,
     remote_stderr: Vec<u8>,
+}
+
+struct IgnoredEnumerationFailingGit {
+    installed: InstalledGit,
+    failed_repository: PathBuf,
+}
+
+struct MalformedIgnoredEnumerationGit {
+    installed: InstalledGit,
+}
+
+struct IgnoredEnumerationOverflowingGit {
+    installed: InstalledGit,
+}
+
+impl GitProcess for IgnoredEnumerationOverflowingGit {
+    fn run(&self, repository: &Path, arguments: &[OsString]) -> io::Result<GitProcessOutput> {
+        let command = arguments
+            .iter()
+            .filter_map(|argument| argument.to_str())
+            .collect::<Vec<_>>();
+        if command
+            == [
+                "ls-files",
+                "--others",
+                "--ignored",
+                "--exclude-standard",
+                "-z",
+            ]
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Git command output exceeded the safe limit",
+            ));
+        }
+        self.installed.run(repository, arguments)
+    }
+}
+
+impl GitProcess for MalformedIgnoredEnumerationGit {
+    fn run(&self, repository: &Path, arguments: &[OsString]) -> io::Result<GitProcessOutput> {
+        let command = arguments
+            .iter()
+            .filter_map(|argument| argument.to_str())
+            .collect::<Vec<_>>();
+        if command
+            == [
+                "ls-files",
+                "--others",
+                "--ignored",
+                "--exclude-standard",
+                "-z",
+            ]
+        {
+            return Ok(GitProcessOutput {
+                status_code: Some(0),
+                stdout: b"../escaped-secret\0".to_vec(),
+                stderr: Vec::new(),
+            });
+        }
+        self.installed.run(repository, arguments)
+    }
+}
+
+impl GitProcess for IgnoredEnumerationFailingGit {
+    fn run(&self, repository: &Path, arguments: &[OsString]) -> io::Result<GitProcessOutput> {
+        let command = arguments
+            .iter()
+            .filter_map(|argument| argument.to_str())
+            .collect::<Vec<_>>();
+        if repository == self.failed_repository
+            && command
+                == [
+                    "ls-files",
+                    "--others",
+                    "--ignored",
+                    "--exclude-standard",
+                    "-z",
+                ]
+        {
+            return Err(io::Error::other("synthetic ignored enumeration failure"));
+        }
+        self.installed.run(repository, arguments)
+    }
 }
 
 impl GitProcess for ScriptedRemoteGit {

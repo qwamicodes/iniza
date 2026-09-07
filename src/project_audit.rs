@@ -101,7 +101,7 @@ pub struct ProjectAudit {
     protection_requirement: ProtectionRequirement,
     local_state: ProjectLocalState,
     remotes: Vec<SanitizedRemote>,
-    ignored_candidates: Vec<IgnoredCandidate>,
+    ignored_state_inventory: IgnoredStateInventory,
     submodules: Vec<ProjectSubmodule>,
     git_large_file_storage: GitLargeFileStorageAudit,
 }
@@ -131,8 +131,15 @@ impl ProjectAudit {
         &self.remotes
     }
 
-    pub fn ignored_candidates(&self) -> &[IgnoredCandidate] {
-        &self.ignored_candidates
+    pub fn ignored_state_inventory(&self) -> &IgnoredStateInventory {
+        &self.ignored_state_inventory
+    }
+
+    pub fn ignored_candidates(&self) -> Result<&[IgnoredCandidate], IgnoredStateUnavailableReason> {
+        match &self.ignored_state_inventory {
+            IgnoredStateInventory::Complete { candidates, .. } => Ok(candidates),
+            IgnoredStateInventory::Unavailable { reason } => Err(*reason),
+        }
     }
 
     pub fn submodules(&self) -> &[ProjectSubmodule] {
@@ -196,6 +203,50 @@ pub struct IgnoredCandidate {
     relative_path: PathBuf,
     review: IgnoredReview,
     explanation: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IgnoredStateInventory {
+    Complete {
+        candidates: Vec<IgnoredCandidate>,
+        excluded_by_plan_count: u64,
+    },
+    Unavailable {
+        reason: IgnoredStateUnavailableReason,
+    },
+}
+
+impl IgnoredStateInventory {
+    pub fn candidates(&self) -> Option<&[IgnoredCandidate]> {
+        match self {
+            Self::Complete { candidates, .. } => Some(candidates),
+            Self::Unavailable { .. } => None,
+        }
+    }
+
+    pub fn excluded_by_plan_count(&self) -> Option<u64> {
+        match self {
+            Self::Complete {
+                excluded_by_plan_count,
+                ..
+            } => Some(*excluded_by_plan_count),
+            Self::Unavailable { .. } => None,
+        }
+    }
+
+    pub fn unavailable_reason(&self) -> Option<IgnoredStateUnavailableReason> {
+        match self {
+            Self::Complete { .. } => None,
+            Self::Unavailable { reason } => Some(*reason),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IgnoredStateUnavailableReason {
+    GitEnumerationFailed,
+    GitOutputLimitExceeded,
+    MalformedGitOutput,
 }
 
 impl IgnoredCandidate {
@@ -302,12 +353,28 @@ impl ProjectAuditReport {
                     remote_check_name(&remote.check_outcome),
                 ));
             }
-            for candidate in &project.ignored_candidates {
-                lines.push(format!(
-                    "  ignored review: {} — {}",
-                    safe_path_display(&candidate.relative_path),
-                    ignored_review_name(candidate.review),
-                ));
+            match &project.ignored_state_inventory {
+                IgnoredStateInventory::Complete {
+                    candidates,
+                    excluded_by_plan_count,
+                } => {
+                    lines.push(format!(
+                        "  ignored state: complete ({} pending, {} excluded by Plan)",
+                        candidates.len(),
+                        excluded_by_plan_count
+                    ));
+                    for candidate in candidates {
+                        lines.push(format!(
+                            "  ignored review: {} — {}",
+                            safe_path_display(&candidate.relative_path),
+                            ignored_review_name(candidate.review),
+                        ));
+                    }
+                }
+                IgnoredStateInventory::Unavailable { reason } => lines.push(format!(
+                    "  ignored state: unavailable ({})",
+                    ignored_state_unavailable_reason_code(*reason)
+                )),
             }
             for gap in project.restorable_gaps() {
                 lines.push(format!("  Restorable gap: {gap}"));
@@ -324,16 +391,24 @@ impl ProjectAuditReport {
             .projects
             .iter()
             .map(|project| {
-                let ignored_candidates = project
-                    .ignored_candidates
-                    .iter()
-                    .map(|candidate| {
-                        serde_json::json!({
+                let ignored_state = match &project.ignored_state_inventory {
+                    IgnoredStateInventory::Complete {
+                        candidates,
+                        excluded_by_plan_count,
+                    } => serde_json::json!({
+                        "state": "complete",
+                        "candidate_count": candidates.len(),
+                        "excluded_by_plan_count": excluded_by_plan_count,
+                        "candidates": candidates.iter().map(|candidate| serde_json::json!({
                             "item_id": candidate.id,
                             "review": ignored_review_name(candidate.review),
-                        })
-                    })
-                    .collect::<Vec<_>>();
+                        })).collect::<Vec<_>>(),
+                    }),
+                    IgnoredStateInventory::Unavailable { reason } => serde_json::json!({
+                        "state": "unavailable",
+                        "reason_code": ignored_state_unavailable_reason_code(*reason),
+                    }),
+                };
                 let remote_checks = project
                     .remotes
                     .iter()
@@ -364,7 +439,7 @@ impl ProjectAuditReport {
                         "local_only_tag_count": project.local_state.local_only_tags.len(),
                     },
                     "remote_checks": remote_checks,
-                    "ignored_candidates": ignored_candidates,
+                    "ignored_state": ignored_state,
                     "submodule_count": project.submodules.len(),
                     "git_large_file_storage": {
                         "configured": project.git_large_file_storage.configured,
@@ -382,7 +457,7 @@ impl ProjectAuditReport {
             })
             .collect::<Vec<_>>();
         serde_json::json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "command": "projects scan",
             "status": "success-with-gaps",
             "data": {
@@ -401,6 +476,12 @@ impl ProjectAudit {
         let mut gaps = vec!["a verified Project Capsule and Restore Rehearsal do not exist yet"];
         if !self.local_state.verified {
             gaps.push("the local Project audit is unverified");
+        }
+        if matches!(
+            self.ignored_state_inventory,
+            IgnoredStateInventory::Unavailable { .. }
+        ) {
+            gaps.push("the ignored-state inventory is unavailable");
         }
         gaps
     }
@@ -480,6 +561,14 @@ fn ignored_review_name(review: IgnoredReview) -> &'static str {
     match review {
         IgnoredReview::SuggestedExclusion => "suggested-exclusion",
         IgnoredReview::RequiresReview => "requires-review",
+    }
+}
+
+fn ignored_state_unavailable_reason_code(reason: IgnoredStateUnavailableReason) -> &'static str {
+    match reason {
+        IgnoredStateUnavailableReason::GitEnumerationFailed => "git-enumeration-failed",
+        IgnoredStateUnavailableReason::GitOutputLimitExceeded => "git-output-limit-exceeded",
+        IgnoredStateUnavailableReason::MalformedGitOutput => "malformed-git-output",
     }
 }
 
@@ -581,8 +670,13 @@ impl GitProcess for InstalledGit {
             .stderr
             .take()
             .ok_or_else(|| io::Error::other("Git standard error was not captured"))?;
-        let stdout_reader = thread::spawn(move || capture_git_stream(stdout));
-        let stderr_reader = thread::spawn(move || capture_git_stream(stderr));
+        let stdout_limit = if is_ignored_state_inventory_command(arguments) {
+            MAX_IGNORED_STATE_STREAM_BYTES
+        } else {
+            MAX_GIT_STREAM_BYTES
+        };
+        let stdout_reader = thread::spawn(move || capture_git_stream(stdout, stdout_limit));
+        let stderr_reader = thread::spawn(move || capture_git_stream(stderr, MAX_GIT_STREAM_BYTES));
         let status = child.wait()?;
         let (stdout, stdout_oversized) = join_git_stream(stdout_reader)?;
         let (stderr, stderr_oversized) = join_git_stream(stderr_reader)?;
@@ -601,8 +695,20 @@ impl GitProcess for InstalledGit {
 }
 
 const MAX_GIT_STREAM_BYTES: usize = 1024 * 1024;
+const MAX_IGNORED_STATE_STREAM_BYTES: usize = 32 * 1024 * 1024;
 
-fn capture_git_stream(mut stream: impl Read) -> io::Result<(Vec<u8>, bool)> {
+fn is_ignored_state_inventory_command(arguments: &[OsString]) -> bool {
+    arguments
+        == [
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "-z",
+        ]
+}
+
+fn capture_git_stream(mut stream: impl Read, maximum_bytes: usize) -> io::Result<(Vec<u8>, bool)> {
     let mut captured = Vec::new();
     let mut oversized = false;
     let mut buffer = [0_u8; 8192];
@@ -611,7 +717,7 @@ fn capture_git_stream(mut stream: impl Read) -> io::Result<(Vec<u8>, bool)> {
         if read == 0 {
             break;
         }
-        let remaining = MAX_GIT_STREAM_BYTES.saturating_sub(captured.len());
+        let remaining = maximum_bytes.saturating_sub(captured.len());
         let retained = remaining.min(read);
         captured.extend_from_slice(&buffer[..retained]);
         oversized |= retained < read;
@@ -694,7 +800,14 @@ impl<G: GitProcess> ProjectAuditEngine<G> {
             let local_state =
                 audit_local_state(&self.git, &root, kind, remote_audit.published_tags.as_ref());
             let remotes = remote_audit.remotes;
-            let ignored_candidates = audit_ignored_candidates(&self.git, &root, kind, &id);
+            let ignored_state_inventory = audit_ignored_candidates(
+                &self.git,
+                &root,
+                kind,
+                &id,
+                relative,
+                request.plan.exclusions(),
+            );
             let submodules = audit_submodules(&self.git, &root, kind);
             let git_large_file_storage = audit_git_large_file_storage(&root, kind);
             projects.push(ProjectAudit {
@@ -704,7 +817,7 @@ impl<G: GitProcess> ProjectAuditEngine<G> {
                 protection_requirement: item.protection_requirement,
                 local_state,
                 remotes,
-                ignored_candidates,
+                ignored_state_inventory,
                 submodules,
                 git_large_file_storage,
             });
@@ -822,29 +935,77 @@ fn audit_ignored_candidates(
     root: &Path,
     kind: ProjectKind,
     project_id: &str,
-) -> Vec<IgnoredCandidate> {
+    project_relative_path: &Path,
+    plan_exclusions: &[PathBuf],
+) -> IgnoredStateInventory {
     if kind == ProjectKind::BareRepository {
-        return Vec::new();
+        return IgnoredStateInventory::Complete {
+            candidates: Vec::new(),
+            excluded_by_plan_count: 0,
+        };
     }
-    let Some(output) = run_optional_bytes(
-        git,
-        root,
-        &[
-            "ls-files",
-            "--others",
-            "--ignored",
-            "--exclude-standard",
-            "-z",
-        ],
-    ) else {
-        return Vec::new();
+    let arguments = [
+        "ls-files",
+        "--others",
+        "--ignored",
+        "--exclude-standard",
+        "-z",
+    ]
+    .map(OsString::from);
+    let output = match git.run(root, &arguments) {
+        Ok(output) if output.status_code == Some(0) => output.stdout,
+        Ok(_) => {
+            return IgnoredStateInventory::Unavailable {
+                reason: IgnoredStateUnavailableReason::GitEnumerationFailed,
+            };
+        }
+        Err(error) => {
+            let reason = if error.kind() == io::ErrorKind::InvalidData {
+                IgnoredStateUnavailableReason::GitOutputLimitExceeded
+            } else {
+                IgnoredStateUnavailableReason::GitEnumerationFailed
+            };
+            return IgnoredStateInventory::Unavailable { reason };
+        }
     };
-    let mut candidates = output
+    if !output.is_empty() && !output.ends_with(&[0]) {
+        return IgnoredStateInventory::Unavailable {
+            reason: IgnoredStateUnavailableReason::MalformedGitOutput,
+        };
+    }
+    let mut parsed_paths = Vec::new();
+    for record in output
         .split(|byte| *byte == 0)
         .filter(|record| !record.is_empty())
-        .filter_map(|record| {
-            let relative_path = PathBuf::from(String::from_utf8_lossy(record).into_owned());
-            if !is_safe_relative_path(&relative_path) {
+    {
+        let Ok(record) = std::str::from_utf8(record) else {
+            return IgnoredStateInventory::Unavailable {
+                reason: IgnoredStateUnavailableReason::MalformedGitOutput,
+            };
+        };
+        let relative_path = PathBuf::from(record);
+        if !is_safe_relative_path(&relative_path) {
+            return IgnoredStateInventory::Unavailable {
+                reason: IgnoredStateUnavailableReason::MalformedGitOutput,
+            };
+        }
+        parsed_paths.push(relative_path);
+    }
+
+    let mut excluded_by_plan_count = 0_u64;
+    let mut candidates = parsed_paths
+        .into_iter()
+        .filter_map(|relative_path| {
+            let plan_relative_path = if project_relative_path == Path::new(".") {
+                relative_path.clone()
+            } else {
+                project_relative_path.join(&relative_path)
+            };
+            if plan_exclusions.iter().any(|excluded_path| {
+                plan_relative_path == *excluded_path
+                    || plan_relative_path.starts_with(excluded_path)
+            }) {
+                excluded_by_plan_count = excluded_by_plan_count.saturating_add(1);
                 return None;
             }
             let generated = relative_path.components().any(|component| {
@@ -878,7 +1039,10 @@ fn audit_ignored_candidates(
         })
         .collect::<Vec<_>>();
     candidates.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
-    candidates
+    IgnoredStateInventory::Complete {
+        candidates,
+        excluded_by_plan_count,
+    }
 }
 
 fn ignored_review_explanation(path: &Path) -> &'static str {

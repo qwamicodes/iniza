@@ -13,10 +13,10 @@ use sha2::{Digest, Sha256};
 use unicode_normalization::UnicodeNormalization;
 
 use crate::{
-    BundleEngine, BundleVerification, CoreError, Disposition, GitProcess, IgnoredReview,
-    InstalledGit, MigrationItemKind, PackReport, PackRequest, Plan, PlanApprovalState, PlanEngine,
-    ProjectAudit, ProjectHead, ProjectKind, RecoveryMethod, RecoverySecret, RestoreEngine,
-    RestoreRequest, ScanRequest, VerifyRequest,
+    BundleEngine, BundleVerification, CoreError, Disposition, GitProcess, IgnoredCandidate,
+    IgnoredReview, InstalledGit, MigrationItemKind, PackReport, PackRequest, Plan,
+    PlanApprovalState, PlanEngine, ProjectAudit, ProjectHead, ProjectKind, RecoveryMethod,
+    RecoverySecret, RestoreEngine, RestoreRequest, ScanRequest, VerifyRequest,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -1113,9 +1113,7 @@ impl<G: GitProcess> ProjectCapsuleEngine<G> {
                     .to_owned(),
             ));
         }
-        let database_candidate = request
-            .project
-            .ignored_candidates()
+        let database_candidate = complete_ignored_candidates(request.project)?
             .iter()
             .find(|candidate| candidate.id() == request.database_candidate_id)
             .ok_or_else(|| {
@@ -1265,9 +1263,7 @@ impl<G: GitProcess> ProjectCapsuleEngine<G> {
                 ));
             }
         }
-        let mut ignored_candidates = request
-            .project
-            .ignored_candidates()
+        let mut ignored_candidates = complete_ignored_candidates(request.project)?
             .iter()
             .map(|candidate| {
                 let recommendation = match candidate.review() {
@@ -2203,9 +2199,7 @@ fn validate_capture_request(
         ));
     }
     let root = request.project.root();
-    let audited_ignored_paths = request
-        .project
-        .ignored_candidates()
+    let audited_ignored_paths = complete_ignored_candidates(request.project)?
         .iter()
         .map(|candidate| candidate.relative_path().to_path_buf())
         .collect::<BTreeSet<_>>();
@@ -2304,6 +2298,14 @@ fn validate_capture_request(
         }
     }
     Ok(())
+}
+
+fn complete_ignored_candidates(project: &ProjectAudit) -> Result<&[IgnoredCandidate], CoreError> {
+    project.ignored_candidates().map_err(|_| {
+        CoreError::InvalidPlan(
+            "Project Capsule operations require a complete ignored-state inventory".to_owned(),
+        )
+    })
 }
 
 fn included_reviewed_ignored_paths(review: &ProjectCapsuleReview) -> Vec<PathBuf> {

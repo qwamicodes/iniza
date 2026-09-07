@@ -76,7 +76,7 @@ iniza projects scan --plan <PATH> [--remote-check]
 
 The Plan must be approved and non-stale. Project roots and must-protect or optional requirements come from that reviewed Plan; arbitrary roots are not accepted by this implementation. Without `--remote-check`, the command performs no intentional network operation. With it, the command performs a read-only `git ls-remote` check and never fetches, pushes, checks out, commits, merges, rebases, resets, or stashes.
 
-The human result may show local paths and sanitized remote addresses. JavaScript Object Notation output uses stable identifiers, redacts local remote paths, and structurally omits source roots, relative paths, filenames, protected content, and raw Git output. A completed audit exits `1` while Restorable or Synchronized gaps remain; command failure exits `40`.
+The human result may show local paths, sanitized remote addresses, pending ignored-state paths, and the count of ignored paths already covered by exact Plan exclusions. Each Project reports its ignored-state inventory as Complete or Unavailable. Git failure, malformed output, or bounded-output overflow is Unavailable and adds a Restorable gap; it is never rendered as a successful zero count. JavaScript Object Notation schema version 2 uses stable identifiers, classifications, counts, state, and reason codes; it redacts local remote paths and structurally omits source roots, relative paths, filenames, protected content, and raw Git output. A completed audit exits `1` while Restorable or Synchronized gaps remain; command failure exits `40`.
 
 ### `iniza projects push`
 

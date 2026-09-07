@@ -41,6 +41,13 @@ fn owner_and_automation_receive_the_same_project_gaps_without_machine_path_leaks
         "private Project marker 74f3d9\n",
     )
     .expect("private Project fixture should be written");
+    fs::write(project_root.join(".gitignore"), "private-settings.local\n")
+        .expect("synthetic ignore rule should be written");
+    fs::write(
+        project_root.join("private-settings.local"),
+        "synthetic local setting\n",
+    )
+    .expect("synthetic ignored setting should be written");
     let mut plan = PlanEngine::local()
         .scan(ScanRequest::for_directory(&project_root))
         .expect("required Project should scan");
@@ -60,6 +67,8 @@ fn owner_and_automation_receive_the_same_project_gaps_without_machine_path_leaks
     let human_text = String::from_utf8_lossy(&human.stdout);
     assert!(human_text.contains("Restorable gap:"));
     assert!(human_text.contains("Synchronized gap:"));
+    assert!(human_text.contains("ignored state: complete (1 pending, 0 excluded by Plan)"));
+    assert!(human_text.contains("private-settings.local"));
     assert!(
         human_text.contains(
             &fs::canonicalize(&project_root)
@@ -81,9 +90,17 @@ fn owner_and_automation_receive_the_same_project_gaps_without_machine_path_leaks
     assert_eq!(String::from_utf8_lossy(&machine.stdout).lines().count(), 1);
     let value: serde_json::Value = serde_json::from_slice(&machine.stdout)
         .expect("machine Project audit should be valid JavaScript Object Notation");
-    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["schema_version"], 2);
     assert_eq!(value["command"], "projects scan");
     assert_eq!(value["status"], "success-with-gaps");
+    assert_eq!(
+        value["data"]["projects"][0]["ignored_state"]["state"],
+        "complete"
+    );
+    assert_eq!(
+        value["data"]["projects"][0]["ignored_state"]["candidate_count"],
+        1
+    );
     let events = String::from_utf8_lossy(&machine.stderr)
         .lines()
         .map(|line| {
@@ -102,6 +119,7 @@ fn owner_and_automation_receive_the_same_project_gaps_without_machine_path_leaks
     );
     assert!(!machine_text.contains(&project_root.display().to_string()));
     assert!(!machine_text.contains("private-source.txt"));
+    assert!(!machine_text.contains("private-settings.local"));
     assert!(!machine_text.contains("private Project marker 74f3d9"));
 }
 

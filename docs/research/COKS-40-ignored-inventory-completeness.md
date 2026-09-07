@@ -1,6 +1,6 @@
 # COKS-40 ignored-state inventory completeness
 
-- Status: Proposed for owner confirmation
+- Status: Implemented after owner confirmation
 - Date: 2026-09-07
 - Issue: COKS-40
 
@@ -76,3 +76,16 @@ After owner confirmation:
 7. Re-run the real read-only audit and reconcile every remaining ignored-state decision before producing any revised Plan.
 
 Confirming these seams authorizes only test-driven correction of ignored-state audit completeness. It does not revise or approve a Plan, publish Git state, capture a Bundle, contact Vaultwarden, delete data, or authorize machine erasure.
+
+## Owner decision
+
+- [x] I confirm all seven COKS-40 ignored-state inventory completeness seams.
+- Owner: Kwaame Ofori-adjekum
+- Decision date: 2026-09-07
+- Notes: The owner separately approved generated-exclusion manifest `e702cbecb6f44c39edabfa6e965ef280fc68a0226bd5b129b6d65aa6491f839c`, retention of the remaining 1,320 ignored items for encrypted protection, and capsule-only reference manifest `14e10e8f91ca6596eaab18db0db07835aa27567c3606b31910cf3df6a04ab8a6`. The owner authorized preparation, but not execution, of the `cashsynq` Push Plan.
+
+## Implementation result
+
+`ProjectAudit::ignored_state_inventory` now exposes a Complete or Unavailable result. Complete inventories report pending candidates and the exact count covered by approved Plan exclusions. Git failure, nonzero exit, malformed output, and bounded-output overflow fail closed as Unavailable and add a Restorable gap without discarding other Project observations. The exact ignored-path enumeration command may retain at most thirty-two mebibytes of standard output; ordinary command output and all standard error remain bounded at one mebibyte per stream.
+
+Human output shows local review paths, coverage counts, and stable Unavailable reason codes. Machine output exposes only stable candidate identifiers, classifications, counts, state, and reason codes. Project Capsule operations reject an Unavailable inventory rather than treating it as an empty candidate list.

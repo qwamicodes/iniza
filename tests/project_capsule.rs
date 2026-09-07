@@ -1002,6 +1002,7 @@ fn project_capsule_capture_requires_the_exact_completed_review_hash() {
     let project_audit = audit.projects().first().expect("Project should be present");
     let ignored_id = project_audit
         .ignored_candidates()
+        .expect("ignored-state inventory should be complete")
         .first()
         .expect("environment file should require review")
         .id();
@@ -1160,11 +1161,13 @@ fn reviewed_capture_encrypts_sensitive_state_and_excludes_reproducible_generated
     let project_audit = audit.projects().first().expect("Project should be present");
     let sensitive = project_audit
         .ignored_candidates()
+        .expect("ignored-state inventory should be complete")
         .iter()
         .find(|candidate| candidate.relative_path() == Path::new(".env.local"))
         .expect("sensitive ignored candidate should be present");
     let generated = project_audit
         .ignored_candidates()
+        .expect("ignored-state inventory should be complete")
         .iter()
         .find(|candidate| candidate.relative_path().starts_with("node_modules"))
         .expect("generated ignored candidate should be present");
@@ -1254,12 +1257,21 @@ fn explicit_review_encrypts_each_sensitive_class_and_can_override_generated_excl
         .audit(ProjectAuditRequest::from_plan(&plan))
         .expect("Project should audit");
     let project_audit = audit.projects().first().expect("Project should be present");
-    assert!(project_audit.ignored_candidates().iter().any(|candidate| {
-        candidate.relative_path() == Path::new("node_modules/example/generated.js")
-            && candidate.review() == iniza::IgnoredReview::SuggestedExclusion
-    }));
+    assert!(
+        project_audit
+            .ignored_candidates()
+            .expect("ignored-state inventory should be complete")
+            .iter()
+            .any(|candidate| {
+                candidate.relative_path() == Path::new("node_modules/example/generated.js")
+                    && candidate.review() == iniza::IgnoredReview::SuggestedExclusion
+            })
+    );
     let mut request = ProjectCapsuleReviewRequest::new(&plan, project_audit);
-    for candidate in project_audit.ignored_candidates() {
+    for candidate in project_audit
+        .ignored_candidates()
+        .expect("ignored-state inventory should be complete")
+    {
         request = request.with_decision(
             ProjectCapsuleReviewDecision::include_as_encrypted_reviewed_state(candidate.id()),
         );
@@ -1342,6 +1354,7 @@ fn live_database_is_replaced_by_stable_selected_export_without_verifying_raw_dat
     let project_audit = audit.projects().first().expect("Project should be present");
     let database_candidate = project_audit
         .ignored_candidates()
+        .expect("ignored-state inventory should be complete")
         .iter()
         .find(|candidate| candidate.relative_path() == Path::new("local.sqlite3"))
         .expect("live database should require review");
@@ -1452,6 +1465,7 @@ fn changed_database_export_is_rejected_before_project_capsule_bundle_creation() 
     let project_audit = audit.projects().first().expect("Project should be present");
     let database_candidate = project_audit
         .ignored_candidates()
+        .expect("ignored-state inventory should be complete")
         .iter()
         .find(|candidate| candidate.relative_path() == Path::new("local.sqlite3"))
         .expect("live database should require review");
@@ -1614,6 +1628,7 @@ fn project_capsule_public_results_are_versioned_sanitized_and_honest() {
     let project_audit = audit.projects().first().expect("Project should be present");
     let candidate = project_audit
         .ignored_candidates()
+        .expect("ignored-state inventory should be complete")
         .first()
         .expect("protected candidate should be present");
     let engine = ProjectCapsuleEngine::local();
@@ -2226,7 +2241,10 @@ fn complete_encrypted_ignored_review(
     project: &iniza::ProjectAudit,
 ) -> ProjectCapsuleReview {
     let mut request = ProjectCapsuleReviewRequest::new(plan, project);
-    for candidate in project.ignored_candidates() {
+    for candidate in project
+        .ignored_candidates()
+        .expect("ignored-state inventory should be complete")
+    {
         request = request.with_decision(
             ProjectCapsuleReviewDecision::include_as_encrypted_reviewed_state(candidate.id()),
         );

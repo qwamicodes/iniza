@@ -15,7 +15,7 @@ Every Must-Protect Item must be included and verified. Every required Project mu
 
 ## Optional protection candidates
 
-- VS Code settings, keybindings, snippets, and extension inventory.
+- Visual Studio Code state is currently unselected because the owner no longer uses the application; it remains a visible Optional Protection Candidate if that decision changes.
 - Homebrew package inventory.
 - Rust, Bun, and other tool/version inventories.
 - Settings normally synchronized by an application account.
