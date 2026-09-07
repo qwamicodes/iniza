@@ -55,9 +55,9 @@ The Vaultwarden service is external to the source Mac. Fresh-device sign-in, inc
 The following observations were collected on 2026-09-07 as preliminary host metadata. They are not Receipts, Owner Attestations, or substitutes for the later real Plan and storage rehearsals.
 
 - The official Bitwarden command-line client version 2026.8.0 is installed and passes Iniza's non-credentialed executable and interpreter review. The real owner-service recovery transaction, fresh-device sign-in, and independent multi-factor recovery confirmation remain incomplete.
-- No external physical disk or mounted external volume was detected. External Bundle storage and separately stored removable Offline Recovery Key media remain unavailable.
-- Time Machine is not running, and its configured destination could not be mounted. No current conventional-backup validation or representative Restore Attestation has been recorded.
-- The documented projects root occupies approximately 16.6 gibibytes. The source volume reported approximately 3.6 gibibytes available, which is insufficient even for one same-volume copy of that root before encryption overhead, temporary-space margin, or a second Verified Copy.
+- A writable two-terabyte external Universal Serial Bus volume is mounted with approximately 832 gigabytes free and a verified Self-Monitoring, Analysis and Reporting Technology status. It uses exFAT and is only a candidate encrypted Bundle destination: it cannot prove restored macOS ownership or extended metadata, has not been selected by the owner, and cannot also satisfy the separately stored Offline Recovery Key failure domain.
+- Time Machine is not running and reports no configured destination. No current conventional-backup validation or representative Restore Attestation has been recorded.
+- The documented projects root occupies approximately 16.6 gibibytes before reviewed generated exclusions. The source volume currently reports approximately 3.9 gibibytes available, which is a narrow margin for temporary artifacts and a locally materialized iCloud Verified Copy.
 - iCloud Drive is configured, but it shares the same reported local filesystem availability. This check does not prove cloud quota, complete local materialization, upload completion, independent availability, or enough capacity for a Verified Copy.
 - The preliminary repository-marker count is 23 rather than the original 22. COKS-40 must use Iniza discovery and owner review to determine whether every current Project is Must-Protect, Optional, excluded with a reason, or unsupported.
 
