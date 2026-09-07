@@ -388,6 +388,15 @@ pub enum VerifiedCopyDurability {
     Weaker,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum VerifiedCopyStorageLocation {
+    ExternalStorage,
+    #[serde(rename = "icloud-drive")]
+    ICloudDrive,
+    Other,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VerifiedCopyPersistenceTransition {
     ReadSource,
@@ -405,6 +414,14 @@ pub trait VerifiedCopyPersistence: Send + Sync {
 
     fn durability(&self) -> VerifiedCopyDurability {
         VerifiedCopyDurability::Durable
+    }
+
+    fn storage_location(
+        &self,
+        source: &Path,
+        destination: &Path,
+    ) -> io::Result<VerifiedCopyStorageLocation> {
+        local_verified_copy_storage_location(source, destination)
     }
 }
 
@@ -465,11 +482,16 @@ pub struct BundleVerification {
     pub authenticated_chunks: u64,
     pub authenticated_bytes: u64,
     bundle_identity: String,
+    plan_hash: String,
 }
 
 impl BundleVerification {
     pub fn bundle_identity(&self) -> &str {
         &self.bundle_identity
+    }
+
+    pub fn plan_hash(&self) -> &str {
+        &self.plan_hash
     }
 
     pub fn machine_json_result(&self) -> String {
@@ -501,6 +523,8 @@ pub struct VerifiedCopyReport {
     destination_digest: String,
     source_bundle_identity: String,
     destination_bundle_identity: String,
+    destination_evidence_identity: String,
+    storage_location: VerifiedCopyStorageLocation,
     receipt: VerifiedCopyReceipt,
     durability: VerifiedCopyDurability,
     warnings: Vec<String>,
@@ -526,6 +550,14 @@ impl VerifiedCopyReport {
 
     pub fn destination_bundle_identity(&self) -> &str {
         &self.destination_bundle_identity
+    }
+
+    pub fn destination_evidence_identity(&self) -> &str {
+        &self.destination_evidence_identity
+    }
+
+    pub fn storage_location(&self) -> VerifiedCopyStorageLocation {
+        self.storage_location
     }
 
     pub fn receipt(&self) -> &VerifiedCopyReceipt {
@@ -559,6 +591,11 @@ impl VerifiedCopyReport {
                     VerifiedCopyDurability::Durable => "durable",
                     VerifiedCopyDurability::Weaker => "weaker",
                 },
+                "storage_location": match self.storage_location {
+                    VerifiedCopyStorageLocation::ExternalStorage => "external-storage",
+                    VerifiedCopyStorageLocation::ICloudDrive => "icloud-drive",
+                    VerifiedCopyStorageLocation::Other => "other",
+                },
             },
             "warnings": self.warnings,
             "errors": [],
@@ -572,8 +609,6 @@ pub struct VerifiedCopyReceipt {
     source_bundle_identity: String,
     destination_bundle_identity: String,
     whole_file_digest: String,
-    destination_evidence_identity: String,
-    durability: VerifiedCopyDurability,
     verified_at_unix_seconds: u64,
 }
 
@@ -602,14 +637,6 @@ impl VerifiedCopyReceipt {
         &self.whole_file_digest
     }
 
-    pub fn destination_evidence_identity(&self) -> &str {
-        &self.destination_evidence_identity
-    }
-
-    pub fn durability(&self) -> VerifiedCopyDurability {
-        self.durability
-    }
-
     pub fn verified_at_unix_seconds(&self) -> u64 {
         self.verified_at_unix_seconds
     }
@@ -622,8 +649,6 @@ impl VerifiedCopyReceipt {
             "source_bundle_identity": self.source_bundle_identity,
             "destination_bundle_identity": self.destination_bundle_identity,
             "whole_file_digest": self.whole_file_digest,
-            "destination_evidence_identity": self.destination_evidence_identity,
-            "durability": verified_copy_durability_name(self.durability),
             "verified_at_unix_seconds": self.verified_at_unix_seconds,
         })
         .to_string()
@@ -1115,7 +1140,64 @@ impl<S: BundleSource, C: DestinationCapacity> BundleEngine<S, C> {
             authenticated_chunks: opened.authenticated_chunks,
             authenticated_bytes: opened.authenticated_bytes,
             bundle_identity: bundle_identity_hex(&opened.bundle_identifier),
+            plan_hash: opened.plan_hash,
         })
+    }
+
+    pub(crate) fn revalidate_current_source(
+        &self,
+        plan: &Plan,
+        bundle: &Path,
+        recovery_secret: &RecoverySecret,
+    ) -> Result<(), CoreError> {
+        let mut event_sink = None;
+        let mut content_sink = None;
+        let opened = open_bundle(
+            bundle,
+            recovery_secret,
+            true,
+            &mut event_sink,
+            &mut content_sink,
+        )?;
+        if opened.plan_hash != plan.approval_hash()? {
+            return Err(invalid_bundle(
+                "Bundle source revalidation is bound to a different Plan",
+            ));
+        }
+        for item in opened
+            .restore_plan
+            .items
+            .iter()
+            .filter(|item| item.selected)
+        {
+            let source = plan.source_path.join(&item.relative_path);
+            let metadata = fs::symlink_metadata(&source).map_err(|_| {
+                invalid_bundle("a selected source item is unavailable after Bundle creation")
+            })?;
+            let matches = match item.kind {
+                AuthenticatedRestoreKind::Directory => metadata.is_dir(),
+                AuthenticatedRestoreKind::RegularFile => {
+                    metadata.is_file()
+                        && !metadata.file_type().is_symlink()
+                        && current_regular_file_hash(&source)?
+                            == item.content_hash.as_deref().unwrap_or_default()
+                }
+                AuthenticatedRestoreKind::SymbolicLink => {
+                    metadata.file_type().is_symlink()
+                        && fs::read_link(&source)
+                            .ok()
+                            .map(|target| target.to_string_lossy().into_owned())
+                            == item.symlink_target
+                }
+                AuthenticatedRestoreKind::Special | AuthenticatedRestoreKind::Unknown => false,
+            };
+            if !matches {
+                return Err(invalid_bundle(
+                    "selected source state changed after Bundle creation",
+                ));
+            }
+        }
+        Ok(())
     }
 
     pub fn copy_verified(
@@ -1372,14 +1454,20 @@ impl<S: BundleSource, C: DestinationCapacity> BundleEngine<S, C> {
         let source_bundle_identity = bundle_identity_hex(&source.bundle_identifier);
         let destination_bundle_identity = bundle_identity_hex(&destination.bundle_identifier);
         let durability = request.persistence.durability();
+        let storage_location = request
+            .persistence
+            .storage_location(&request.source, &request.destination)
+            .map_err(|source_error| CoreError::Io {
+                action: "classify Verified Copy storage location",
+                path: request.destination.clone(),
+                source: source_error,
+            })?;
+        let destination_evidence_identity =
+            verified_copy_destination_evidence_identity(&request.destination)?;
         let receipt = VerifiedCopyReceipt {
             source_bundle_identity: source_bundle_identity.clone(),
             destination_bundle_identity: destination_bundle_identity.clone(),
             whole_file_digest: destination_digest.clone(),
-            destination_evidence_identity: verified_copy_destination_evidence_identity(
-                &request.destination,
-            )?,
-            durability,
             verified_at_unix_seconds: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_err(|_| invalid_bundle("system clock is before the Unix epoch"))?
@@ -1400,6 +1488,8 @@ impl<S: BundleSource, C: DestinationCapacity> BundleEngine<S, C> {
             destination_digest,
             source_bundle_identity,
             destination_bundle_identity,
+            destination_evidence_identity,
+            storage_location,
             receipt,
             durability,
             warnings,
@@ -3573,6 +3663,7 @@ struct OpenedBundle {
     restore_plan: AuthenticatedRestorePlan,
     bundle_hash: [u8; 32],
     bundle_identifier: [u8; 16],
+    plan_hash: String,
 }
 
 #[derive(Debug)]
@@ -3719,6 +3810,31 @@ fn open_bundle_file(source: &Path) -> Result<fs::File, CoreError> {
         path: source.to_path_buf(),
         source: source_error,
     })
+}
+
+fn current_regular_file_hash(source: &Path) -> Result<String, CoreError> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options
+        .open(source)
+        .map_err(|_| invalid_bundle("a selected source file cannot be reopened"))?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|_| invalid_bundle("a selected source file cannot be reread"))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
 fn open_bundle_from(
@@ -3984,6 +4100,7 @@ fn open_bundle_from(
         restore_plan,
         bundle_hash: *bundle_hasher.finalize().as_bytes(),
         bundle_identifier: opened_header.bundle_identifier,
+        plan_hash: manifest.plan_hash,
     })
 }
 
@@ -4566,13 +4683,6 @@ fn decode_manifest(bytes: &[u8]) -> Result<Manifest, CoreError> {
         .map_err(|_| invalid_bundle("Bundle manifest is not canonical supported JSON"))
 }
 
-fn verified_copy_durability_name(durability: VerifiedCopyDurability) -> &'static str {
-    match durability {
-        VerifiedCopyDurability::Durable => "durable",
-        VerifiedCopyDurability::Weaker => "weaker",
-    }
-}
-
 pub(crate) fn verified_copy_destination_evidence_identity(
     destination: &Path,
 ) -> Result<String, CoreError> {
@@ -4606,6 +4716,47 @@ pub(crate) fn verified_copy_destination_evidence_identity(
             .as_bytes(),
     );
     Ok(hasher.finalize().to_hex().to_string())
+}
+
+pub(crate) fn local_verified_copy_storage_location(
+    source: &Path,
+    destination: &Path,
+) -> io::Result<VerifiedCopyStorageLocation> {
+    let canonical_source = fs::canonicalize(source)?;
+    let canonical_destination = fs::canonicalize(destination)?;
+    if is_icloud_drive_path(&canonical_destination) {
+        return Ok(VerifiedCopyStorageLocation::ICloudDrive);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let source_device = fs::symlink_metadata(&canonical_source)?.dev();
+        let destination_device = fs::symlink_metadata(&canonical_destination)?.dev();
+        if canonical_destination.starts_with(Path::new("/Volumes"))
+            && canonical_destination != Path::new("/Volumes")
+            && destination_device != source_device
+        {
+            return Ok(VerifiedCopyStorageLocation::ExternalStorage);
+        }
+    }
+    Ok(VerifiedCopyStorageLocation::Other)
+}
+
+fn is_icloud_drive_path(path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(Path::new("/Users")) else {
+        return false;
+    };
+    let mut components = relative.components();
+    matches!(components.next(), Some(std::path::Component::Normal(_)))
+        && components
+            .next()
+            .is_some_and(|component| component.as_os_str() == std::ffi::OsStr::new("Library"))
+        && components.next().is_some_and(|component| {
+            component.as_os_str() == std::ffi::OsStr::new("Mobile Documents")
+        })
+        && components.next().is_some_and(|component| {
+            component.as_os_str() == std::ffi::OsStr::new("com~apple~CloudDocs")
+        })
 }
 
 fn partial_path(destination: &Path) -> PathBuf {

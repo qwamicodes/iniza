@@ -144,7 +144,7 @@ Generated Cargo artifacts under `target/` may remain. They do not affect migrati
 
 ## Known limitations
 
-- COKS-38 exposes the reviewed in-process Project Capsule interface. Durable authenticated expectation and Receipt persistence is deferred to COKS-39; supported cross-process owner orchestration is not yet complete.
+- COKS-38 exposes the reviewed in-process Project Capsule interface. COKS-39 provides durable authenticated expectation and Receipt persistence; supported cross-process owner orchestration is not yet complete.
 - Database export validation proves stable selected bytes, not application-specific transactional consistency. The owner must provide and review the export procedure.
 - Unsupported repository state remains blocking; Iniza does not normalize, fetch, or silently omit it.
 - Destination filesystem compatibility still must be proven by the actual Restore Rehearsal on the new Mac.

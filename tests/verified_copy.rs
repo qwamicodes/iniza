@@ -107,6 +107,8 @@ fn owner_can_create_a_verified_copy_with_matching_bytes_identity_and_digest() {
     assert_eq!(machine["schema_version"], 1);
     assert_eq!(machine["operation"], "verified-copy");
     assert_eq!(machine["result"], "verified");
+    assert!(machine.get("destination_evidence_identity").is_none());
+    assert!(machine.get("durability").is_none());
     assert!(machine.get("source_path").is_none());
     assert!(machine.get("destination_path").is_none());
     assert_eq!(copied.human_summary(), "Verified Copy created.");

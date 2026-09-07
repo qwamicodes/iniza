@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -16,15 +17,17 @@ use iniza::{
     OfflineRecoveryPersistenceTransition, OfflineRecoveryRehearsalRequest, OfflineRecoveryStorage,
     OfflineRecoveryWriteRequest, OwnerAttestationClaimKind, OwnerAttestationConfirmationRequest,
     OwnerAttestationPreparationRequest, OwnerAttestationWithdrawalRequest, PackRecoveryContext,
-    PackRequest, PlanEngine, ProjectAuditEngine, ProjectAuditRequest, ProjectCapsuleCaptureRequest,
-    ProjectCapsuleEngine, ProjectCapsuleRehearsalRequest, ProjectCapsuleReviewRequest,
-    PushPlanApprovalRequest, PushPlanDraftRequest, PushPlanEngine, PushPlanExecutionRequest,
-    ReadinessEvidenceConclusion, ReadinessEvidenceEngine, ReadinessEvidenceInitializationRequest,
-    ReadinessEvidenceState, ReadinessEvidenceStatusRequest, ReadinessEvidenceStorage,
-    ReadinessEvidenceStorageTransition, ReadinessReceiptRecordRequest, RecoveryMethod,
-    RecoverySecret, RestoreEngine, RestoreRequest, ScanRequest, VaultwardenInstallationRequest,
-    VaultwardenItemIdentifier, VaultwardenLoadRequest, VaultwardenPreflightRequest,
-    VaultwardenRecoveryEngine, VaultwardenStoreRequest, VerifiedCopyRequest, VerifyRequest,
+    PackRequest, Plan, PlanEngine, ProjectAuditEngine, ProjectAuditRequest,
+    ProjectCapsuleCaptureRequest, ProjectCapsuleEngine, ProjectCapsuleRehearsalRequest,
+    ProjectCapsuleReviewRequest, PushPlanApprovalRequest, PushPlanDraftRequest, PushPlanEngine,
+    PushPlanExecutionRequest, ReadinessEvidenceConclusion, ReadinessEvidenceEngine,
+    ReadinessEvidenceInitializationRequest, ReadinessEvidenceState, ReadinessEvidenceStatusRequest,
+    ReadinessEvidenceStorage, ReadinessEvidenceStorageTransition, ReadinessReceiptRecordRequest,
+    RecoveryMethod, RecoverySecret, RestoreEngine, RestoreRequest, ScanRequest,
+    VaultwardenInstallationRequest, VaultwardenItemIdentifier, VaultwardenLoadRequest,
+    VaultwardenPreflightRequest, VaultwardenRecoveryEngine, VaultwardenStoreRequest,
+    VerifiedCopyPersistence, VerifiedCopyPersistenceTransition, VerifiedCopyRequest,
+    VerifiedCopyStorageLocation, VerifyRequest,
 };
 use zeroize::Zeroizing;
 
@@ -232,6 +235,121 @@ fn approved_plan_and_matching_bundle_produce_current_bundle_verification_evidenc
 }
 
 #[test]
+fn bundle_verification_from_a_different_approved_plan_is_rejected() {
+    let directory = TestDirectory::new();
+    let source = directory.path().join("synthetic-developer-state");
+    fs::create_dir(&source).expect("synthetic source should be created");
+    fs::write(source.join("settings.txt"), b"first reviewed state\n")
+        .expect("first synthetic source should be written");
+
+    let mut first_plan = PlanEngine::local()
+        .scan(ScanRequest::for_directory(&source))
+        .expect("first synthetic source should scan");
+    let first_plan_hash = first_plan
+        .approval_hash()
+        .expect("first Plan should have a hash");
+    first_plan
+        .approve(&first_plan_hash)
+        .expect("exact first hash should approve the first Plan");
+
+    let bundle = directory.path().join("first-plan.iniza");
+    let bundle_engine = BundleEngine::local();
+    let packed = bundle_engine
+        .pack(PackRequest::new(&first_plan, &bundle))
+        .expect("first approved Plan should produce a completed Bundle");
+    let verification = bundle_engine
+        .verify(VerifyRequest::new(&bundle, packed.offline_recovery_key()))
+        .expect("first Plan Bundle should fully verify");
+
+    fs::write(source.join("settings.txt"), b"second reviewed state\n")
+        .expect("second synthetic source should be written");
+    let mut second_plan = PlanEngine::local()
+        .scan(ScanRequest::for_directory(&source))
+        .expect("second synthetic source should scan");
+    let second_plan_hash = second_plan
+        .approval_hash()
+        .expect("second Plan should have a hash");
+    second_plan
+        .approve(&second_plan_hash)
+        .expect("exact second hash should approve the second Plan");
+    assert_ne!(first_plan_hash, second_plan_hash);
+
+    let evidence_directory = directory.path().join("readiness-evidence");
+    let engine = ReadinessEvidenceEngine::local();
+    engine
+        .initialize(ReadinessEvidenceInitializationRequest::new(
+            &second_plan,
+            &evidence_directory,
+        ))
+        .expect("second approved Plan should initialize its evidence store");
+
+    let error = engine
+        .record_receipt(ReadinessReceiptRecordRequest::bundle_verification(
+            &evidence_directory,
+            &second_plan,
+            &bundle,
+            &verification,
+        ))
+        .expect_err("a Bundle from the first Plan must not become second-Plan evidence");
+    assert_eq!(
+        error.to_string(),
+        "Bundle verification is bound to a different Plan"
+    );
+}
+
+#[test]
+fn source_content_changed_after_bundle_creation_invalidates_bundle_readiness_evidence() {
+    let directory = TestDirectory::new();
+    let source = directory.path().join("synthetic-developer-state");
+    fs::create_dir(&source).expect("synthetic source should be created");
+    let settings = source.join("settings.txt");
+    fs::write(&settings, b"alpha\n").expect("initial synthetic source should be written");
+    let mut plan = PlanEngine::local()
+        .scan(ScanRequest::for_directory(&source))
+        .expect("synthetic source should scan");
+    let plan_hash = plan.approval_hash().expect("Plan should have a hash");
+    plan.approve(&plan_hash)
+        .expect("exact reviewed hash should approve the Plan");
+    let bundle = directory.path().join("migration.iniza");
+    let bundle_engine = BundleEngine::local();
+    let packed = bundle_engine
+        .pack(PackRequest::new(&plan, &bundle))
+        .expect("approved Plan should produce a completed Bundle");
+    let verification = bundle_engine
+        .verify(VerifyRequest::new(&bundle, packed.offline_recovery_key()))
+        .expect("completed Bundle should fully verify");
+    let evidence_directory = directory.path().join("readiness-evidence");
+    let engine = ReadinessEvidenceEngine::local();
+    engine
+        .initialize(ReadinessEvidenceInitializationRequest::new(
+            &plan,
+            &evidence_directory,
+        ))
+        .expect("approved Plan should initialize a private evidence store");
+    engine
+        .record_receipt(ReadinessReceiptRecordRequest::bundle_verification(
+            &evidence_directory,
+            &plan,
+            &bundle,
+            &verification,
+        ))
+        .expect("current Bundle verification should append");
+
+    fs::write(&settings, b"omega\n")
+        .expect("source should change without changing its byte length");
+    let status = engine
+        .status(
+            ReadinessEvidenceStatusRequest::new(&evidence_directory, &plan)
+                .with_bundle(&bundle, packed.offline_recovery_key()),
+        )
+        .expect("source drift should produce a blocking status");
+    assert_eq!(
+        status.bundle_verification(),
+        ReadinessEvidenceConclusion::Invalidated
+    );
+}
+
+#[test]
 fn blocking_status_is_deterministic_secret_free_and_never_an_erase_safety_decision() {
     let directory = TestDirectory::new();
     let source = directory.path().join("private-source-name");
@@ -355,8 +473,8 @@ fn exact_owner_attestation_is_prepared_without_writing_and_recorded_only_as_owne
         .prepare_attestation(OwnerAttestationPreparationRequest::new(
             &evidence_directory,
             &plan,
-            OwnerAttestationClaimKind::ReviewedExternalVaultwardenServiceConfirmed,
-            "vaultwarden-receipt:synthetic-reference-1",
+            OwnerAttestationClaimKind::ConventionalBackupValidated,
+            "conventional-backup:synthetic-reference-1",
         ))
         .expect("fixed owner-stated claim should prepare for review");
     assert_eq!(
@@ -368,11 +486,11 @@ fn exact_owner_attestation_is_prepared_without_writing_and_recorded_only_as_owne
     );
     assert_eq!(
         review.claim_text(),
-        "I confirm that the reviewed Vaultwarden service is external to the source Mac."
+        "I confirm that the conventional backup was validated."
     );
     assert_eq!(
         review.evidence_reference(),
-        "vaultwarden-receipt:synthetic-reference-1"
+        "conventional-backup:synthetic-reference-1"
     );
     assert_eq!(
         review.required_acknowledgement(),
@@ -419,6 +537,131 @@ fn exact_owner_attestation_is_prepared_without_writing_and_recorded_only_as_owne
 }
 
 #[test]
+fn not_protected_attestation_requires_the_latest_report_evidence_reference() {
+    let directory = TestDirectory::new();
+    let source = directory.path().join("synthetic-state");
+    fs::create_dir(&source).expect("synthetic source should be created");
+    fs::write(source.join("settings.txt"), b"synthetic settings\n")
+        .expect("synthetic source should be written");
+    let mut plan = PlanEngine::local()
+        .scan(ScanRequest::for_directory(&source))
+        .expect("synthetic source should scan");
+    let plan_hash = plan.approval_hash().expect("Plan should have a hash");
+    plan.approve(&plan_hash)
+        .expect("exact reviewed hash should approve the Plan");
+    let evidence_directory = directory.path().join("readiness-evidence");
+    let engine = ReadinessEvidenceEngine::local();
+    engine
+        .initialize(ReadinessEvidenceInitializationRequest::new(
+            &plan,
+            &evidence_directory,
+        ))
+        .expect("approved Plan should initialize a private evidence store");
+    let report = engine
+        .record_receipt(ReadinessReceiptRecordRequest::not_protected_report(
+            &evidence_directory,
+            &plan,
+        ))
+        .expect("Not Protected Report should append");
+
+    engine
+        .prepare_attestation(OwnerAttestationPreparationRequest::new(
+            &evidence_directory,
+            &plan,
+            OwnerAttestationClaimKind::NotProtectedReportReviewed,
+            "arbitrary-reference",
+        ))
+        .expect_err("an arbitrary reference must not bind a Not Protected Report review");
+    let review = engine
+        .prepare_attestation(OwnerAttestationPreparationRequest::new(
+            &evidence_directory,
+            &plan,
+            OwnerAttestationClaimKind::NotProtectedReportReviewed,
+            report.evidence_reference(),
+        ))
+        .expect("the latest Not Protected Report reference should prepare");
+    assert_eq!(review.evidence_reference(), report.evidence_reference());
+}
+
+#[test]
+fn a_superseding_not_protected_report_invalidates_the_older_owner_attestation() {
+    let directory = TestDirectory::new();
+    let source = directory.path().join("synthetic-state");
+    fs::create_dir(&source).expect("synthetic source should be created");
+    fs::write(source.join("settings.txt"), b"synthetic settings\n")
+        .expect("synthetic source should be written");
+    let mut plan = PlanEngine::local()
+        .scan(ScanRequest::for_directory(&source))
+        .expect("synthetic source should scan");
+    let plan_hash = plan.approval_hash().expect("Plan should have a hash");
+    plan.approve(&plan_hash)
+        .expect("exact reviewed hash should approve the Plan");
+    let evidence_directory = directory.path().join("readiness-evidence");
+    let engine = ReadinessEvidenceEngine::local();
+    engine
+        .initialize(ReadinessEvidenceInitializationRequest::new(
+            &plan,
+            &evidence_directory,
+        ))
+        .expect("approved Plan should initialize a private evidence store");
+    let first_report = engine
+        .record_receipt(ReadinessReceiptRecordRequest::not_protected_report(
+            &evidence_directory,
+            &plan,
+        ))
+        .expect("first Not Protected Report should append");
+    let review = engine
+        .prepare_attestation(OwnerAttestationPreparationRequest::new(
+            &evidence_directory,
+            &plan,
+            OwnerAttestationClaimKind::NotProtectedReportReviewed,
+            first_report.evidence_reference(),
+        ))
+        .expect("first Not Protected Report should prepare for review");
+    engine
+        .confirm_attestation(OwnerAttestationConfirmationRequest::new(
+            &evidence_directory,
+            &plan,
+            &review,
+            review.review_hash(),
+            review.required_acknowledgement(),
+        ))
+        .expect("exact first report review should append");
+
+    let before = engine
+        .status(ReadinessEvidenceStatusRequest::new(
+            &evidence_directory,
+            &plan,
+        ))
+        .expect("current reviewed report should produce status");
+    assert!(
+        before
+            .blocking_gaps()
+            .iter()
+            .any(|gap| { gap.code() == "required-owner-attestations-missing" && gap.count() == 6 })
+    );
+
+    engine
+        .record_receipt(ReadinessReceiptRecordRequest::not_protected_report(
+            &evidence_directory,
+            &plan,
+        ))
+        .expect("superseding Not Protected Report should append");
+    let after = engine
+        .status(ReadinessEvidenceStatusRequest::new(
+            &evidence_directory,
+            &plan,
+        ))
+        .expect("superseded report review should remain auditable");
+    assert!(
+        after
+            .blocking_gaps()
+            .iter()
+            .any(|gap| { gap.code() == "required-owner-attestations-missing" && gap.count() == 7 })
+    );
+}
+
+#[test]
 fn withdrawing_an_owner_attestation_appends_history_and_removes_the_active_claim() {
     let directory = TestDirectory::new();
     let source = directory.path().join("synthetic-state");
@@ -443,8 +686,8 @@ fn withdrawing_an_owner_attestation_appends_history_and_removes_the_active_claim
         .prepare_attestation(OwnerAttestationPreparationRequest::new(
             &evidence_directory,
             &plan,
-            OwnerAttestationClaimKind::ReviewedExternalVaultwardenServiceConfirmed,
-            "vaultwarden-receipt:synthetic-reference-2",
+            OwnerAttestationClaimKind::ConventionalBackupValidated,
+            "conventional-backup:synthetic-reference-2",
         ))
         .expect("fixed owner-stated claim should prepare for review");
     let attestation = engine
@@ -532,6 +775,12 @@ fn every_supported_owner_attestation_uses_fixed_non_free_form_claim_text() {
             &evidence_directory,
         ))
         .expect("approved Plan should initialize a private evidence store");
+    let not_protected_report = engine
+        .record_receipt(ReadinessReceiptRecordRequest::not_protected_report(
+            &evidence_directory,
+            &plan,
+        ))
+        .expect("Not Protected Report should append");
 
     let cases = [
         (
@@ -539,38 +788,24 @@ fn every_supported_owner_attestation_uses_fixed_non_free_form_claim_text() {
             "I confirm that the conventional backup was validated.",
         ),
         (
-            OwnerAttestationClaimKind::RepresentativeRestoredProjectBuildCompleted,
-            "I confirm that a representative restored Project build completed.",
-        ),
-        (
-            OwnerAttestationClaimKind::SecondEnvironmentRehearsalCompleted,
-            "I confirm that the second-environment Restore Rehearsal completed.",
-        ),
-        (
             OwnerAttestationClaimKind::NotProtectedReportReviewed,
             "I confirm that I reviewed the Not Protected Report.",
-        ),
-        (
-            OwnerAttestationClaimKind::ReviewedExternalVaultwardenServiceConfirmed,
-            "I confirm that the reviewed Vaultwarden service is external to the source Mac.",
-        ),
-        (
-            OwnerAttestationClaimKind::FreshDeviceVaultwardenAccessConfirmed,
-            "I confirm that fresh-device Vaultwarden access succeeded.",
-        ),
-        (
-            OwnerAttestationClaimKind::IndependentMultiFactorRecoveryPathConfirmed,
-            "I confirm that the independent multi-factor recovery path succeeded.",
         ),
     ];
 
     for (index, (claim_kind, expected_text)) in cases.into_iter().enumerate() {
+        let evidence_reference =
+            if claim_kind == OwnerAttestationClaimKind::NotProtectedReportReviewed {
+                not_protected_report.evidence_reference().to_owned()
+            } else {
+                format!("evidence:synthetic-{index}")
+            };
         let review = engine
             .prepare_attestation(OwnerAttestationPreparationRequest::new(
                 &evidence_directory,
                 &plan,
                 claim_kind,
-                format!("evidence:synthetic-{index}"),
+                evidence_reference,
             ))
             .expect("supported fixed claim should prepare");
         assert_eq!(review.claim_text(), expected_text);
@@ -648,7 +883,7 @@ fn typed_recovery_and_copy_receipts_are_current_only_while_their_artifacts_reval
         .record_receipt(ReadinessReceiptRecordRequest::verified_copy(
             &evidence_directory,
             &plan,
-            copied.receipt(),
+            &copied,
         ))
         .expect("typed Verified Copy Receipt should append");
 
@@ -779,13 +1014,55 @@ fn typed_vaultwarden_receipt_revalidates_through_the_loaded_recovery_method() {
             &verification,
         ))
         .expect("Bundle verification should append");
-    engine
+    let vaultwarden_record = engine
         .record_receipt(ReadinessReceiptRecordRequest::vaultwarden_recovery(
             &evidence_directory,
             &plan,
             receipt,
         ))
         .expect("typed Vaultwarden Receipt should append");
+
+    engine
+        .prepare_attestation(OwnerAttestationPreparationRequest::new(
+            &evidence_directory,
+            &plan,
+            OwnerAttestationClaimKind::ReviewedExternalVaultwardenServiceConfirmed,
+            "unbound-vaultwarden-owner-statement",
+        ))
+        .expect_err("a Vaultwarden owner statement must bind the current typed Receipt");
+    for (claim_kind, claim_text) in [
+        (
+            OwnerAttestationClaimKind::ReviewedExternalVaultwardenServiceConfirmed,
+            "I confirm that the reviewed Vaultwarden service is external to the source Mac.",
+        ),
+        (
+            OwnerAttestationClaimKind::FreshDeviceVaultwardenAccessConfirmed,
+            "I confirm that fresh-device Vaultwarden access succeeded.",
+        ),
+        (
+            OwnerAttestationClaimKind::IndependentMultiFactorRecoveryPathConfirmed,
+            "I confirm that the independent multi-factor recovery path succeeded.",
+        ),
+    ] {
+        let review = engine
+            .prepare_attestation(OwnerAttestationPreparationRequest::new(
+                &evidence_directory,
+                &plan,
+                claim_kind,
+                vaultwarden_record.evidence_reference(),
+            ))
+            .expect("the current typed Vaultwarden Receipt should prepare the fixed statement");
+        assert_eq!(review.claim_text(), claim_text);
+        engine
+            .confirm_attestation(OwnerAttestationConfirmationRequest::new(
+                &evidence_directory,
+                &plan,
+                &review,
+                review.review_hash(),
+                review.required_acknowledgement(),
+            ))
+            .expect("exact Vaultwarden owner statement should append");
+    }
 
     let status = engine
         .status(
@@ -797,6 +1074,27 @@ fn typed_vaultwarden_receipt_revalidates_through_the_loaded_recovery_method() {
     assert_eq!(
         status.vaultwarden_recovery_method(),
         ReadinessEvidenceConclusion::Current
+    );
+
+    engine
+        .record_receipt(ReadinessReceiptRecordRequest::vaultwarden_recovery(
+            &evidence_directory,
+            &plan,
+            receipt,
+        ))
+        .expect("newer typed Vaultwarden Receipt should supersede the older binding");
+    let superseded = engine
+        .status(
+            ReadinessEvidenceStatusRequest::new(&evidence_directory, &plan)
+                .with_bundle(&bundle, loaded.recovery_secret())
+                .with_vaultwarden_recovery(&loaded),
+        )
+        .expect("superseded owner statements should remain auditable but blocking");
+    assert!(
+        superseded
+            .blocking_gaps()
+            .iter()
+            .any(|gap| { gap.code() == "required-owner-attestations-missing" && gap.count() == 7 })
     );
 }
 
@@ -928,13 +1226,33 @@ fn project_capsule_and_restore_rehearsal_make_only_the_project_restorable() {
             &captured,
         ))
         .expect("verified Project Capsule capture should append");
-    engine
+    let rehearsal_record = engine
         .record_receipt(ReadinessReceiptRecordRequest::project_capsule_rehearsal(
             &evidence_directory,
             &plan,
             &rehearsal,
         ))
         .expect("Restorable Project rehearsal should append");
+    engine
+        .prepare_attestation(OwnerAttestationPreparationRequest::new(
+            &evidence_directory,
+            &plan,
+            OwnerAttestationClaimKind::RepresentativeRestoredProjectBuildCompleted,
+            "unbound-restored-project-build",
+        ))
+        .expect_err("restored-Project build statement must bind the current rehearsal Receipt");
+    let build_review = engine
+        .prepare_attestation(OwnerAttestationPreparationRequest::new(
+            &evidence_directory,
+            &plan,
+            OwnerAttestationClaimKind::RepresentativeRestoredProjectBuildCompleted,
+            rehearsal_record.evidence_reference(),
+        ))
+        .expect("current Project Capsule rehearsal should prepare the fixed build statement");
+    assert_eq!(
+        build_review.claim_text(),
+        "I confirm that a representative restored Project build completed."
+    );
 
     let status =
         engine
@@ -990,13 +1308,33 @@ fn completed_restore_rehearsal_is_current_only_for_its_bundle_and_destination() 
             &evidence_directory,
         ))
         .expect("approved Plan should initialize a private evidence store");
-    engine
+    let restore_record = engine
         .record_receipt(ReadinessReceiptRecordRequest::restore_rehearsal(
             &evidence_directory,
             &plan,
             &restored,
         ))
         .expect("completed Restore Rehearsal should append");
+    engine
+        .prepare_attestation(OwnerAttestationPreparationRequest::new(
+            &evidence_directory,
+            &plan,
+            OwnerAttestationClaimKind::SecondEnvironmentRehearsalCompleted,
+            "unbound-second-environment-rehearsal",
+        ))
+        .expect_err("second-environment statement must bind the current Restore Receipt");
+    let second_environment_review = engine
+        .prepare_attestation(OwnerAttestationPreparationRequest::new(
+            &evidence_directory,
+            &plan,
+            OwnerAttestationClaimKind::SecondEnvironmentRehearsalCompleted,
+            restore_record.evidence_reference(),
+        ))
+        .expect("current Restore Rehearsal should prepare the fixed owner statement");
+    assert_eq!(
+        second_environment_review.claim_text(),
+        "I confirm that the second-environment Restore Rehearsal completed."
+    );
 
     let status = engine
         .status(
@@ -1055,12 +1393,12 @@ fn every_selected_verified_copy_must_revalidate_independently() {
             &evidence_directory,
         ))
         .expect("approved Plan should initialize a private evidence store");
-    for receipt in [first.receipt(), second.receipt()] {
+    for report in [&first, &second] {
         engine
             .record_receipt(ReadinessReceiptRecordRequest::verified_copy(
                 &evidence_directory,
                 &plan,
-                receipt,
+                report,
             ))
             .expect("each typed Verified Copy Receipt should append");
     }
@@ -1092,6 +1430,73 @@ fn every_selected_verified_copy_must_revalidate_independently() {
             .verified_copy(),
         ReadinessEvidenceConclusion::Invalidated
     );
+}
+
+#[test]
+fn two_verified_copy_files_on_one_filesystem_are_not_independent_protection() {
+    let directory = TestDirectory::new();
+    let source = directory.path().join("synthetic-state");
+    fs::create_dir(&source).expect("synthetic source should be created");
+    fs::write(source.join("settings.txt"), b"synthetic settings\n")
+        .expect("synthetic source should be written");
+    let mut plan = PlanEngine::local()
+        .scan(ScanRequest::for_directory(&source))
+        .expect("synthetic source should scan");
+    let plan_hash = plan.approval_hash().expect("Plan should have a hash");
+    plan.approve(&plan_hash)
+        .expect("exact reviewed hash should approve the Plan");
+
+    let bundle = directory.path().join("migration.iniza");
+    let bundle_engine = BundleEngine::local();
+    let packed = bundle_engine
+        .pack(PackRequest::new(&plan, &bundle))
+        .expect("approved Plan should produce a completed Bundle");
+    let first_copy = directory.path().join("first-copy.iniza");
+    let second_copy = directory.path().join("second-copy.iniza");
+    let first_report = bundle_engine
+        .copy_verified(VerifiedCopyRequest::new(
+            &bundle,
+            &first_copy,
+            packed.offline_recovery_key(),
+        ))
+        .expect("first Verified Copy should complete");
+    let second_report = bundle_engine
+        .copy_verified(VerifiedCopyRequest::new(
+            &bundle,
+            &second_copy,
+            packed.offline_recovery_key(),
+        ))
+        .expect("second Verified Copy should complete");
+
+    let evidence_directory = directory.path().join("readiness-evidence");
+    let engine = ReadinessEvidenceEngine::local();
+    engine
+        .initialize(ReadinessEvidenceInitializationRequest::new(
+            &plan,
+            &evidence_directory,
+        ))
+        .expect("approved Plan should initialize a private evidence store");
+    for report in [&first_report, &second_report] {
+        engine
+            .record_receipt(ReadinessReceiptRecordRequest::verified_copy(
+                &evidence_directory,
+                &plan,
+                report,
+            ))
+            .expect("Verified Copy report should append");
+    }
+
+    let status = engine
+        .status(
+            ReadinessEvidenceStatusRequest::new(&evidence_directory, &plan)
+                .with_bundle(&bundle, packed.offline_recovery_key())
+                .with_verified_copy(&first_copy)
+                .with_verified_copy(&second_copy),
+        )
+        .expect("same-filesystem copies should produce a blocking status");
+    assert!(status.blocking_gaps().iter().any(|gap| {
+        gap.code() == "two-independent-verified-copies-required" && gap.count() == 2
+    }));
 }
 
 #[test]
@@ -1222,6 +1627,312 @@ fn complete_push_plan_execution_makes_only_the_project_synchronized() {
 }
 
 #[test]
+fn project_already_equal_to_its_upstream_is_synchronized_without_a_push_execution() {
+    let directory = TestDirectory::new();
+    let project = directory.path().join("synthetic-project");
+    let remote = directory.path().join("synthetic-remote.git");
+    fs::create_dir(&project).expect("synthetic Project should be created");
+    run_git(&project, &["init", "-q", "--initial-branch=main"]);
+    run_git(
+        directory.path(),
+        &[
+            "init",
+            "-q",
+            "--bare",
+            "--initial-branch=main",
+            remote.to_str().expect("remote path should be Unicode"),
+        ],
+    );
+    run_git(
+        &project,
+        &[
+            "remote",
+            "add",
+            "origin",
+            remote.to_str().expect("remote path should be Unicode"),
+        ],
+    );
+    fs::write(project.join("tracked.txt"), "already published\n")
+        .expect("tracked fixture should be written");
+    run_git(&project, &["add", "tracked.txt"]);
+    run_git_with_identity(&project, &["commit", "-q", "-m", "Published state"]);
+    run_git(&project, &["push", "-q", "-u", "origin", "main"]);
+
+    let mut plan = PlanEngine::local()
+        .scan(ScanRequest::for_directory(&project))
+        .expect("Project should scan");
+    let plan_hash = plan.approval_hash().expect("Plan should have a hash");
+    plan.approve(&plan_hash)
+        .expect("exact reviewed hash should approve the Plan");
+    let audit = ProjectAuditEngine::local()
+        .audit(ProjectAuditRequest::from_plan(&plan))
+        .expect("already-published Project should audit");
+    let project_audit = audit
+        .projects()
+        .first()
+        .expect("Project should be discovered");
+    assert_eq!(project_audit.local_state().ahead(), Some(0));
+    assert_eq!(project_audit.local_state().behind(), Some(0));
+
+    let evidence_directory = directory.path().join("readiness-evidence");
+    let engine = ReadinessEvidenceEngine::with_git_publication_process(LocalGitPublication);
+    engine
+        .initialize(ReadinessEvidenceInitializationRequest::new(
+            &plan,
+            &evidence_directory,
+        ))
+        .expect("approved Plan should initialize a private evidence store");
+    let status = engine
+        .status(
+            ReadinessEvidenceStatusRequest::new(&evidence_directory, &plan)
+                .with_project_publication(project_audit),
+        )
+        .expect("read-only remote comparison should produce Project status");
+
+    assert_eq!(status.projects().len(), 1);
+    assert_eq!(
+        status.projects()[0].synchronized(),
+        ReadinessEvidenceConclusion::Current
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn local_only_references_are_synchronized_only_with_current_capsule_protection_and_owner_decision()
+{
+    let directory = TestDirectory::new();
+    let project = directory.path().join("synthetic-project");
+    let remote = directory.path().join("synthetic-remote.git");
+    fs::create_dir(&project).expect("synthetic Project should be created");
+    run_git(&project, &["init", "-q", "--initial-branch=main"]);
+    run_git(
+        directory.path(),
+        &[
+            "init",
+            "-q",
+            "--bare",
+            "--initial-branch=main",
+            remote.to_str().expect("remote path should be Unicode"),
+        ],
+    );
+    fs::write(project.join("tracked.txt"), "published state\n")
+        .expect("tracked fixture should be written");
+    run_git(&project, &["add", "tracked.txt"]);
+    run_git_with_identity(&project, &["commit", "-q", "-m", "Published state"]);
+    run_git(
+        &project,
+        &[
+            "remote",
+            "add",
+            "origin",
+            remote.to_str().expect("remote path should be Unicode"),
+        ],
+    );
+    run_git(&project, &["push", "-q", "-u", "origin", "main"]);
+    run_git(&project, &["checkout", "-q", "-b", "capsule-only-branch"]);
+    fs::write(
+        project.join("capsule-only.txt"),
+        "deliberately unpublished\n",
+    )
+    .expect("capsule-only fixture should be written");
+    run_git(&project, &["add", "capsule-only.txt"]);
+    run_git_with_identity(&project, &["commit", "-q", "-m", "Capsule-only state"]);
+    run_git(&project, &["checkout", "-q", "main"]);
+
+    let mut plan = PlanEngine::local()
+        .scan(ScanRequest::for_directory(&project))
+        .expect("Project should scan");
+    let plan_hash = plan.approval_hash().expect("Plan should have a hash");
+    plan.approve(&plan_hash)
+        .expect("exact reviewed hash should approve the Plan");
+    let audit = ProjectAuditEngine::local()
+        .audit(ProjectAuditRequest::from_plan(&plan).with_remote_check())
+        .expect("Project should audit");
+    let project_audit = audit
+        .projects()
+        .first()
+        .expect("Project should be discovered");
+    assert_eq!(project_audit.local_state().ahead(), Some(0));
+    assert_eq!(project_audit.local_state().behind(), Some(0));
+    assert_eq!(project_audit.local_state().local_only_branches().len(), 1);
+
+    let review = ProjectCapsuleEngine::local()
+        .review(ProjectCapsuleReviewRequest::new(&plan, project_audit))
+        .expect("local-only references should be included in the Project Capsule review");
+    let capsule = directory.path().join("project-capsule.iniza");
+    let capture = ProjectCapsuleEngine::local()
+        .capture(ProjectCapsuleCaptureRequest::new(
+            &plan,
+            project_audit,
+            &review,
+            review.review_hash(),
+            &capsule,
+        ))
+        .expect("reviewed Project should capture into a verified Project Capsule");
+    let expectation = capture
+        .expectation()
+        .expect("verified Project Capsule should bind an expectation");
+    let restored = directory.path().join("restored-project");
+    let rehearsal = ProjectCapsuleEngine::local()
+        .rehearse(ProjectCapsuleRehearsalRequest::new(
+            &capsule,
+            expectation,
+            capture.offline_recovery_key(),
+            &restored,
+        ))
+        .expect("Project Capsule should restore every reviewed local-only reference");
+
+    let evidence_directory = directory.path().join("readiness-evidence");
+    let engine = ReadinessEvidenceEngine::with_git_publication_process(LocalGitPublication);
+    engine
+        .initialize(ReadinessEvidenceInitializationRequest::new(
+            &plan,
+            &evidence_directory,
+        ))
+        .expect("approved Plan should initialize a private evidence store");
+    let capture_record = engine
+        .record_receipt(ReadinessReceiptRecordRequest::project_capsule_capture(
+            &evidence_directory,
+            &plan,
+            &capture,
+        ))
+        .expect("verified Project Capsule capture should append");
+    engine
+        .record_receipt(ReadinessReceiptRecordRequest::project_capsule_rehearsal(
+            &evidence_directory,
+            &plan,
+            &rehearsal,
+        ))
+        .expect("Restorable Project rehearsal should append");
+
+    let request = || {
+        ReadinessEvidenceStatusRequest::new(&evidence_directory, &plan)
+            .with_project_capsule(&capsule, expectation, capture.offline_recovery_key())
+            .with_project_publication(project_audit)
+    };
+    let without_decision = engine
+        .status(request())
+        .expect("missing owner decision should produce blocking Project evidence");
+    assert_eq!(
+        without_decision.projects()[0].restorable(),
+        ReadinessEvidenceConclusion::Current
+    );
+    assert_eq!(
+        without_decision.projects()[0].synchronized(),
+        ReadinessEvidenceConclusion::Missing
+    );
+
+    assert!(
+        engine
+            .prepare_attestation(OwnerAttestationPreparationRequest::new(
+                &evidence_directory,
+                &plan,
+                OwnerAttestationClaimKind::LocalOnlyProjectReferencesRetainedInProjectCapsule,
+                "unbound-capsule-decision",
+            ))
+            .is_err(),
+        "a capsule-only decision must bind the current Project Capsule capture"
+    );
+    let attestation_review = engine
+        .prepare_attestation(OwnerAttestationPreparationRequest::new(
+            &evidence_directory,
+            &plan,
+            OwnerAttestationClaimKind::LocalOnlyProjectReferencesRetainedInProjectCapsule,
+            capture_record.evidence_reference(),
+        ))
+        .expect("exact Project Capsule reference should prepare the fixed owner decision");
+    let attestation = engine
+        .confirm_attestation(OwnerAttestationConfirmationRequest::new(
+            &evidence_directory,
+            &plan,
+            &attestation_review,
+            attestation_review.review_hash(),
+            attestation_review.required_acknowledgement(),
+        ))
+        .expect("exact capsule-only owner decision should append");
+
+    let with_decision = engine
+        .status(request())
+        .expect("current capsule protection and owner decision should revalidate");
+    assert_eq!(
+        with_decision.projects()[0].synchronized(),
+        ReadinessEvidenceConclusion::Current
+    );
+
+    engine
+        .withdraw_attestation(OwnerAttestationWithdrawalRequest::new(
+            &evidence_directory,
+            &plan,
+            attestation.attestation_identifier(),
+            "I withdraw this Owner Attestation.",
+        ))
+        .expect("owner should be able to withdraw the capsule-only decision");
+    let after_withdrawal = engine
+        .status(request())
+        .expect("withdrawn decision should produce blocking Project evidence");
+    assert_eq!(
+        after_withdrawal.projects()[0].synchronized(),
+        ReadinessEvidenceConclusion::Missing
+    );
+}
+
+#[test]
+fn an_omitted_must_protect_project_remains_visible_and_blocking() {
+    let directory = TestDirectory::new();
+    let source = directory.path().join("synthetic-developer-state");
+    let first_project = source.join("first-project");
+    let second_project = source.join("second-project");
+    fs::create_dir_all(&first_project).expect("first Project should be created");
+    fs::create_dir_all(&second_project).expect("second Project should be created");
+    for project in [&first_project, &second_project] {
+        run_git(project, &["init", "-q", "--initial-branch=main"]);
+        fs::write(project.join("tracked.txt"), "synthetic tracked state\n")
+            .expect("tracked fixture should be written");
+        run_git(project, &["add", "tracked.txt"]);
+        run_git_with_identity(project, &["commit", "-q", "-m", "Initial state"]);
+    }
+
+    let mut plan = PlanEngine::local()
+        .scan(ScanRequest::for_directory(&source))
+        .expect("synthetic developer state should scan");
+    let plan_hash = plan.approval_hash().expect("Plan should have a hash");
+    plan.approve(&plan_hash)
+        .expect("exact reviewed hash should approve the Plan");
+    let audit = ProjectAuditEngine::local()
+        .audit(ProjectAuditRequest::from_plan(&plan))
+        .expect("both Projects should audit");
+    assert_eq!(audit.projects().len(), 2);
+
+    let evidence_directory = directory.path().join("readiness-evidence");
+    let engine = ReadinessEvidenceEngine::local();
+    engine
+        .initialize(ReadinessEvidenceInitializationRequest::new(
+            &plan,
+            &evidence_directory,
+        ))
+        .expect("approved Plan should initialize a private evidence store");
+    let status = engine
+        .status(
+            ReadinessEvidenceStatusRequest::new(&evidence_directory, &plan)
+                .with_project_publication(&audit.projects()[0]),
+        )
+        .expect("required Project coverage should derive from the approved Plan");
+
+    assert_eq!(status.projects().len(), 2);
+    assert!(status.projects().iter().any(|project| {
+        project.project_identity() == audit.projects()[1].id()
+            && project.restorable() == ReadinessEvidenceConclusion::Missing
+            && project.synchronized() == ReadinessEvidenceConclusion::Missing
+    }));
+    assert!(
+        status
+            .blocking_gaps()
+            .iter()
+            .any(|gap| { gap.code() == "required-projects-not-restorable" && gap.count() == 2 })
+    );
+}
+
+#[test]
 fn record_candidate_creation_failure_preserves_the_last_valid_evidence_chain() {
     let directory = TestDirectory::new();
     let source = directory.path().join("synthetic-state");
@@ -1270,6 +1981,81 @@ fn record_candidate_creation_failure_preserves_the_last_valid_evidence_chain() {
 }
 
 #[test]
+fn record_write_failure_never_makes_failed_receipt_current() {
+    assert_storage_failure_never_makes_receipt_current(
+        ReadinessEvidenceStorageTransition::WriteRecordCandidate,
+    );
+}
+
+#[test]
+fn record_synchronization_failure_never_makes_failed_receipt_current() {
+    assert_storage_failure_never_makes_receipt_current(
+        ReadinessEvidenceStorageTransition::SynchronizeRecordCandidate,
+    );
+}
+
+#[test]
+fn record_publication_failure_never_makes_failed_receipt_current() {
+    assert_storage_failure_never_makes_receipt_current(
+        ReadinessEvidenceStorageTransition::PublishRecord,
+    );
+}
+
+#[test]
+fn record_candidate_removal_failure_never_makes_failed_receipt_current() {
+    assert_storage_failure_never_makes_receipt_current(
+        ReadinessEvidenceStorageTransition::RemoveRecordCandidate,
+    );
+}
+
+#[test]
+fn evidence_directory_synchronization_failure_never_makes_failed_receipt_current() {
+    assert_storage_failure_never_makes_receipt_current(
+        ReadinessEvidenceStorageTransition::SynchronizeEvidenceDirectory,
+    );
+}
+
+fn assert_storage_failure_never_makes_receipt_current(
+    rejected_transition: ReadinessEvidenceStorageTransition,
+) {
+    let directory = TestDirectory::new();
+    let source = directory.path().join("synthetic-state");
+    fs::create_dir(&source).expect("synthetic source should be created");
+    fs::write(source.join("settings.txt"), b"synthetic settings\n")
+        .expect("synthetic source should be written");
+    let mut plan = PlanEngine::local()
+        .scan(ScanRequest::for_directory(&source))
+        .expect("synthetic source should scan");
+    let plan_hash = plan.approval_hash().expect("Plan should have a hash");
+    plan.approve(&plan_hash)
+        .expect("exact reviewed hash should approve the Plan");
+    let evidence_directory = directory.path().join("readiness-evidence");
+    ReadinessEvidenceEngine::local()
+        .initialize(ReadinessEvidenceInitializationRequest::new(
+            &plan,
+            &evidence_directory,
+        ))
+        .expect("approved Plan should initialize a private evidence store");
+
+    ReadinessEvidenceEngine::with_storage(RejectStorageTransition(rejected_transition))
+        .record_receipt(ReadinessReceiptRecordRequest::not_protected_report(
+            &evidence_directory,
+            &plan,
+        ))
+        .expect_err("the injected storage failure must prevent a successful record report");
+
+    if let Ok(status) = ReadinessEvidenceEngine::local().status(
+        ReadinessEvidenceStatusRequest::new(&evidence_directory, &plan),
+    ) {
+        assert_ne!(
+            status.not_protected_report(),
+            ReadinessEvidenceConclusion::Current,
+            "an operation that returned failure must not become current evidence"
+        );
+    }
+}
+
+#[test]
 fn complete_synthetic_evidence_chain_reports_complete_evidence_without_erase_permission() {
     let directory = TestDirectory::new();
     let project = directory.path().join("synthetic-project");
@@ -1299,10 +2085,6 @@ fn complete_synthetic_evidence_chain_reports_complete_evidence_without_erase_per
         ],
     );
     run_git(&project, &["push", "-q", "-u", "origin", "main"]);
-    fs::write(project.join("tracked.txt"), "approved ahead commit\n")
-        .expect("ahead fixture should be written");
-    run_git(&project, &["add", "tracked.txt"]);
-    run_git_with_identity(&project, &["commit", "-q", "-m", "Approved ahead commit"]);
 
     let mut plan = PlanEngine::local()
         .scan(ScanRequest::for_directory(&project))
@@ -1317,6 +2099,10 @@ fn complete_synthetic_evidence_chain_reports_complete_evidence_without_erase_per
         .projects()
         .first()
         .expect("Project should be discovered");
+    assert_eq!(project_audit.local_state().ahead(), Some(0));
+    assert_eq!(project_audit.local_state().behind(), Some(0));
+    assert!(project_audit.local_state().local_only_branches().is_empty());
+    assert!(project_audit.local_state().local_only_tags().is_empty());
 
     let project_capsule = directory.path().join("project-capsule.iniza");
     let capsule_review = ProjectCapsuleEngine::local()
@@ -1420,19 +2206,20 @@ fn complete_synthetic_evidence_chain_reports_complete_evidence_without_erase_per
 
     let first_copy = directory.path().join("external-storage.iniza");
     let second_copy = directory.path().join("cloud-storage.iniza");
+    let external_storage =
+        SyntheticVerifiedCopyPersistence(VerifiedCopyStorageLocation::ExternalStorage);
+    let icloud_drive = SyntheticVerifiedCopyPersistence(VerifiedCopyStorageLocation::ICloudDrive);
     let first_copy_report = bundle_engine
-        .copy_verified(VerifiedCopyRequest::new(
-            &bundle,
-            &first_copy,
-            loaded.recovery_secret(),
-        ))
+        .copy_verified(
+            VerifiedCopyRequest::new(&bundle, &first_copy, loaded.recovery_secret())
+                .with_persistence(&external_storage),
+        )
         .expect("external-storage Verified Copy should complete");
     let second_copy_report = bundle_engine
-        .copy_verified(VerifiedCopyRequest::new(
-            &bundle,
-            &second_copy,
-            loaded.recovery_secret(),
-        ))
+        .copy_verified(
+            VerifiedCopyRequest::new(&bundle, &second_copy, loaded.recovery_secret())
+                .with_persistence(&icloud_drive),
+        )
         .expect("cloud-storage Verified Copy should complete");
     let restore_destination = directory.path().join("restore-rehearsal");
     let restore_report = RestoreEngine::local()
@@ -1443,36 +2230,22 @@ fn complete_synthetic_evidence_chain_reports_complete_evidence_without_erase_per
         ))
         .expect("safe Restore Rehearsal should complete");
 
-    let push_plan = directory.path().join("publication.push-plan");
-    let push_approval = directory.path().join("publication.push-approval");
-    let push_result = directory.path().join("publication.push-result");
-    let publication = PushPlanEngine::with_git_publication_process(LocalGitPublication);
-    let push_draft = publication
-        .draft(PushPlanDraftRequest::new(
-            &plan,
-            project_audit,
-            "origin",
-            &push_plan,
-        ))
-        .expect("ahead Project should produce a Push Plan");
-    publication
-        .approve(
-            PushPlanApprovalRequest::new(&push_plan, push_draft.approval_hash(), &push_approval)
-                .acknowledge_remote_side_effects(),
-        )
-        .expect("exact synthetic Push Plan should approve");
-    let push_execution = publication
-        .execute(PushPlanExecutionRequest::new(
-            &plan,
-            project_audit,
-            &push_plan,
-            &push_approval,
-            &push_result,
-        ))
-        .expect("exact synthetic publication should complete");
-
     let evidence_directory = directory.path().join("readiness-evidence");
-    let engine = ReadinessEvidenceEngine::with_git_publication_process(LocalGitPublication);
+    let engine = ReadinessEvidenceEngine::with_adapters(
+        LocalGitPublication,
+        SyntheticReadinessStorageLocations {
+            locations: BTreeMap::from([
+                (
+                    first_copy.clone(),
+                    VerifiedCopyStorageLocation::ExternalStorage,
+                ),
+                (
+                    second_copy.clone(),
+                    VerifiedCopyStorageLocation::ICloudDrive,
+                ),
+            ]),
+        },
+    );
     engine
         .initialize(ReadinessEvidenceInitializationRequest::new(
             &plan,
@@ -1494,23 +2267,23 @@ fn complete_synthetic_evidence_chain_reports_complete_evidence_without_erase_per
             &offline_receipt,
         ))
         .expect("Offline Recovery Key Receipt should append");
-    engine
+    let vaultwarden_record = engine
         .record_receipt(ReadinessReceiptRecordRequest::vaultwarden_recovery(
             &evidence_directory,
             &plan,
             vaultwarden_receipt,
         ))
         .expect("Vaultwarden Receipt should append");
-    for receipt in [first_copy_report.receipt(), second_copy_report.receipt()] {
+    for report in [&first_copy_report, &second_copy_report] {
         engine
             .record_receipt(ReadinessReceiptRecordRequest::verified_copy(
                 &evidence_directory,
                 &plan,
-                receipt,
+                report,
             ))
             .expect("Verified Copy Receipt should append");
     }
-    engine
+    let restore_record = engine
         .record_receipt(ReadinessReceiptRecordRequest::restore_rehearsal(
             &evidence_directory,
             &plan,
@@ -1524,21 +2297,14 @@ fn complete_synthetic_evidence_chain_reports_complete_evidence_without_erase_per
             &capsule_capture,
         ))
         .expect("Project Capsule capture should append");
-    engine
+    let capsule_rehearsal_record = engine
         .record_receipt(ReadinessReceiptRecordRequest::project_capsule_rehearsal(
             &evidence_directory,
             &plan,
             &capsule_rehearsal,
         ))
         .expect("Project Capsule rehearsal should append");
-    engine
-        .record_receipt(ReadinessReceiptRecordRequest::push_execution(
-            &evidence_directory,
-            &plan,
-            &push_execution,
-        ))
-        .expect("Push Plan execution should append");
-    engine
+    let not_protected_report = engine
         .record_receipt(ReadinessReceiptRecordRequest::not_protected_report(
             &evidence_directory,
             &plan,
@@ -1557,12 +2323,29 @@ fn complete_synthetic_evidence_chain_reports_complete_evidence_without_erase_per
     .into_iter()
     .enumerate()
     {
+        let evidence_reference = match claim_kind {
+            OwnerAttestationClaimKind::NotProtectedReportReviewed => {
+                not_protected_report.evidence_reference().to_owned()
+            }
+            OwnerAttestationClaimKind::RepresentativeRestoredProjectBuildCompleted => {
+                capsule_rehearsal_record.evidence_reference().to_owned()
+            }
+            OwnerAttestationClaimKind::SecondEnvironmentRehearsalCompleted => {
+                restore_record.evidence_reference().to_owned()
+            }
+            OwnerAttestationClaimKind::ReviewedExternalVaultwardenServiceConfirmed
+            | OwnerAttestationClaimKind::FreshDeviceVaultwardenAccessConfirmed
+            | OwnerAttestationClaimKind::IndependentMultiFactorRecoveryPathConfirmed => {
+                vaultwarden_record.evidence_reference().to_owned()
+            }
+            _ => format!("synthetic-evidence-{index}"),
+        };
         let review = engine
             .prepare_attestation(OwnerAttestationPreparationRequest::new(
                 &evidence_directory,
                 &plan,
                 claim_kind,
-                format!("synthetic-evidence-{index}"),
+                evidence_reference,
             ))
             .expect("fixed Owner Attestation should prepare");
         engine
@@ -1593,7 +2376,12 @@ fn complete_synthetic_evidence_chain_reports_complete_evidence_without_erase_per
                 .with_project_publication(project_audit),
         )
         .expect("complete synthetic evidence should revalidate");
-    assert_eq!(status.state(), ReadinessEvidenceState::CompleteEvidence);
+    assert_eq!(
+        status.state(),
+        ReadinessEvidenceState::CompleteEvidence,
+        "{}",
+        status.machine_json_result()
+    );
     assert_eq!(status.exit_code(), 0);
     assert_eq!(status.projects().len(), 1);
     assert_eq!(
@@ -1612,8 +2400,7 @@ fn complete_synthetic_evidence_chain_reports_complete_evidence_without_erase_per
     );
 }
 
-#[test]
-fn tampered_missing_or_incomplete_evidence_records_fail_closed() {
+fn three_record_evidence_store() -> (TestDirectory, Plan, PathBuf) {
     let directory = TestDirectory::new();
     let source = directory.path().join("synthetic-state");
     fs::create_dir(&source).expect("synthetic source should be created");
@@ -1641,6 +2428,12 @@ fn tampered_missing_or_incomplete_evidence_records_fail_closed() {
             ))
             .expect("synthetic Receipt should append");
     }
+    (directory, plan, evidence_directory)
+}
+
+#[test]
+fn tampered_evidence_record_fails_closed() {
+    let (directory, plan, evidence_directory) = three_record_evidence_store();
     let mut records = fs::read_dir(&evidence_directory)
         .expect("evidence records should enumerate")
         .map(|entry| entry.expect("evidence entry should be readable").path())
@@ -1658,7 +2451,7 @@ fn tampered_missing_or_incomplete_evidence_records_fail_closed() {
     tampered[changed_byte] = b'2';
     fs::write(&middle, &tampered).expect("synthetic record should be tampered");
     assert!(
-        engine
+        ReadinessEvidenceEngine::local()
             .status(ReadinessEvidenceStatusRequest::new(
                 &evidence_directory,
                 &plan,
@@ -1666,11 +2459,21 @@ fn tampered_missing_or_incomplete_evidence_records_fail_closed() {
             .is_err(),
         "tampered record bytes must block status"
     );
+    drop(directory);
+}
 
-    fs::write(&middle, &original).expect("synthetic record should be restored");
+#[test]
+fn missing_evidence_sequence_fails_closed() {
+    let (directory, plan, evidence_directory) = three_record_evidence_store();
+    let mut records = fs::read_dir(&evidence_directory)
+        .expect("evidence records should enumerate")
+        .map(|entry| entry.expect("evidence entry should be readable").path())
+        .collect::<Vec<_>>();
+    records.sort();
+    let middle = records[1].clone();
     fs::remove_file(&middle).expect("synthetic middle record should be removed");
     assert!(
-        engine
+        ReadinessEvidenceEngine::local()
             .status(ReadinessEvidenceStatusRequest::new(
                 &evidence_directory,
                 &plan,
@@ -1678,15 +2481,19 @@ fn tampered_missing_or_incomplete_evidence_records_fail_closed() {
             .is_err(),
         "missing sequence must block status"
     );
+    drop(directory);
+}
 
-    fs::write(&middle, &original).expect("synthetic middle record should be restored again");
+#[test]
+fn incomplete_evidence_candidate_fails_closed() {
+    let (directory, plan, evidence_directory) = three_record_evidence_store();
     fs::write(
         evidence_directory.join("interrupted.json.incomplete"),
         b"partial",
     )
     .expect("synthetic incomplete candidate should be written");
     assert!(
-        engine
+        ReadinessEvidenceEngine::local()
             .status(ReadinessEvidenceStatusRequest::new(
                 &evidence_directory,
                 &plan,
@@ -1694,6 +2501,7 @@ fn tampered_missing_or_incomplete_evidence_records_fail_closed() {
             .is_err(),
         "incomplete candidate must block status"
     );
+    drop(directory);
 }
 
 #[test]
@@ -1757,6 +2565,51 @@ fn contradictory_active_owner_attestations_remain_a_blocking_gap() {
 
 struct RejectCandidateCreation;
 
+struct SyntheticVerifiedCopyPersistence(VerifiedCopyStorageLocation);
+
+impl VerifiedCopyPersistence for SyntheticVerifiedCopyPersistence {
+    fn prepare_transition(
+        &self,
+        _transition: VerifiedCopyPersistenceTransition,
+    ) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn storage_location(
+        &self,
+        _source: &Path,
+        _destination: &Path,
+    ) -> std::io::Result<VerifiedCopyStorageLocation> {
+        Ok(self.0)
+    }
+}
+
+struct SyntheticReadinessStorageLocations {
+    locations: BTreeMap<PathBuf, VerifiedCopyStorageLocation>,
+}
+
+impl ReadinessEvidenceStorage for SyntheticReadinessStorageLocations {
+    fn prepare_transition(
+        &self,
+        _transition: ReadinessEvidenceStorageTransition,
+    ) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn verified_copy_storage_location(
+        &self,
+        _source: &Path,
+        destination: &Path,
+    ) -> std::io::Result<VerifiedCopyStorageLocation> {
+        self.locations.get(destination).copied().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "synthetic Verified Copy location was not registered",
+            )
+        })
+    }
+}
+
 impl ReadinessEvidenceStorage for RejectCandidateCreation {
     fn prepare_transition(
         &self,
@@ -1766,6 +2619,23 @@ impl ReadinessEvidenceStorage for RejectCandidateCreation {
             Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 "synthetic candidate creation failure",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+struct RejectStorageTransition(ReadinessEvidenceStorageTransition);
+
+impl ReadinessEvidenceStorage for RejectStorageTransition {
+    fn prepare_transition(
+        &self,
+        transition: ReadinessEvidenceStorageTransition,
+    ) -> std::io::Result<()> {
+        if transition == self.0 {
+            Err(std::io::Error::other(
+                "synthetic evidence storage transition failure",
             ))
         } else {
             Ok(())

@@ -28,7 +28,7 @@ pub use bundle::{
     PackRecoveryContext, PackReport, PackRequest, PackState, PackStopAction,
     VerifiedCopyCancellation, VerifiedCopyDurability, VerifiedCopyEvent, VerifiedCopyEventSink,
     VerifiedCopyPersistence, VerifiedCopyPersistenceTransition, VerifiedCopyReceipt,
-    VerifiedCopyReport, VerifiedCopyRequest, VerifyRequest,
+    VerifiedCopyReport, VerifiedCopyRequest, VerifiedCopyStorageLocation, VerifyRequest,
 };
 pub use iz1::{
     AuthenticatedBundleSummary, Iz1Prototype, RecoveryMethod, RecoverySecret, SealedBundle,

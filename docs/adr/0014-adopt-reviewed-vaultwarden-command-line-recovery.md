@@ -54,7 +54,7 @@ A failure before successful creation returns an error and claims no remote item.
 
 Only exact retrieval followed by complete Bundle authentication creates a `VaultwardenRecoveryReceipt`. The Receipt contains Bundle identity, Recovery Method identity, item identifier, server identity hash, and verification time. It excludes the secret, session, executable path, server address, account identifier, item name, location hint, Bundle path, and protected content.
 
-The connector hashes the configured Hypertext Transfer Protocol Secure server origin and account identifier with separate domains. It cannot prove physical hosting location, possession of an independent multi-factor recovery method, or a fresh-device sign-in. COKS-36 therefore also requires an explicit Owner Attestation after the owner independently confirms the external service, fresh-device access, and the independent multi-factor recovery path. COKS-39 later binds that attestation and the machine-verifiable Receipt into Readiness Evidence.
+The connector hashes the configured Hypertext Transfer Protocol Secure server origin and account identifier with separate domains. It cannot prove physical hosting location, possession of an independent multi-factor recovery method, or a fresh-device sign-in. COKS-36 therefore also requires an explicit Owner Attestation after the owner independently confirms the external service, fresh-device access, and the independent multi-factor recovery path. COKS-39 binds those attestations to the current machine-verifiable Vaultwarden Receipt in Readiness Evidence.
 
 ## Compatibility scope and remaining risks
 

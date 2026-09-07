@@ -80,7 +80,7 @@ The expectation binds the approved Plan and review hashes, stable Project identi
 - Project Capsules are larger than the Git-native prototype but have fewer format-specific reconstruction steps and no intermediate plaintext archive.
 - Exact local repository state can be protected even when there is no remote or publication is intentionally deferred.
 - A completed Project Capsule does not by itself make a Project Synchronized or make the machine safe to erase.
-- COKS-38 integrates the selected capture with approved Plans, verified Project audits, both Recovery Methods, and source-independent Restore Rehearsals. Durable authenticated Receipt persistence remains COKS-39.
+- COKS-38 integrates the selected capture with approved Plans, verified Project audits, both Recovery Methods, and source-independent Restore Rehearsals. COKS-39 provides durable authenticated Receipt persistence and revalidation.
 - Owner Dogfood still requires real Project selection, a real encrypted Bundle, verified independent copies, both Recovery Method rehearsals, and a successful Restore Rehearsal before any readiness conclusion.
 
 ## Owner decision

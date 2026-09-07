@@ -85,7 +85,7 @@ Passing tests automatically remove their temporary directories. Cargo build arti
 ## Known limitations
 
 - The supported command-line flow awaits secure Recovery Method loading in COKS-33 and COKS-36.
-- Receipt persistence and readiness aggregation await COKS-39.
+- COKS-39 provides Receipt persistence, current-artifact revalidation, and the external-storage plus iCloud Drive readiness requirement.
 - Cloud-placeholder behavior is represented by an injected unavailable-read boundary; provider-specific status reporting is not implemented.
 - Only exact-prefix partial replacement is supported. The implementation safely recopies into a new candidate rather than appending in place.
 - These tests use synthetic data and do not authorize Owner Dogfood, sole-copy use, or erasing the old Mac.

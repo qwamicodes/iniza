@@ -45,11 +45,11 @@ The version-one copy Receipt contains only:
 - whole-file digest; and
 - verification time as Unix seconds.
 
-Receipt persistence and aggregation into Readiness Evidence remain COKS-39. The supported command-line adapter must obtain a Recovery Method through the COKS-33 or COKS-36 secure storage flows; this issue does not add an unsafe argument, environment-variable, or ordinary-file secret transport merely to expose `iniza copy` early.
+Receipt persistence and aggregation into Readiness Evidence are provided by COKS-39. The supported command-line adapter must obtain a Recovery Method through the COKS-33 or COKS-36 secure storage flows; this issue does not add an unsafe argument, environment-variable, or ordinary-file secret transport merely to expose `iniza copy` early.
 
 ## Remaining gates
 
 - Recovery Method persistence and supported cross-process command-line use remain COKS-33 and COKS-36.
-- Receipt storage and readiness aggregation remain COKS-39.
+- The COKS-39 Readiness Evidence transaction stores and revalidates the typed Receipt.
 - Complete synthetic rehearsal, independent destination rehearsal, real Plan review, real Bundle capture, and Restore rehearsals remain mandatory.
 - Keep independent conventional copies until all Owner Dogfood evidence is reviewed. Iniza never grants permission to erase a machine.
