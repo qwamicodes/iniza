@@ -1756,6 +1756,7 @@ fn inspect_installed_bitwarden(path: &Path) -> Result<BitwardenInstallationObser
         .as_deref()
         .map(validate_trusted_executable)
         .transpose()?;
+    let home = trusted_user_home()?;
     let mut version_command = if let Some(interpreter) = &interpreter_path {
         let mut command = Command::new(interpreter);
         command.arg(path);
@@ -1766,6 +1767,7 @@ fn inspect_installed_bitwarden(path: &Path) -> Result<BitwardenInstallationObser
     let mut child = version_command
         .arg("--version")
         .env_clear()
+        .env("HOME", home)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

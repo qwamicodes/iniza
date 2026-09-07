@@ -100,12 +100,13 @@ The official client may prompt for the master password. Iniza does not receive t
 Run the adversarial process-output and session tests:
 
 ```sh
+cargo test --test vaultwarden_recovery production_installation_inspection_does_not_leave_the_client_without_a_home_directory -- --exact
 cargo test --test vaultwarden_recovery production_status_rejects_unknown_duplicate_and_oversized_output -- --exact
 cargo test --test vaultwarden_recovery production_get_rejects_extra_changed_and_duplicate_iniza_fields -- --exact
 cargo test --test vaultwarden_recovery non_base64_session_is_rejected_before_bitwarden_receives_it -- --exact
 ```
 
-Expect all three tests to pass. Hostile status output, oversized output, extra or duplicate Iniza fields, wrong hidden-field types, and invalid sessions fail closed without disclosure.
+Expect all four tests to pass. Installation inspection supplies only the verified user home instead of allowing the client to create configuration under the repository. Hostile status output, oversized output, extra or duplicate Iniza fields, wrong hidden-field types, and invalid sessions fail closed without disclosure.
 
 Prove post-creation containment and independent recovery:
 

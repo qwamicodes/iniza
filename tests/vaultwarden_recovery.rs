@@ -572,6 +572,71 @@ fn production_installation_inspection_binds_executable_interpreter_and_current_v
 
 #[cfg(unix)]
 #[test]
+fn production_installation_inspection_child_uses_verified_home_in_cleared_environment() {
+    let Some(root) = std::env::var_os("INIZA_SYNTHETIC_BITWARDEN_INSPECTION_CHILD") else {
+        return;
+    };
+    let directory = TestDirectory(PathBuf::from(root));
+    let executable = directory.path().join("bw");
+    let engine = VaultwardenRecoveryEngine::with_command_line(InstalledBitwarden::system());
+
+    engine
+        .inspect_installation(VaultwardenInstallationRequest::explicit(&executable))
+        .expect("installation inspection should use the verified user home");
+
+    std::mem::forget(directory);
+}
+
+#[cfg(unix)]
+#[test]
+fn production_installation_inspection_does_not_leave_the_client_without_a_home_directory() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = TestDirectory::new();
+    let executable = directory.path().join("bw");
+    fs::write(
+        &executable,
+        b"#!/bin/sh\n\
+if [ \"$1\" = \"--version\" ]; then\n\
+  [ -z \"${INIZA_SHOULD_NOT_LEAK+x}\" ] || exit 71\n\
+  printf '%s' \"${HOME-unset}\" > version-home\n\
+  printf '2026.8.0\\n'\n\
+  exit 0\n\
+fi\n\
+exit 72\n",
+    )
+    .unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    let hostile_home = directory.path().join("hostile-inherited-home");
+
+    let output = Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("production_installation_inspection_child_uses_verified_home_in_cleared_environment")
+        .arg("--nocapture")
+        .current_dir(directory.path())
+        .env(
+            "INIZA_SYNTHETIC_BITWARDEN_INSPECTION_CHILD",
+            directory.path(),
+        )
+        .env("INIZA_SHOULD_NOT_LEAK", "hostile inherited value")
+        .env("HOME", &hostile_home)
+        .output()
+        .unwrap();
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "child failed: {combined}");
+    let observed_home = fs::read_to_string(directory.path().join("version-home")).unwrap();
+    assert_ne!(observed_home, "unset");
+    assert_ne!(Path::new(&observed_home), hostile_home);
+    assert!(Path::new(&observed_home).is_absolute());
+}
+
+#[cfg(unix)]
+#[test]
 fn unsupported_bitwarden_version_returns_safe_upgrade_guidance() {
     use std::os::unix::fs::PermissionsExt;
 
