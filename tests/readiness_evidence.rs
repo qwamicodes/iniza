@@ -20,11 +20,11 @@ use iniza::{
     ProjectCapsuleEngine, ProjectCapsuleRehearsalRequest, ProjectCapsuleReviewRequest,
     PushPlanApprovalRequest, PushPlanDraftRequest, PushPlanEngine, PushPlanExecutionRequest,
     ReadinessEvidenceConclusion, ReadinessEvidenceEngine, ReadinessEvidenceInitializationRequest,
-    ReadinessEvidenceState, ReadinessEvidenceStatusRequest, ReadinessReceiptRecordRequest,
-    RecoveryMethod, RecoverySecret, RestoreEngine, RestoreRequest, ScanRequest,
-    VaultwardenInstallationRequest, VaultwardenItemIdentifier, VaultwardenLoadRequest,
-    VaultwardenPreflightRequest, VaultwardenRecoveryEngine, VaultwardenStoreRequest,
-    VerifiedCopyRequest, VerifyRequest,
+    ReadinessEvidenceState, ReadinessEvidenceStatusRequest, ReadinessEvidenceStorage,
+    ReadinessEvidenceStorageTransition, ReadinessReceiptRecordRequest, RecoveryMethod,
+    RecoverySecret, RestoreEngine, RestoreRequest, ScanRequest, VaultwardenInstallationRequest,
+    VaultwardenItemIdentifier, VaultwardenLoadRequest, VaultwardenPreflightRequest,
+    VaultwardenRecoveryEngine, VaultwardenStoreRequest, VerifiedCopyRequest, VerifyRequest,
 };
 use zeroize::Zeroizing;
 
@@ -1203,6 +1203,72 @@ fn complete_push_plan_execution_makes_only_the_project_synchronized() {
         status.projects()[0].synchronized(),
         ReadinessEvidenceConclusion::Current
     );
+}
+
+#[test]
+fn record_candidate_creation_failure_preserves_the_last_valid_evidence_chain() {
+    let directory = TestDirectory::new();
+    let source = directory.path().join("synthetic-state");
+    fs::create_dir(&source).expect("synthetic source should be created");
+    fs::write(source.join("settings.txt"), b"synthetic settings\n")
+        .expect("synthetic source should be written");
+    let mut plan = PlanEngine::local()
+        .scan(ScanRequest::for_directory(&source))
+        .expect("synthetic source should scan");
+    let plan_hash = plan.approval_hash().expect("Plan should have a hash");
+    plan.approve(&plan_hash)
+        .expect("exact reviewed hash should approve the Plan");
+    let evidence_directory = directory.path().join("readiness-evidence");
+    ReadinessEvidenceEngine::local()
+        .initialize(ReadinessEvidenceInitializationRequest::new(
+            &plan,
+            &evidence_directory,
+        ))
+        .expect("approved Plan should initialize a private evidence store");
+
+    let failed = ReadinessEvidenceEngine::with_storage(RejectCandidateCreation).record_receipt(
+        ReadinessReceiptRecordRequest::not_protected_report(&evidence_directory, &plan),
+    );
+    assert!(
+        failed.is_err(),
+        "injected creation failure must be returned"
+    );
+
+    let status = ReadinessEvidenceEngine::local()
+        .status(ReadinessEvidenceStatusRequest::new(
+            &evidence_directory,
+            &plan,
+        ))
+        .expect("last valid evidence chain should remain readable");
+    assert_eq!(
+        status.not_protected_report(),
+        ReadinessEvidenceConclusion::Missing
+    );
+    assert_eq!(
+        fs::read_dir(&evidence_directory)
+            .expect("evidence directory should remain readable")
+            .count(),
+        1,
+        "failed candidate creation must not add an evidence file"
+    );
+}
+
+struct RejectCandidateCreation;
+
+impl ReadinessEvidenceStorage for RejectCandidateCreation {
+    fn prepare_transition(
+        &self,
+        transition: ReadinessEvidenceStorageTransition,
+    ) -> std::io::Result<()> {
+        if transition == ReadinessEvidenceStorageTransition::CreateRecordCandidate {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "synthetic candidate creation failure",
+            ))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 struct LocalGitPublication;

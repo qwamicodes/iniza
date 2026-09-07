@@ -75,13 +75,14 @@ pub use push_plan::{
     PushPlanDraftRequest, PushPlanEngine, PushPlanExecutionRequest,
 };
 pub use readiness_evidence::{
-    OwnerAttestationClaimKind, OwnerAttestationConfirmationRequest,
+    LocalReadinessEvidenceStorage, OwnerAttestationClaimKind, OwnerAttestationConfirmationRequest,
     OwnerAttestationPreparationRequest, OwnerAttestationRecord, OwnerAttestationReview,
     OwnerAttestationStatus, OwnerAttestationWithdrawalRecord, OwnerAttestationWithdrawalRequest,
     ReadinessEvidenceConclusion, ReadinessEvidenceEngine, ReadinessEvidenceEvent,
     ReadinessEvidenceGap, ReadinessEvidenceInitializationRequest, ReadinessEvidenceState,
-    ReadinessEvidenceStatusReport, ReadinessEvidenceStatusRequest, ReadinessEvidenceStoreReport,
-    ReadinessProjectEvidence, ReadinessReceiptRecordReport, ReadinessReceiptRecordRequest,
+    ReadinessEvidenceStatusReport, ReadinessEvidenceStatusRequest, ReadinessEvidenceStorage,
+    ReadinessEvidenceStorageTransition, ReadinessEvidenceStoreReport, ReadinessProjectEvidence,
+    ReadinessReceiptRecordReport, ReadinessReceiptRecordRequest,
 };
 pub use restore::{
     RestoreCancellation, RestoreEngine, RestoreEvent, RestoreEventSink, RestoreReport,

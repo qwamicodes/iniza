@@ -793,26 +793,75 @@ impl OwnerAttestationWithdrawalRecord {
     }
 }
 
-#[derive(Debug)]
-pub struct ReadinessEvidenceEngine<G = InstalledGitPublication> {
-    git: G,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadinessEvidenceStorageTransition {
+    CreateRecordCandidate,
+    WriteRecordCandidate,
+    SynchronizeRecordCandidate,
+    PublishRecord,
+    RemoveRecordCandidate,
+    SynchronizeEvidenceDirectory,
 }
 
-impl ReadinessEvidenceEngine<InstalledGitPublication> {
+pub trait ReadinessEvidenceStorage: Send + Sync {
+    fn prepare_transition(
+        &self,
+        transition: ReadinessEvidenceStorageTransition,
+    ) -> std::io::Result<()>;
+}
+
+#[derive(Debug, Default)]
+pub struct LocalReadinessEvidenceStorage;
+
+impl ReadinessEvidenceStorage for LocalReadinessEvidenceStorage {
+    fn prepare_transition(
+        &self,
+        _transition: ReadinessEvidenceStorageTransition,
+    ) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub struct ReadinessEvidenceEngine<G = InstalledGitPublication, S = LocalReadinessEvidenceStorage> {
+    git: G,
+    storage: S,
+}
+
+impl ReadinessEvidenceEngine<InstalledGitPublication, LocalReadinessEvidenceStorage> {
     pub fn local() -> Self {
         Self {
             git: InstalledGitPublication::default(),
+            storage: LocalReadinessEvidenceStorage,
         }
     }
 }
 
-impl<G> ReadinessEvidenceEngine<G> {
+impl<G> ReadinessEvidenceEngine<G, LocalReadinessEvidenceStorage> {
     pub fn with_git_publication_process(git: G) -> Self {
-        Self { git }
+        Self {
+            git,
+            storage: LocalReadinessEvidenceStorage,
+        }
     }
 }
 
-impl<G: GitPublicationProcess> ReadinessEvidenceEngine<G> {
+impl<S> ReadinessEvidenceEngine<InstalledGitPublication, S> {
+    pub fn with_storage(storage: S) -> Self {
+        Self {
+            git: InstalledGitPublication::default(),
+            storage,
+        }
+    }
+}
+
+impl<G, S> ReadinessEvidenceEngine<G, S> {
+    pub fn with_adapters(git: G, storage: S) -> Self {
+        Self { git, storage }
+    }
+}
+
+impl<G: GitPublicationProcess, S: ReadinessEvidenceStorage> ReadinessEvidenceEngine<G, S> {
     pub fn initialize(
         &self,
         request: ReadinessEvidenceInitializationRequest<'_>,
@@ -844,7 +893,7 @@ impl<G: GitPublicationProcess> ReadinessEvidenceEngine<G> {
             },
         };
         let record = StoredRecord::new(content)?;
-        if let Err(error) = publish_record(&request.directory, &record) {
+        if let Err(error) = publish_record(&self.storage, &request.directory, &record) {
             let _ = fs::remove_dir(&request.directory);
             return Err(error);
         }
@@ -1031,7 +1080,7 @@ impl<G: GitPublicationProcess> ReadinessEvidenceEngine<G> {
             evidence,
         };
         let record = StoredRecord::new(content)?;
-        publish_record(&request.directory, &record)?;
+        publish_record(&self.storage, &request.directory, &record)?;
 
         Ok(ReadinessReceiptRecordReport {
             operation,
@@ -1598,7 +1647,11 @@ impl<G: GitPublicationProcess> ReadinessEvidenceEngine<G> {
                 owner_confirmed: true,
             },
         };
-        publish_record(&request.directory, &StoredRecord::new(content)?)?;
+        publish_record(
+            &self.storage,
+            &request.directory,
+            &StoredRecord::new(content)?,
+        )?;
 
         Ok(OwnerAttestationRecord {
             attestation_identifier,
@@ -1659,7 +1712,11 @@ impl<G: GitPublicationProcess> ReadinessEvidenceEngine<G> {
                 attestation_identifier: request.attestation_identifier.clone(),
             },
         };
-        publish_record(&request.directory, &StoredRecord::new(content)?)?;
+        publish_record(
+            &self.storage,
+            &request.directory,
+            &StoredRecord::new(content)?,
+        )?;
 
         Ok(OwnerAttestationWithdrawalRecord {
             attestation_identifier: request.attestation_identifier,
@@ -1962,7 +2019,11 @@ fn validate_new_store_path(directory: &Path) -> Result<(), CoreError> {
     Ok(())
 }
 
-fn publish_record(directory: &Path, record: &StoredRecord) -> Result<(), CoreError> {
+fn publish_record(
+    storage: &impl ReadinessEvidenceStorage,
+    directory: &Path,
+    record: &StoredRecord,
+) -> Result<(), CoreError> {
     let bytes = serde_json::to_vec(record)
         .map_err(|_| readiness_error("could not encode canonical evidence record"))?;
     if bytes.len() as u64 > MAX_RECORD_BYTES {
@@ -1978,21 +2039,53 @@ fn publish_record(directory: &Path, record: &StoredRecord) -> Result<(), CoreErr
     options.write(true).create_new(true);
     #[cfg(unix)]
     options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    prepare_storage_transition(
+        storage,
+        ReadinessEvidenceStorageTransition::CreateRecordCandidate,
+    )?;
     let mut candidate = options
         .open(&candidate_path)
         .map_err(|_| readiness_error("could not create exclusive evidence candidate"))?;
+    prepare_storage_transition(
+        storage,
+        ReadinessEvidenceStorageTransition::WriteRecordCandidate,
+    )?;
     candidate
         .write_all(&bytes)
-        .and_then(|_| candidate.sync_all())
-        .map_err(|_| readiness_error("could not persist evidence candidate"))?;
+        .map_err(|_| readiness_error("could not write evidence candidate"))?;
+    prepare_storage_transition(
+        storage,
+        ReadinessEvidenceStorageTransition::SynchronizeRecordCandidate,
+    )?;
+    candidate
+        .sync_all()
+        .map_err(|_| readiness_error("could not synchronize evidence candidate"))?;
+    prepare_storage_transition(storage, ReadinessEvidenceStorageTransition::PublishRecord)?;
     fs::hard_link(&candidate_path, &final_path)
         .map_err(|_| readiness_error("could not publish evidence record without overwrite"))?;
+    prepare_storage_transition(
+        storage,
+        ReadinessEvidenceStorageTransition::RemoveRecordCandidate,
+    )?;
     fs::remove_file(&candidate_path)
         .map_err(|_| readiness_error("could not remove published evidence candidate"))?;
+    prepare_storage_transition(
+        storage,
+        ReadinessEvidenceStorageTransition::SynchronizeEvidenceDirectory,
+    )?;
     File::open(directory)
         .and_then(|directory_file| directory_file.sync_all())
         .map_err(|_| readiness_error("could not synchronize evidence directory"))?;
     Ok(())
+}
+
+fn prepare_storage_transition(
+    storage: &impl ReadinessEvidenceStorage,
+    transition: ReadinessEvidenceStorageTransition,
+) -> Result<(), CoreError> {
+    storage
+        .prepare_transition(transition)
+        .map_err(|_| readiness_error("evidence storage transition failed"))
 }
 
 fn read_validated_records(directory: &Path) -> Result<Vec<StoredRecord>, CoreError> {
