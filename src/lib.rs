@@ -57,10 +57,10 @@ pub use project_capsule::{
     ProjectCapsuleComparisonRequest, ProjectCapsuleEngine, ProjectCapsuleExpectation,
     ProjectCapsuleIgnoredRecommendation, ProjectCapsuleIgnoredReview,
     ProjectCapsuleRehearsalReceipt, ProjectCapsuleRehearsalRequest, ProjectCapsuleRepresentation,
-    ProjectCapsuleReview, ProjectCapsuleReviewDecision, ProjectCapsuleReviewDecisionKind,
-    ProjectCapsuleReviewRequest, ProjectCapsuleSupportReport, ProjectCapsuleSupportedState,
-    ProjectCapsuleValidationReport, ProjectCapsuleValidationRequest, ProjectDatabaseExportReview,
-    ProjectDatabaseExportReviewRequest,
+    ProjectCapsuleRetryPolicy, ProjectCapsuleReview, ProjectCapsuleReviewDecision,
+    ProjectCapsuleReviewDecisionKind, ProjectCapsuleReviewRequest, ProjectCapsuleSupportReport,
+    ProjectCapsuleSupportedState, ProjectCapsuleValidationReport, ProjectCapsuleValidationRequest,
+    ProjectDatabaseExportReview, ProjectDatabaseExportReviewRequest,
 };
 pub use protection_candidates::{
     CandidatePortability, CandidateSensitivity, CandidateSourceKind, CandidateValidation,

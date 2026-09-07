@@ -9,14 +9,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::os::unix::fs::{PermissionsExt, symlink};
 
 use iniza::{
-    GitProcess, GitProcessOutput, InstalledGit, PlanEngine, ProjectAuditEngine,
-    ProjectAuditRequest, ProjectCapsuleBlockingFeature, ProjectCapsuleCaptureRequest,
-    ProjectCapsuleCaptureState, ProjectCapsuleComparisonRequest, ProjectCapsuleEngine,
-    ProjectCapsuleIgnoredRecommendation, ProjectCapsuleRehearsalRequest,
-    ProjectCapsuleRepresentation, ProjectCapsuleReview, ProjectCapsuleReviewDecision,
-    ProjectCapsuleReviewDecisionKind, ProjectCapsuleReviewRequest, ProjectCapsuleSupportedState,
-    ProjectCapsuleValidationRequest, ProjectDatabaseExportReviewRequest, RecoveryMethod,
-    RestoreEngine, RestoreRequest, ScanRequest,
+    BundleEngine, CoreError, GitProcess, GitProcessOutput, InspectRequest, InstalledGit,
+    PlanEngine, ProjectAuditEngine, ProjectAuditRequest, ProjectCapsuleBlockingFeature,
+    ProjectCapsuleCaptureRequest, ProjectCapsuleCaptureState, ProjectCapsuleComparisonRequest,
+    ProjectCapsuleEngine, ProjectCapsuleIgnoredRecommendation, ProjectCapsuleRehearsalRequest,
+    ProjectCapsuleRepresentation, ProjectCapsuleRetryPolicy, ProjectCapsuleReview,
+    ProjectCapsuleReviewDecision, ProjectCapsuleReviewDecisionKind, ProjectCapsuleReviewRequest,
+    ProjectCapsuleSupportedState, ProjectCapsuleValidationRequest,
+    ProjectDatabaseExportReviewRequest, RecoveryMethod, RestoreEngine, RestoreRequest, ScanRequest,
 };
 
 static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -201,6 +201,161 @@ fn project_capsule_review_reports_submodules_as_blocking_without_creating_a_bund
         !bundle.exists(),
         "read-only review must not create a Bundle"
     );
+}
+
+#[test]
+fn project_capsule_review_blocks_bare_repositories_and_linked_worktrees() {
+    let directory = TestDirectory::new("review-repository-shapes");
+    let source = directory.path.join("source-project");
+    let linked = directory.path.join("linked-worktree");
+    let bare = directory.path.join("bare-project.git");
+    fs::create_dir_all(&source).expect("source Project should be created");
+    git(&source, &["init", "-q", "--initial-branch=main"]);
+    fs::write(source.join("README.md"), "synthetic Project\n")
+        .expect("source fixture should be written");
+    git(&source, &["add", "README.md"]);
+    commit(&source, "Create source Project", "2026-01-01T00:00:00Z");
+    git(
+        &source,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "linked-review",
+            linked.to_str().expect("linked path should be text"),
+        ],
+    );
+    git(
+        &directory.path,
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            source.to_str().expect("source path should be text"),
+            bare.to_str().expect("bare path should be text"),
+        ],
+    );
+
+    for (project, expected) in [
+        (&bare, ProjectCapsuleBlockingFeature::BareRepository),
+        (&linked, ProjectCapsuleBlockingFeature::LinkedWorktree),
+    ] {
+        let mut plan = PlanEngine::local()
+            .scan(ScanRequest::for_directory(project))
+            .expect("unsupported Project shape should scan");
+        let plan_hash = plan.approval_hash().expect("Plan should hash");
+        plan.approve(&plan_hash).expect("exact Plan should approve");
+        let audit = ProjectAuditEngine::local()
+            .audit(ProjectAuditRequest::from_plan(&plan))
+            .expect("unsupported Project shape should audit without network access");
+        let project_audit = audit.projects().first().expect("Project should be present");
+
+        let review = ProjectCapsuleEngine::local()
+            .review(ProjectCapsuleReviewRequest::new(&plan, project_audit))
+            .expect("unsupported Project shape should remain reviewable");
+
+        assert!(review.support_report().blocks(expected));
+        assert!(!review.support_report().is_supported_for_capture());
+        assert!(!review.is_complete());
+    }
+}
+
+#[test]
+fn project_capsule_review_blocks_external_or_incomplete_repository_storage() {
+    let directory = TestDirectory::new("review-repository-storage");
+    let project = directory.path.join("owner-project");
+    let alternate = directory.path.join("alternate-project");
+    fs::create_dir_all(&project).expect("Project should be created");
+    git(&project, &["init", "-q", "--initial-branch=main"]);
+    fs::write(project.join("README.md"), "synthetic Project\n")
+        .expect("Project fixture should be written");
+    git(&project, &["add", "README.md"]);
+    commit(&project, "Create synthetic Project", "2026-01-01T00:00:00Z");
+    fs::create_dir_all(&alternate).expect("alternate Project should be created");
+    git(&alternate, &["init", "-q", "--initial-branch=main"]);
+    fs::create_dir_all(project.join(".git/objects/info"))
+        .expect("Git object information directory should exist");
+    fs::write(
+        project.join(".git/objects/info/alternates"),
+        format!("{}\n", alternate.join(".git/objects").display()),
+    )
+    .expect("object alternate should be configured");
+    fs::create_dir_all(project.join(".git/info")).expect("Git information directory should exist");
+    fs::write(project.join(".git/info/sparse-checkout"), "README.md\n")
+        .expect("sparse checkout should be configured");
+    git(&project, &["config", "core.sparseCheckout", "true"]);
+    git(&project, &["config", "extensions.partialClone", "origin"]);
+    git(&project, &["config", "remote.origin.promisor", "true"]);
+
+    let mut plan = PlanEngine::local()
+        .scan(ScanRequest::for_directory(&project))
+        .expect("Project storage state should scan");
+    let plan_hash = plan.approval_hash().expect("Plan should hash");
+    plan.approve(&plan_hash).expect("exact Plan should approve");
+    let audit = ProjectAuditEngine::local()
+        .audit(ProjectAuditRequest::from_plan(&plan))
+        .expect("Project storage state should audit without fetching");
+    let project_audit = audit.projects().first().expect("Project should be present");
+
+    let review = ProjectCapsuleEngine::local()
+        .review(ProjectCapsuleReviewRequest::new(&plan, project_audit))
+        .expect("unsupported storage state should remain reviewable");
+
+    for feature in [
+        ProjectCapsuleBlockingFeature::ObjectAlternates,
+        ProjectCapsuleBlockingFeature::SparseCheckout,
+        ProjectCapsuleBlockingFeature::PartialClone,
+        ProjectCapsuleBlockingFeature::PromisorObjects,
+    ] {
+        assert!(
+            review.support_report().blocks(feature),
+            "unsupported repository storage should be explicit: {feature:?}"
+        );
+    }
+    assert!(!review.is_complete());
+}
+
+#[test]
+fn project_capsule_review_blocks_active_locks_and_nonportable_names() {
+    let directory = TestDirectory::new("review-locks-and-names");
+    let project = directory.path.join("owner-project");
+    fs::create_dir_all(&project).expect("Project should be created");
+    git(&project, &["init", "-q", "--initial-branch=main"]);
+    fs::write(project.join("README.md"), "synthetic Project\n")
+        .expect("Project fixture should be written");
+    fs::write(project.join("not-portable?.txt"), "protected content\n")
+        .expect("nonportable fixture should be written");
+    git(&project, &["add", "README.md", "not-portable?.txt"]);
+    commit(&project, "Create synthetic Project", "2026-01-01T00:00:00Z");
+    fs::write(project.join(".git/index.lock"), b"synthetic lock evidence")
+        .expect("active Git lock should be created");
+
+    let mut plan = PlanEngine::local()
+        .scan(ScanRequest::for_directory(&project))
+        .expect("locked Project should scan read-only");
+    let plan_hash = plan.approval_hash().expect("Plan should hash");
+    plan.approve(&plan_hash).expect("exact Plan should approve");
+    let audit = ProjectAuditEngine::local()
+        .audit(ProjectAuditRequest::from_plan(&plan))
+        .expect("locked Project should audit read-only");
+    let project_audit = audit.projects().first().expect("Project should be present");
+
+    let review = ProjectCapsuleEngine::local()
+        .review(ProjectCapsuleReviewRequest::new(&plan, project_audit))
+        .expect("lock and name blockers should remain reviewable");
+
+    assert!(
+        review
+            .support_report()
+            .blocks(ProjectCapsuleBlockingFeature::ActiveGitLocks)
+    );
+    assert!(
+        review
+            .support_report()
+            .blocks(ProjectCapsuleBlockingFeature::NonportableFilesystemNames)
+    );
+    assert!(!review.is_complete());
 }
 
 #[cfg(unix)]
@@ -875,6 +1030,102 @@ fn project_capsule_capture_requires_the_exact_completed_review_hash() {
     assert!(!bundle.exists(), "a rejected review must create no Bundle");
 }
 
+#[test]
+fn project_capsule_capture_rejects_ignored_state_added_after_review() {
+    let directory = TestDirectory::new("stale-ignored-review");
+    let project = directory.path.join("owner-project");
+    let bundle = directory.path.join("project-capsule.iniza");
+    fs::create_dir_all(&project).expect("Project should be created");
+    git(&project, &["init", "-q", "--initial-branch=main"]);
+    fs::write(project.join(".gitignore"), "*.secret\n").expect("ignore rule should be written");
+    fs::write(project.join("README.md"), "synthetic Project\n")
+        .expect("tracked fixture should be written");
+    git(&project, &["add", ".gitignore", "README.md"]);
+    commit(&project, "Create synthetic Project", "2026-01-01T00:00:00Z");
+    let mut plan = PlanEngine::local()
+        .scan(ScanRequest::for_directory(&project))
+        .expect("Project Plan should scan");
+    let plan_hash = plan.approval_hash().expect("Plan should hash");
+    plan.approve(&plan_hash).expect("exact Plan should approve");
+    let audit = ProjectAuditEngine::local()
+        .audit(ProjectAuditRequest::from_plan(&plan))
+        .expect("Project should audit");
+    let project_audit = audit.projects().first().expect("Project should be present");
+    let engine = ProjectCapsuleEngine::local();
+    let review = engine
+        .review(ProjectCapsuleReviewRequest::new(&plan, project_audit))
+        .expect("initial review should complete");
+    assert!(review.is_complete());
+    fs::write(
+        project.join("appeared-after-review.secret"),
+        "SYNTHETIC SECRET\n",
+    )
+    .expect("late ignored state should be written");
+
+    let error = engine
+        .capture(ProjectCapsuleCaptureRequest::new(
+            &plan,
+            project_audit,
+            &review,
+            review.review_hash(),
+            &bundle,
+        ))
+        .expect_err("new ignored state must require a fresh review");
+
+    assert_eq!(
+        error.to_string(),
+        "Project Capsule capture requires a fresh ignored-state review"
+    );
+    assert!(!bundle.exists());
+}
+
+#[test]
+fn project_capsule_capture_rejects_repository_blocker_added_after_review() {
+    let directory = TestDirectory::new("stale-support-review");
+    let project = directory.path.join("owner-project");
+    let bundle = directory.path.join("project-capsule.iniza");
+    fs::create_dir_all(&project).expect("Project should be created");
+    git(&project, &["init", "-q", "--initial-branch=main"]);
+    fs::write(project.join("README.md"), "synthetic Project\n")
+        .expect("tracked fixture should be written");
+    git(&project, &["add", "README.md"]);
+    commit(&project, "Create synthetic Project", "2026-01-01T00:00:00Z");
+    let mut plan = PlanEngine::local()
+        .scan(ScanRequest::for_directory(&project))
+        .expect("Project Plan should scan");
+    let plan_hash = plan.approval_hash().expect("Plan should hash");
+    plan.approve(&plan_hash).expect("exact Plan should approve");
+    let audit = ProjectAuditEngine::local()
+        .audit(ProjectAuditRequest::from_plan(&plan))
+        .expect("Project should audit");
+    let project_audit = audit.projects().first().expect("Project should be present");
+    let engine = ProjectCapsuleEngine::local();
+    let review = engine
+        .review(ProjectCapsuleReviewRequest::new(&plan, project_audit))
+        .expect("initial support review should complete");
+    assert!(review.is_complete());
+    fs::create_dir_all(project.join(".git/info")).expect("Git information directory should exist");
+    fs::write(project.join(".git/info/sparse-checkout"), "README.md\n")
+        .expect("sparse checkout should be introduced after review");
+    git(&project, &["config", "core.sparseCheckout", "true"]);
+
+    let error = engine
+        .capture(ProjectCapsuleCaptureRequest::new(
+            &plan,
+            project_audit,
+            &review,
+            review.review_hash(),
+            &bundle,
+        ))
+        .expect_err("new repository blocker must require a fresh review");
+
+    assert_eq!(
+        error.to_string(),
+        "Project Capsule capture requires a fresh repository support review"
+    );
+    assert!(!bundle.exists());
+}
+
 #[cfg(unix)]
 #[test]
 fn reviewed_capture_encrypts_sensitive_state_and_excludes_reproducible_generated_state() {
@@ -961,6 +1212,91 @@ fn reviewed_capture_encrypts_sensitive_state_and_excludes_reproducible_generated
         !restore.join("node_modules/example/generated.js").exists(),
         "explicitly excluded reproducible generated state must not enter the Bundle"
     );
+}
+
+#[test]
+fn explicit_review_encrypts_each_sensitive_class_and_can_override_generated_exclusion() {
+    let directory = TestDirectory::new("reviewed-sensitive-classes");
+    let project = directory.path.join("owner-project");
+    let bundle = directory.path.join("project-capsule.iniza");
+    let restore = directory.path.join("restored-project");
+    fs::create_dir_all(project.join("uploads")).expect("upload directory should be created");
+    fs::create_dir_all(project.join("node_modules/example"))
+        .expect("generated directory should be created");
+    git(&project, &["init", "-q", "--initial-branch=main"]);
+    fs::write(
+        project.join(".gitignore"),
+        ".env.local\nowner-certificate.pem\nsettings.local.json\nuploads/\nnode_modules/\n",
+    )
+    .expect("sensitive ignore rules should be written");
+    fs::write(project.join("README.md"), "synthetic Project\n")
+        .expect("tracked fixture should be written");
+    git(&project, &["add", ".gitignore", "README.md"]);
+    commit(&project, "Create synthetic Project", "2026-01-01T00:00:00Z");
+    for (relative, content) in [
+        (".env.local", "SYNTHETIC_ENVIRONMENT=true\n"),
+        ("owner-certificate.pem", "SYNTHETIC CERTIFICATE\n"),
+        ("settings.local.json", "{\"synthetic\":true}\n"),
+        ("uploads/avatar.bin", "synthetic upload bytes\n"),
+        (
+            "node_modules/example/generated.js",
+            "synthetic generated dependency override\n",
+        ),
+    ] {
+        fs::write(project.join(relative), content).expect("ignored fixture should be written");
+    }
+    let mut plan = PlanEngine::local()
+        .scan(ScanRequest::for_directory(&project))
+        .expect("Project Plan should scan");
+    let plan_hash = plan.approval_hash().expect("Plan should hash");
+    plan.approve(&plan_hash).expect("exact Plan should approve");
+    let audit = ProjectAuditEngine::local()
+        .audit(ProjectAuditRequest::from_plan(&plan))
+        .expect("Project should audit");
+    let project_audit = audit.projects().first().expect("Project should be present");
+    assert!(project_audit.ignored_candidates().iter().any(|candidate| {
+        candidate.relative_path() == Path::new("node_modules/example/generated.js")
+            && candidate.review() == iniza::IgnoredReview::SuggestedExclusion
+    }));
+    let mut request = ProjectCapsuleReviewRequest::new(&plan, project_audit);
+    for candidate in project_audit.ignored_candidates() {
+        request = request.with_decision(
+            ProjectCapsuleReviewDecision::include_as_encrypted_reviewed_state(candidate.id()),
+        );
+    }
+    let engine = ProjectCapsuleEngine::local();
+    let review = engine
+        .review(request)
+        .expect("every sensitive class and generated override should be reviewable");
+    let capture = engine
+        .capture(ProjectCapsuleCaptureRequest::new(
+            &plan,
+            project_audit,
+            &review,
+            review.review_hash(),
+            &bundle,
+        ))
+        .expect("explicitly reviewed state should capture encrypted");
+    RestoreEngine::local()
+        .restore(RestoreRequest::new(
+            &bundle,
+            &restore,
+            capture.offline_recovery_key(),
+        ))
+        .expect("reviewed state should restore");
+
+    for relative in [
+        ".env.local",
+        "owner-certificate.pem",
+        "settings.local.json",
+        "uploads/avatar.bin",
+        "node_modules/example/generated.js",
+    ] {
+        assert!(
+            restore.join(relative).is_file(),
+            "explicitly reviewed state should restore: {relative}"
+        );
+    }
 }
 
 #[cfg(unix)]
@@ -1244,6 +1580,127 @@ fn verified_capture_rehearses_as_restorable_without_consulting_the_source_projec
     let visible = format!("{receipt:?}{}", receipt.machine_json_result());
     assert!(!visible.contains("owner-project"));
     assert!(!visible.contains(&directory.path.to_string_lossy().to_string()));
+}
+
+#[test]
+fn project_capsule_public_results_are_versioned_sanitized_and_honest() {
+    let directory = TestDirectory::new("sanitized-public-results");
+    let project = directory.path.join("private-owner-project-name");
+    let bundle = directory.path.join("project-capsule.iniza");
+    let second_bundle = directory.path.join("second-project-capsule.iniza");
+    let restore = directory.path.join("restored-project");
+    let mismatched_restore = directory.path.join("must-not-be-created");
+    fs::create_dir_all(&project).expect("Project should be created");
+    git(&project, &["init", "-q", "--initial-branch=main"]);
+    fs::write(project.join(".gitignore"), "private-owner-secret.pem\n")
+        .expect("ignore rule should be written");
+    fs::write(project.join("README.md"), "synthetic Project\n")
+        .expect("tracked fixture should be written");
+    git(&project, &["add", ".gitignore", "README.md"]);
+    commit(&project, "Create synthetic Project", "2026-01-01T00:00:00Z");
+    fs::write(
+        project.join("private-owner-secret.pem"),
+        "PROTECTED-CONTENT-MUST-NOT-APPEAR-IN-RESULTS\n",
+    )
+    .expect("reviewed protected fixture should be written");
+    let mut plan = PlanEngine::local()
+        .scan(ScanRequest::for_directory(&project))
+        .expect("Project Plan should scan");
+    let plan_hash = plan.approval_hash().expect("Plan should hash");
+    plan.approve(&plan_hash).expect("exact Plan should approve");
+    let audit = ProjectAuditEngine::local()
+        .audit(ProjectAuditRequest::from_plan(&plan))
+        .expect("Project should audit");
+    let project_audit = audit.projects().first().expect("Project should be present");
+    let candidate = project_audit
+        .ignored_candidates()
+        .first()
+        .expect("protected candidate should be present");
+    let engine = ProjectCapsuleEngine::local();
+    let review = engine
+        .review(
+            ProjectCapsuleReviewRequest::new(&plan, project_audit).with_decision(
+                ProjectCapsuleReviewDecision::include_as_encrypted_reviewed_state(candidate.id()),
+            ),
+        )
+        .expect("explicit encrypted-state review should complete");
+    let capture = engine
+        .capture(ProjectCapsuleCaptureRequest::new(
+            &plan,
+            project_audit,
+            &review,
+            review.review_hash(),
+            &bundle,
+        ))
+        .expect("reviewed Project should capture");
+    let receipt = engine
+        .rehearse(ProjectCapsuleRehearsalRequest::new(
+            &bundle,
+            capture
+                .expectation()
+                .expect("verified capture should have an expectation"),
+            capture.offline_recovery_key(),
+            &restore,
+        ))
+        .expect("source-independent rehearsal should complete");
+    let second_capture = engine
+        .capture(ProjectCapsuleCaptureRequest::new(
+            &plan,
+            project_audit,
+            &review,
+            review.review_hash(),
+            &second_bundle,
+        ))
+        .expect("independent Bundle should capture");
+    let mismatch = engine
+        .rehearse(ProjectCapsuleRehearsalRequest::new(
+            &second_bundle,
+            capture
+                .expectation()
+                .expect("first capture should have an expectation"),
+            second_capture.offline_recovery_key(),
+            &mismatched_restore,
+        ))
+        .expect_err("expectation copied from another Bundle must be rejected");
+    assert_eq!(
+        mismatch.to_string(),
+        "Project Capsule expectation does not belong to the selected Bundle"
+    );
+    assert!(!mismatched_restore.exists());
+
+    let machine_results = [
+        review.support_report().machine_json_result(),
+        review.machine_json_result(),
+        capture.machine_json_result(),
+        receipt.machine_json_result(),
+    ];
+    for result in &machine_results {
+        let value: serde_json::Value =
+            serde_json::from_str(result).expect("machine result should be valid JSON");
+        assert_eq!(value["schema_version"], 1);
+        assert!(!result.contains("private-owner-project-name"));
+        assert!(!result.contains("private-owner-secret.pem"));
+        assert!(!result.contains("PROTECTED-CONTENT"));
+        assert!(!result.contains("SYNCHRONIZED"));
+    }
+    for result in [
+        review.support_report().human_result(),
+        review.human_result(),
+        capture.human_result(),
+        receipt.human_result(),
+    ] {
+        assert!(!result.contains("private-owner-project-name"));
+        assert!(!result.contains("private-owner-secret.pem"));
+        assert!(!result.contains("PROTECTED-CONTENT"));
+    }
+    let capture_json: serde_json::Value =
+        serde_json::from_str(&capture.machine_json_result()).expect("capture JSON should parse");
+    let rehearsal_json: serde_json::Value =
+        serde_json::from_str(&receipt.machine_json_result()).expect("rehearsal JSON should parse");
+    assert_eq!(capture_json["data"]["synchronized"], "not-evaluated");
+    assert_eq!(capture_json["data"]["restore_rehearsal"], "not-performed");
+    assert_eq!(rehearsal_json["status"], "restorable");
+    assert_eq!(rehearsal_json["data"]["synchronized"], "not-evaluated");
 }
 
 #[cfg(unix)]
@@ -1534,7 +1991,7 @@ fn approved_verified_project_captures_directly_into_a_fully_verified_snapshot_bu
 
 #[cfg(unix)]
 #[test]
-fn production_capture_preserves_but_does_not_rely_on_a_bundle_when_the_project_changes() {
+fn exhausted_capture_retains_changed_evidence_without_publishing_a_final_bundle() {
     let directory = TestDirectory::new("production-capture-change");
     let project = directory.path.join("owner-project");
     let bundle = directory.path.join("project-capsule.iniza");
@@ -1576,14 +2033,96 @@ fn production_capture_preserves_but_does_not_rely_on_a_bundle_when_the_project_c
     assert!(!report.is_verified());
     assert_ne!(report.pre_capture_hash(), report.post_capture_hash());
     assert!(
-        bundle.is_file(),
-        "the encrypted evidence should be preserved"
+        !bundle.exists(),
+        "changed evidence must not use the requested final Bundle name"
+    );
+    assert_eq!(report.attempts(), 1);
+    assert_eq!(report.retained_changed_attempts(), 1);
+    assert!(
+        fs::read_dir(&directory.path)
+            .expect("attempt evidence should be inspectable")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .any(|path| path.extension().and_then(|value| value.to_str()) == Some("partial")),
+        "changed encrypted evidence should remain under an incomplete name"
     );
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&report.machine_json_result())
             .expect("capture result should be JSON")["status"],
         "changed-and-unverified"
     );
+}
+
+#[test]
+fn project_capsule_retry_policy_allows_only_one_to_three_total_attempts() {
+    assert!(ProjectCapsuleRetryPolicy::new(1).is_ok());
+    assert!(ProjectCapsuleRetryPolicy::new(3).is_ok());
+    assert!(ProjectCapsuleRetryPolicy::new(0).is_err());
+    assert!(ProjectCapsuleRetryPolicy::new(4).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn bounded_retry_retains_changed_evidence_and_publishes_only_an_unchanged_attempt() {
+    let directory = TestDirectory::new("production-capture-retry-success");
+    let project = directory.path.join("owner-project");
+    let bundle = directory.path.join("project-capsule.iniza");
+    create_dirty_project_fixture(
+        &project,
+        &directory.path.join("script-ran"),
+        &directory.path.join("hook-ran"),
+    );
+    retain_only_reviewed_environment_candidate(&project);
+    let mut plan = PlanEngine::local()
+        .scan(ScanRequest::for_directory(&project))
+        .expect("Project Plan should scan");
+    let reviewed_hash = plan.approval_hash().expect("Project Plan should hash");
+    plan.approve(&reviewed_hash)
+        .expect("exact reviewed hash should approve the Project Plan");
+    let audit = ProjectAuditEngine::local()
+        .audit(ProjectAuditRequest::from_plan(&plan))
+        .expect("approved Project should audit");
+    let project_audit = audit.projects().first().expect("Project should be audited");
+    let review = complete_encrypted_ignored_review(&plan, project_audit);
+    let git = PostPackMutatingGit {
+        installed: InstalledGit::default(),
+        project: project.clone(),
+        head_observations: AtomicUsize::new(0),
+    };
+    let retry_policy =
+        ProjectCapsuleRetryPolicy::new(2).expect("two total capture attempts should be permitted");
+
+    let report = ProjectCapsuleEngine::with_git_process(git)
+        .capture(
+            ProjectCapsuleCaptureRequest::new(
+                &plan,
+                project_audit,
+                &review,
+                review.review_hash(),
+                &bundle,
+            )
+            .with_reviewed_executable("scripts/rebuild.sh")
+            .with_retry_policy(retry_policy),
+        )
+        .expect("second unchanged attempt should complete capture");
+
+    assert!(report.is_verified());
+    assert_eq!(report.attempts(), 2);
+    assert_eq!(report.retained_changed_attempts(), 1);
+    assert!(bundle.is_file(), "only unchanged capture becomes final");
+    let retained = fs::read_dir(&directory.path)
+        .expect("attempt artifacts should be inspectable")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.extension().and_then(|value| value.to_str()) == Some("partial"))
+        .expect("changed attempt should remain under an incomplete name");
+    let error = BundleEngine::local()
+        .inspect(InspectRequest::new(
+            &retained,
+            report.offline_recovery_key(),
+        ))
+        .expect_err("ordinary Bundle inspection must reject changed attempt evidence");
+    assert!(matches!(error, CoreError::BundleIncomplete(path) if path == retained));
 }
 
 #[cfg(unix)]

@@ -10,6 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt, symlink};
 
 use sha2::{Digest, Sha256};
+use unicode_normalization::UnicodeNormalization;
 
 use crate::{
     BundleEngine, BundleVerification, CoreError, Disposition, GitProcess, IgnoredReview,
@@ -30,6 +31,28 @@ pub enum ProjectCapsuleCaptureState {
     ChangedAndUnverified,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProjectCapsuleRetryPolicy {
+    total_attempts: u8,
+}
+
+impl ProjectCapsuleRetryPolicy {
+    pub fn new(total_attempts: u8) -> Result<Self, CoreError> {
+        if !(1..=3).contains(&total_attempts) {
+            return Err(CoreError::InvalidPlan(
+                "Project Capsule capture allows one to three total attempts".to_owned(),
+            ));
+        }
+        Ok(Self { total_attempts })
+    }
+}
+
+impl Default for ProjectCapsuleRetryPolicy {
+    fn default() -> Self {
+        Self { total_attempts: 1 }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ProjectCapsuleSupportedState {
     AttachedCurrentState,
@@ -47,6 +70,14 @@ pub enum ProjectCapsuleSupportedState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ProjectCapsuleBlockingFeature {
     Submodules,
+    BareRepository,
+    LinkedWorktree,
+    ObjectAlternates,
+    SparseCheckout,
+    PartialClone,
+    PromisorObjects,
+    ActiveGitLocks,
+    NonportableFilesystemNames,
     IncompleteGitLargeFileStorage,
 }
 
@@ -78,6 +109,39 @@ impl ProjectCapsuleSupportReport {
 
     pub fn is_supported_for_capture(&self) -> bool {
         self.blocking_features.is_empty()
+    }
+
+    pub fn human_result(&self) -> String {
+        format!(
+            "Project Capsule support\n  state: {}\n  supported states: {}\n  blocking features: {}\n  local Git Large File Storage objects: {}",
+            if self.is_supported_for_capture() {
+                "Supported for capture"
+            } else {
+                "Blocked and Unverified"
+            },
+            self.supported_states.len(),
+            self.blocking_features.len(),
+            self.git_large_file_storage_objects.len(),
+        )
+    }
+
+    pub fn machine_json_result(&self) -> String {
+        serde_json::json!({
+            "schema_version": 1,
+            "command": "project capsule support",
+            "status": if self.is_supported_for_capture() { "supported" } else { "blocked" },
+            "data": {
+                "supported_for_capture": self.is_supported_for_capture(),
+                "supported_states": self.supported_states.iter().map(|state| project_capsule_supported_state_name(*state)).collect::<Vec<_>>(),
+                "blocking_features": self.blocking_features.iter().map(|feature| project_capsule_blocking_feature_name(*feature)).collect::<Vec<_>>(),
+                "git_large_file_storage_object_count": self.git_large_file_storage_objects.len(),
+                "restorable": "not-rehearsed",
+                "synchronized": "not-evaluated",
+            },
+            "warnings": [],
+            "errors": [],
+        })
+        .to_string()
     }
 }
 
@@ -281,6 +345,61 @@ impl ProjectCapsuleReview {
                 .iter()
                 .all(|candidate| candidate.decision.is_some())
     }
+
+    pub fn human_result(&self) -> String {
+        let decided = self
+            .ignored_candidates
+            .iter()
+            .filter(|candidate| candidate.decision.is_some())
+            .count();
+        format!(
+            "Project Capsule review\n  state: {}\n  Project: {}\n  review hash: {}\n  ignored decisions: {}/{}\n  blocking features: {}\n  next action: {}",
+            if self.is_complete() {
+                "Complete for capture"
+            } else {
+                "Blocked and Unverified"
+            },
+            self.project_id,
+            self.review_hash,
+            decided,
+            self.ignored_candidates.len(),
+            self.support_report.blocking_features.len(),
+            if self.is_complete() {
+                "capture with this exact review hash"
+            } else {
+                "resolve every decision and blocking feature, then review again"
+            },
+        )
+    }
+
+    pub fn machine_json_result(&self) -> String {
+        let decided = self
+            .ignored_candidates
+            .iter()
+            .filter(|candidate| candidate.decision.is_some())
+            .count();
+        serde_json::json!({
+            "schema_version": 1,
+            "command": "project capsule review",
+            "status": if self.is_complete() { "complete" } else { "blocked" },
+            "data": {
+                "project_id": self.project_id,
+                "plan_hash": self.plan_hash,
+                "review_hash": self.review_hash,
+                "supported_for_capture": self.support_report.is_supported_for_capture(),
+                "supported_state_count": self.support_report.supported_states.len(),
+                "blocking_feature_count": self.support_report.blocking_features.len(),
+                "ignored_candidate_count": self.ignored_candidates.len(),
+                "decided_ignored_candidate_count": decided,
+                "database_export_evidence": database_export_evidence_count(self),
+                "restorable": "not-rehearsed",
+                "synchronized": "not-evaluated",
+            },
+            "warnings": [],
+            "errors": [],
+        })
+        .to_string()
+    }
 }
 
 pub struct ProjectCapsuleCaptureRequest<'a> {
@@ -290,6 +409,7 @@ pub struct ProjectCapsuleCaptureRequest<'a> {
     review_hash: String,
     destination: PathBuf,
     reviewed_executables: Vec<PathBuf>,
+    retry_policy: ProjectCapsuleRetryPolicy,
 }
 
 impl<'a> ProjectCapsuleCaptureRequest<'a> {
@@ -307,11 +427,17 @@ impl<'a> ProjectCapsuleCaptureRequest<'a> {
             review_hash: review_hash.into(),
             destination: destination.into(),
             reviewed_executables: Vec::new(),
+            retry_policy: ProjectCapsuleRetryPolicy::default(),
         }
     }
 
     pub fn with_reviewed_executable(mut self, path: impl Into<PathBuf>) -> Self {
         self.reviewed_executables.push(path.into());
+        self
+    }
+
+    pub fn with_retry_policy(mut self, retry_policy: ProjectCapsuleRetryPolicy) -> Self {
+        self.retry_policy = retry_policy;
         self
     }
 }
@@ -324,6 +450,8 @@ pub struct ProjectCapsuleCaptureReport {
     verification: BundleVerification,
     pack: PackReport,
     expectation: Option<ProjectCapsuleExpectation>,
+    attempts: u8,
+    retained_changed_attempts: u8,
 }
 
 impl fmt::Debug for ProjectCapsuleCaptureReport {
@@ -344,6 +472,8 @@ impl fmt::Debug for ProjectCapsuleCaptureReport {
                 &self.verification.authenticated_bytes,
             )
             .field("pack_state", &self.pack.state())
+            .field("attempts", &self.attempts)
+            .field("retained_changed_attempts", &self.retained_changed_attempts)
             .finish()
     }
 }
@@ -393,13 +523,23 @@ impl ProjectCapsuleCaptureReport {
         self.expectation.as_ref()
     }
 
+    pub fn attempts(&self) -> u8 {
+        self.attempts
+    }
+
+    pub fn retained_changed_attempts(&self) -> u8 {
+        self.retained_changed_attempts
+    }
+
     pub fn human_result(&self) -> String {
         format!(
-            "Project Capsule capture\n  state: {}\n  representation: full-repository-snapshot\n  encrypted Bundle: {} bytes\n  authenticated Project: {} bytes\n  next action: {}",
+            "Project Capsule capture\n  state: {}\n  representation: full-repository-snapshot\n  attempts: {}\n  retained changed attempts: {}\n  encrypted Bundle: {} bytes\n  authenticated Project: {} bytes\n  next action: {}",
             match self.state {
                 ProjectCapsuleCaptureState::Verified => "Verified",
                 ProjectCapsuleCaptureState::ChangedAndUnverified => "Changed and Unverified",
             },
+            self.attempts,
+            self.retained_changed_attempts,
             self.bundle_bytes,
             self.verification.authenticated_bytes,
             if self.state == ProjectCapsuleCaptureState::Verified {
@@ -424,6 +564,8 @@ impl ProjectCapsuleCaptureReport {
                     ProjectCapsuleCaptureState::ChangedAndUnverified => "changed-and-unverified",
                 },
                 "representation": "full-repository-snapshot",
+                "attempts": self.attempts,
+                "retained_changed_attempts": self.retained_changed_attempts,
                 "bundle_identity": self.verification.bundle_identity(),
                 "encrypted_bundle_bytes": self.bundle_bytes,
                 "authenticated_project_bytes": self.verification.authenticated_bytes,
@@ -556,6 +698,24 @@ impl ProjectCapsuleRehearsalReceipt {
         false
     }
 
+    pub fn human_result(&self) -> String {
+        format!(
+            "Project Capsule Restore Rehearsal\n  state: {}\n  Recovery Method: {}\n  Project: {}\n  validation findings: {}\n  database export evidence: {}\n  database consistency: not automatically verified\n  Synchronized: not evaluated",
+            if self.restorable {
+                "Restorable"
+            } else {
+                "Unverified"
+            },
+            match self.recovery_method {
+                RecoveryMethod::Vaultwarden => "Vaultwarden Recovery Secret",
+                RecoveryMethod::Offline => "Offline Recovery Key",
+            },
+            self.project_id,
+            self.validation.findings().len(),
+            self.database_export_evidence,
+        )
+    }
+
     pub fn machine_json_result(&self) -> String {
         serde_json::json!({
             "schema_version": 1,
@@ -569,6 +729,7 @@ impl ProjectCapsuleRehearsalReceipt {
                     RecoveryMethod::Offline => "offline",
                 },
                 "restorable": self.restorable,
+                "synchronized": "not-evaluated",
                 "database_export_evidence": self.database_export_evidence,
                 "database_consistency_automatically_verified": false,
                 "validation_findings": self.validation.findings(),
@@ -875,6 +1036,40 @@ fn representation_name(representation: ProjectCapsuleRepresentation) -> &'static
     }
 }
 
+fn project_capsule_supported_state_name(state: ProjectCapsuleSupportedState) -> &'static str {
+    match state {
+        ProjectCapsuleSupportedState::AttachedCurrentState => "attached-current-state",
+        ProjectCapsuleSupportedState::DetachedCurrentState => "detached-current-state",
+        ProjectCapsuleSupportedState::Stashes => "stashes",
+        ProjectCapsuleSupportedState::LocalOnlyBranches => "local-only-branches",
+        ProjectCapsuleSupportedState::LocalOnlyTags => "local-only-tags",
+        ProjectCapsuleSupportedState::StagedChanges => "staged-changes",
+        ProjectCapsuleSupportedState::UnstagedChanges => "unstaged-changes",
+        ProjectCapsuleSupportedState::UntrackedItems => "untracked-items",
+        ProjectCapsuleSupportedState::RepositoryWithoutRemote => "repository-without-remote",
+        ProjectCapsuleSupportedState::LocallyCompleteGitLargeFileStorage => {
+            "locally-complete-git-large-file-storage"
+        }
+    }
+}
+
+fn project_capsule_blocking_feature_name(feature: ProjectCapsuleBlockingFeature) -> &'static str {
+    match feature {
+        ProjectCapsuleBlockingFeature::Submodules => "submodules",
+        ProjectCapsuleBlockingFeature::BareRepository => "bare-repository",
+        ProjectCapsuleBlockingFeature::LinkedWorktree => "linked-worktree",
+        ProjectCapsuleBlockingFeature::ObjectAlternates => "object-alternates",
+        ProjectCapsuleBlockingFeature::SparseCheckout => "sparse-checkout",
+        ProjectCapsuleBlockingFeature::PartialClone => "partial-clone",
+        ProjectCapsuleBlockingFeature::PromisorObjects => "promisor-objects",
+        ProjectCapsuleBlockingFeature::ActiveGitLocks => "active-git-locks",
+        ProjectCapsuleBlockingFeature::NonportableFilesystemNames => "nonportable-filesystem-names",
+        ProjectCapsuleBlockingFeature::IncompleteGitLargeFileStorage => {
+            "incomplete-git-large-file-storage"
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct ProjectCapsuleEngine<G = InstalledGit> {
     git: G,
@@ -1016,6 +1211,21 @@ impl<G: GitProcess> ProjectCapsuleEngine<G> {
         }
         let mut blocking_features = BTreeSet::new();
         let mut git_large_file_storage_objects = Vec::new();
+        match request.project.kind() {
+            ProjectKind::WorkingTree => {}
+            ProjectKind::BareRepository => {
+                blocking_features.insert(ProjectCapsuleBlockingFeature::BareRepository);
+            }
+            ProjectKind::Submodule => {
+                blocking_features.insert(ProjectCapsuleBlockingFeature::LinkedWorktree);
+            }
+        }
+        if request.project.kind() == ProjectKind::WorkingTree {
+            blocking_features.extend(working_tree_blocking_features(
+                &self.git,
+                request.project.root(),
+            )?);
+        }
         if !request.project.submodules().is_empty() {
             blocking_features.insert(ProjectCapsuleBlockingFeature::Submodules);
         }
@@ -1149,60 +1359,101 @@ impl<G: GitProcess> ProjectCapsuleEngine<G> {
         validate_capture_request(&self.git, &mut request)?;
         let root = request.project.root();
         let reviewed_ignored_paths = included_reviewed_ignored_paths(request.review);
-        let expected = observe_project(&self.git, root, &reviewed_ignored_paths)?;
         let excluded_ignored = unreviewed_ignored_paths(&self.git, root, &reviewed_ignored_paths)?;
         let capsule_plan = approved_capsule_plan(root, &excluded_ignored)?;
         let engine = BundleEngine::local();
-        let pack = engine.pack(PackRequest::new(&capsule_plan, &request.destination))?;
-        let verification = engine.verify(VerifyRequest::new(
-            &request.destination,
-            pack.offline_recovery_key(),
-        ))?;
-        let post_capture_hash = observe_project(&self.git, root, &reviewed_ignored_paths)?.digest;
-        let state = if expected.digest == post_capture_hash {
-            ProjectCapsuleCaptureState::Verified
-        } else {
-            ProjectCapsuleCaptureState::ChangedAndUnverified
-        };
-        let expectation = if state == ProjectCapsuleCaptureState::Verified {
-            let reviewed_executable_modes =
-                reviewed_executable_modes(request.project.root(), &request.reviewed_executables)?;
-            let required_executable_mode_review_hash = executable_expectation_review_hash(
-                request.project.id(),
-                &request.review_hash,
-                verification.bundle_identity(),
-                &expected,
-                &reviewed_executable_modes,
-            );
-            Some(ProjectCapsuleExpectation {
-                project_id: request.project.id().to_owned(),
-                plan_hash: request.plan.approval_hash()?,
-                review_hash: request.review_hash.clone(),
-                bundle_identity: verification.bundle_identity().to_owned(),
-                captured_unix_seconds: project_capsule_unix_time_now()?,
-                observation: expected.clone(),
-                reviewed_ignored_paths,
-                reviewed_executable_modes,
-                required_executable_mode_review_hash,
-                git_large_file_storage_objects: request
-                    .review
-                    .support_report
-                    .git_large_file_storage_objects
-                    .clone(),
-                database_export_evidence: database_export_evidence_count(request.review),
-            })
-        } else {
-            None
-        };
-        Ok(ProjectCapsuleCaptureReport {
-            state,
-            pre_capture_hash: expected.digest,
-            post_capture_hash,
-            bundle_bytes: file_len(&request.destination)?,
-            verification,
-            pack,
-            expectation,
-        })
+        let mut recovery_owner = None::<PackReport>;
+        let mut retained_changed_attempts = 0_u8;
+        for attempt in 1..=request.retry_policy.total_attempts {
+            let attempt_path = project_capsule_attempt_path(&request.destination, attempt)?;
+            let retained_path = retained_project_capsule_attempt_path(&attempt_path);
+            if attempt_path.exists() || retained_path.exists() {
+                return Err(CoreError::DestinationAlreadyExists(
+                    if attempt_path.exists() {
+                        attempt_path
+                    } else {
+                        retained_path
+                    },
+                ));
+            }
+            let expected = observe_project(&self.git, root, &reviewed_ignored_paths)?;
+            let pack = if let Some(owner) = recovery_owner.as_ref() {
+                engine.pack(
+                    PackRequest::new(&capsule_plan, &attempt_path)
+                        .with_recovery_context(owner.recovery_context()),
+                )?
+            } else {
+                engine.pack(PackRequest::new(&capsule_plan, &attempt_path))?
+            };
+            let verification = engine.verify(VerifyRequest::new(
+                &attempt_path,
+                pack.offline_recovery_key(),
+            ))?;
+            let bundle_bytes = file_len(&attempt_path)?;
+            let post_capture_hash =
+                observe_project(&self.git, root, &reviewed_ignored_paths)?.digest;
+            if expected.digest == post_capture_hash {
+                publish_project_capsule_attempt(&attempt_path, &request.destination)?;
+                let reviewed_executable_modes = reviewed_executable_modes(
+                    request.project.root(),
+                    &request.reviewed_executables,
+                )?;
+                let required_executable_mode_review_hash = executable_expectation_review_hash(
+                    request.project.id(),
+                    &request.review_hash,
+                    verification.bundle_identity(),
+                    &expected,
+                    &reviewed_executable_modes,
+                );
+                let expectation = ProjectCapsuleExpectation {
+                    project_id: request.project.id().to_owned(),
+                    plan_hash: request.plan.approval_hash()?,
+                    review_hash: request.review_hash.clone(),
+                    bundle_identity: verification.bundle_identity().to_owned(),
+                    captured_unix_seconds: project_capsule_unix_time_now()?,
+                    observation: expected.clone(),
+                    reviewed_ignored_paths: reviewed_ignored_paths.clone(),
+                    reviewed_executable_modes,
+                    required_executable_mode_review_hash,
+                    git_large_file_storage_objects: request
+                        .review
+                        .support_report
+                        .git_large_file_storage_objects
+                        .clone(),
+                    database_export_evidence: database_export_evidence_count(request.review),
+                };
+                return Ok(ProjectCapsuleCaptureReport {
+                    state: ProjectCapsuleCaptureState::Verified,
+                    pre_capture_hash: expected.digest,
+                    post_capture_hash,
+                    bundle_bytes,
+                    verification,
+                    pack,
+                    expectation: Some(expectation),
+                    attempts: attempt,
+                    retained_changed_attempts,
+                });
+            }
+            retain_changed_project_capsule_attempt(&attempt_path, &retained_path)?;
+            retained_changed_attempts = retained_changed_attempts.saturating_add(1);
+            if attempt == request.retry_policy.total_attempts {
+                return Ok(ProjectCapsuleCaptureReport {
+                    state: ProjectCapsuleCaptureState::ChangedAndUnverified,
+                    pre_capture_hash: expected.digest,
+                    post_capture_hash,
+                    bundle_bytes,
+                    verification,
+                    pack,
+                    expectation: None,
+                    attempts: attempt,
+                    retained_changed_attempts,
+                });
+            }
+            if recovery_owner.is_none() {
+                recovery_owner = Some(pack);
+            }
+        }
+        unreachable!("Project Capsule retry policy always permits at least one attempt")
     }
 
     pub fn rehearse(
@@ -1952,6 +2203,22 @@ fn validate_capture_request(
         ));
     }
     let root = request.project.root();
+    let audited_ignored_paths = request
+        .project
+        .ignored_candidates()
+        .iter()
+        .map(|candidate| candidate.relative_path().to_path_buf())
+        .collect::<BTreeSet<_>>();
+    if ignored_paths(git, root)? != audited_ignored_paths {
+        return Err(CoreError::InvalidPlan(
+            "Project Capsule capture requires a fresh ignored-state review".to_owned(),
+        ));
+    }
+    if !working_tree_blocking_features(git, root)?.is_empty() {
+        return Err(CoreError::InvalidPlan(
+            "Project Capsule capture requires a fresh repository support review".to_owned(),
+        ));
+    }
     let current_audit_hash =
         crate::project_audit::observe_local_repository_hash(git, root, request.project.kind())
             .ok_or_else(|| {
@@ -2388,6 +2655,122 @@ fn repository_has_active_lock(git_directory: &Path) -> io::Result<bool> {
         }
     }
     Ok(false)
+}
+
+fn working_tree_blocking_features(
+    git: &impl GitProcess,
+    root: &Path,
+) -> Result<BTreeSet<ProjectCapsuleBlockingFeature>, CoreError> {
+    let mut features = BTreeSet::new();
+    if root.join(".git/objects/info/alternates").exists() {
+        features.insert(ProjectCapsuleBlockingFeature::ObjectAlternates);
+    }
+    if root.join(".git/worktrees").exists() {
+        features.insert(ProjectCapsuleBlockingFeature::LinkedWorktree);
+    }
+    if root.join(".git/info/sparse-checkout").exists()
+        || git_optional_text(
+            git,
+            root,
+            &["config", "--local", "--get", "core.sparseCheckout"],
+            "inspect sparse-checkout configuration",
+        )?
+        .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+    {
+        features.insert(ProjectCapsuleBlockingFeature::SparseCheckout);
+    }
+    if git_optional_text(
+        git,
+        root,
+        &["config", "--local", "--get", "extensions.partialClone"],
+        "inspect partial-clone configuration",
+    )?
+    .is_some()
+    {
+        features.insert(ProjectCapsuleBlockingFeature::PartialClone);
+    }
+    if git_optional_text(
+        git,
+        root,
+        &[
+            "config",
+            "--local",
+            "--get-regexp",
+            "^remote\\..*\\.promisor$",
+        ],
+        "inspect promisor-object configuration",
+    )?
+    .is_some()
+    {
+        features.insert(ProjectCapsuleBlockingFeature::PromisorObjects);
+    }
+    if repository_has_active_lock(&root.join(".git")).map_err(|_| {
+        CoreError::InvalidPlan("Project Capsule could not verify repository lock state".to_owned())
+    })? {
+        features.insert(ProjectCapsuleBlockingFeature::ActiveGitLocks);
+    }
+    if repository_has_nonportable_names(root)? {
+        features.insert(ProjectCapsuleBlockingFeature::NonportableFilesystemNames);
+    }
+    Ok(features)
+}
+
+fn repository_has_nonportable_names(root: &Path) -> Result<bool, CoreError> {
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let mut portable_names = BTreeSet::<String>::new();
+        for entry in fs::read_dir(&directory).map_err(|source| CoreError::Io {
+            action: "inspect Project names for portable capture",
+            path: directory.clone(),
+            source,
+        })? {
+            let entry = entry.map_err(|source| CoreError::Io {
+                action: "inspect Project name for portable capture",
+                path: directory.clone(),
+                source,
+            })?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                return Ok(true);
+            };
+            if !is_portable_project_name(&name)
+                || !portable_names
+                    .insert(name.nfc().flat_map(char::to_lowercase).collect::<String>())
+            {
+                return Ok(true);
+            }
+            let metadata = fs::symlink_metadata(entry.path()).map_err(|source| CoreError::Io {
+                action: "inspect Project entry for portable capture",
+                path: entry.path(),
+                source,
+            })?;
+            if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                pending.push(entry.path());
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn is_portable_project_name(name: &str) -> bool {
+    if name.is_empty()
+        || name.len() > 255
+        || name.ends_with(['.', ' '])
+        || name
+            .chars()
+            .any(|character| character.is_control() || "<>:\"\\|?*".contains(character))
+    {
+        return false;
+    }
+    let base = name
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches(' ')
+        .to_ascii_uppercase();
+    !matches!(base.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        && !(base.len() == 4
+            && (base.starts_with("COM") || base.starts_with("LPT"))
+            && matches!(base.as_bytes()[3], b'1'..=b'9'))
 }
 
 fn validate_reviewed_paths(
@@ -3115,6 +3498,59 @@ fn sorted_entries(directory: &Path) -> Result<Vec<fs::DirEntry>, CoreError> {
         })?;
     entries.sort_by_key(|entry| entry.file_name());
     Ok(entries)
+}
+
+fn project_capsule_attempt_path(destination: &Path, attempt: u8) -> Result<PathBuf, CoreError> {
+    let file_name = destination.file_name().ok_or_else(|| {
+        CoreError::InvalidPlan("Project Capsule destination must have a file name".to_owned())
+    })?;
+    let mut attempt_name = file_name.to_os_string();
+    attempt_name.push(format!(".project-capsule-attempt-{attempt}.iniza"));
+    Ok(destination.with_file_name(attempt_name))
+}
+
+fn retained_project_capsule_attempt_path(attempt: &Path) -> PathBuf {
+    let mut retained = attempt.as_os_str().to_os_string();
+    retained.push(".partial");
+    PathBuf::from(retained)
+}
+
+fn publish_project_capsule_attempt(source: &Path, destination: &Path) -> Result<(), CoreError> {
+    fs::hard_link(source, destination).map_err(|source_error| {
+        if source_error.kind() == io::ErrorKind::AlreadyExists {
+            CoreError::DestinationAlreadyExists(destination.to_path_buf())
+        } else {
+            CoreError::Io {
+                action: "publish verified Project Capsule attempt",
+                path: destination.to_path_buf(),
+                source: source_error,
+            }
+        }
+    })?;
+    fs::remove_file(source).map_err(|source_error| CoreError::Io {
+        action: "remove published Project Capsule attempt name",
+        path: source.to_path_buf(),
+        source: source_error,
+    })
+}
+
+fn retain_changed_project_capsule_attempt(source: &Path, retained: &Path) -> Result<(), CoreError> {
+    fs::hard_link(source, retained).map_err(|source_error| {
+        if source_error.kind() == io::ErrorKind::AlreadyExists {
+            CoreError::DestinationAlreadyExists(retained.to_path_buf())
+        } else {
+            CoreError::Io {
+                action: "retain changed Project Capsule attempt",
+                path: retained.to_path_buf(),
+                source: source_error,
+            }
+        }
+    })?;
+    fs::remove_file(source).map_err(|source_error| CoreError::Io {
+        action: "remove completed changed-attempt Bundle name",
+        path: source.to_path_buf(),
+        source: source_error,
+    })
 }
 
 fn file_len(path: &Path) -> Result<u64, CoreError> {
