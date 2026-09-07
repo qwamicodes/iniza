@@ -1,6 +1,6 @@
 # COKS-36 Vaultwarden Recovery Secret interface comparison
 
-- Status: Proposed for owner confirmation; no behavior test or implementation has started
+- Status: All ten public seams confirmed; synthetic and production-adapter implementation verified; real owner-service rehearsal remains required
 - Date: 2026-09-06
 - Issue: COKS-36
 
@@ -235,3 +235,5 @@ Before any COKS-36 behavior test or implementation, confirm or revise:
 8. the exact Secure Note field schema and hidden hexadecimal secret;
 9. a non-cloneable loaded-secret handle for later Inspect, Verify, Verified Copy, and Restore commands; and
 10. separate owner attestation for external hosting, fresh-device sign-in, and independent multi-factor recovery.
+
+The owner confirmed all ten seams on 2026-09-06. Any later change to these public interfaces or security boundaries requires renewed confirmation before behavior tests depend on it.

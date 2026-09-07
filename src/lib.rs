@@ -17,6 +17,7 @@ mod protection_candidates;
 mod push_plan;
 mod restore;
 mod restore_fs;
+mod vaultwarden_recovery;
 
 pub use bundle::{
     BundleEngine, BundleEvent, BundleEventSink, BundleSource, BundleSourceObservation,
@@ -70,6 +71,15 @@ pub use push_plan::{
 pub use restore::{
     RestoreCancellation, RestoreEngine, RestoreEvent, RestoreEventSink, RestoreReport,
     RestoreRequest, RestoreState,
+};
+pub use vaultwarden_recovery::{
+    BitwardenCommandLine, BitwardenInstallationObservation, BitwardenRecoveryNote,
+    BitwardenRetrievedRecoveryNote, BitwardenVaultObservation, InstalledBitwarden,
+    LoadedVaultwardenRecoverySecret, VaultwardenInstallationReport, VaultwardenInstallationRequest,
+    VaultwardenItemIdentifier, VaultwardenLoadRequest, VaultwardenPreflightReport,
+    VaultwardenPreflightRequest, VaultwardenRecoveryEngine, VaultwardenRecoveryReceipt,
+    VaultwardenRehearsalRequest, VaultwardenStoreReport, VaultwardenStoreRequest,
+    VaultwardenStoreState,
 };
 
 pub const FIXTURE_MAGIC: &[u8] = b"INIZA-TEST-FIXTURE-V0\0";
@@ -263,6 +273,7 @@ pub enum CoreError {
     SourceIsNotARegularFile(PathBuf),
     SourceHasNoFileName(PathBuf),
     TestFixtureIsNotBundle(PathBuf),
+    Vaultwarden(String),
     Io {
         action: &'static str,
         path: PathBuf,
@@ -317,6 +328,7 @@ impl fmt::Display for CoreError {
                 "test-only fixture is not an encrypted Bundle and is accepted only by the fixture commands: {}",
                 path.display()
             ),
+            Self::Vaultwarden(message) => formatter.write_str(message),
             Self::Io {
                 action,
                 path,
