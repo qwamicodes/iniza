@@ -1609,10 +1609,26 @@ impl<G: GitPublicationProcess, S: ReadinessEvidenceStorage> ReadinessEvidenceEng
                     .any(|active| active.claim_kind == **required)
             })
             .count();
+        let contradictory_attestations = required_attestations
+            .iter()
+            .map(|required| {
+                active_owner_attestations
+                    .iter()
+                    .filter(|active| active.claim_kind == *required)
+                    .count()
+                    .saturating_sub(1)
+            })
+            .sum::<usize>();
         if missing_attestations > 0 {
             blocking_gaps.push(ReadinessEvidenceGap {
                 code: "required-owner-attestations-missing",
                 count: missing_attestations as u64,
+            });
+        }
+        if contradictory_attestations > 0 {
+            blocking_gaps.push(ReadinessEvidenceGap {
+                code: "contradictory-owner-attestations",
+                count: contradictory_attestations as u64,
             });
         }
         let projects_not_restorable = projects

@@ -1203,6 +1203,22 @@ fn complete_push_plan_execution_makes_only_the_project_synchronized() {
         status.projects()[0].synchronized(),
         ReadinessEvidenceConclusion::Current
     );
+
+    let published_parent = git_stdout(&project, &["rev-parse", "refs/heads/main^"]);
+    run_git(
+        &remote,
+        &["update-ref", "refs/heads/main", published_parent.trim()],
+    );
+    let changed_remote = engine
+        .status(
+            ReadinessEvidenceStatusRequest::new(&evidence_directory, &plan)
+                .with_project_publication(project_audit),
+        )
+        .expect("changed remote should produce a blocking Project conclusion");
+    assert_eq!(
+        changed_remote.projects()[0].synchronized(),
+        ReadinessEvidenceConclusion::Invalidated
+    );
 }
 
 #[test]
@@ -1596,6 +1612,149 @@ fn complete_synthetic_evidence_chain_reports_complete_evidence_without_erase_per
     );
 }
 
+#[test]
+fn tampered_missing_or_incomplete_evidence_records_fail_closed() {
+    let directory = TestDirectory::new();
+    let source = directory.path().join("synthetic-state");
+    fs::create_dir(&source).expect("synthetic source should be created");
+    fs::write(source.join("settings.txt"), b"synthetic settings\n")
+        .expect("synthetic source should be written");
+    let mut plan = PlanEngine::local()
+        .scan(ScanRequest::for_directory(&source))
+        .expect("synthetic source should scan");
+    let plan_hash = plan.approval_hash().expect("Plan should have a hash");
+    plan.approve(&plan_hash)
+        .expect("exact reviewed hash should approve the Plan");
+    let evidence_directory = directory.path().join("readiness-evidence");
+    let engine = ReadinessEvidenceEngine::local();
+    engine
+        .initialize(ReadinessEvidenceInitializationRequest::new(
+            &plan,
+            &evidence_directory,
+        ))
+        .expect("approved Plan should initialize a private evidence store");
+    for _ in 0..2 {
+        engine
+            .record_receipt(ReadinessReceiptRecordRequest::not_protected_report(
+                &evidence_directory,
+                &plan,
+            ))
+            .expect("synthetic Receipt should append");
+    }
+    let mut records = fs::read_dir(&evidence_directory)
+        .expect("evidence records should enumerate")
+        .map(|entry| entry.expect("evidence entry should be readable").path())
+        .collect::<Vec<_>>();
+    records.sort();
+    assert_eq!(records.len(), 3);
+    let middle = records[1].clone();
+    let original = fs::read(&middle).expect("middle evidence record should be readable");
+
+    let mut tampered = original.clone();
+    let changed_byte = tampered
+        .iter()
+        .position(|byte| *byte == b'1')
+        .expect("record should contain a digit");
+    tampered[changed_byte] = b'2';
+    fs::write(&middle, &tampered).expect("synthetic record should be tampered");
+    assert!(
+        engine
+            .status(ReadinessEvidenceStatusRequest::new(
+                &evidence_directory,
+                &plan,
+            ))
+            .is_err(),
+        "tampered record bytes must block status"
+    );
+
+    fs::write(&middle, &original).expect("synthetic record should be restored");
+    fs::remove_file(&middle).expect("synthetic middle record should be removed");
+    assert!(
+        engine
+            .status(ReadinessEvidenceStatusRequest::new(
+                &evidence_directory,
+                &plan,
+            ))
+            .is_err(),
+        "missing sequence must block status"
+    );
+
+    fs::write(&middle, &original).expect("synthetic middle record should be restored again");
+    fs::write(
+        evidence_directory.join("interrupted.json.incomplete"),
+        b"partial",
+    )
+    .expect("synthetic incomplete candidate should be written");
+    assert!(
+        engine
+            .status(ReadinessEvidenceStatusRequest::new(
+                &evidence_directory,
+                &plan,
+            ))
+            .is_err(),
+        "incomplete candidate must block status"
+    );
+}
+
+#[test]
+fn contradictory_active_owner_attestations_remain_a_blocking_gap() {
+    let directory = TestDirectory::new();
+    let source = directory.path().join("synthetic-state");
+    fs::create_dir(&source).expect("synthetic source should be created");
+    fs::write(source.join("settings.txt"), b"synthetic settings\n")
+        .expect("synthetic source should be written");
+    let mut plan = PlanEngine::local()
+        .scan(ScanRequest::for_directory(&source))
+        .expect("synthetic source should scan");
+    let plan_hash = plan.approval_hash().expect("Plan should have a hash");
+    plan.approve(&plan_hash)
+        .expect("exact reviewed hash should approve the Plan");
+    let evidence_directory = directory.path().join("readiness-evidence");
+    let engine = ReadinessEvidenceEngine::local();
+    engine
+        .initialize(ReadinessEvidenceInitializationRequest::new(
+            &plan,
+            &evidence_directory,
+        ))
+        .expect("approved Plan should initialize a private evidence store");
+
+    for evidence_reference in [
+        "conventional-backup:first-observation",
+        "conventional-backup:contradictory-observation",
+    ] {
+        let review = engine
+            .prepare_attestation(OwnerAttestationPreparationRequest::new(
+                &evidence_directory,
+                &plan,
+                OwnerAttestationClaimKind::ConventionalBackupValidated,
+                evidence_reference,
+            ))
+            .expect("fixed Owner Attestation should prepare");
+        engine
+            .confirm_attestation(OwnerAttestationConfirmationRequest::new(
+                &evidence_directory,
+                &plan,
+                &review,
+                review.review_hash(),
+                review.required_acknowledgement(),
+            ))
+            .expect("exact Owner Attestation should append");
+    }
+
+    let status = engine
+        .status(ReadinessEvidenceStatusRequest::new(
+            &evidence_directory,
+            &plan,
+        ))
+        .expect("contradictory attestations should remain auditable");
+    assert!(
+        status
+            .blocking_gaps()
+            .iter()
+            .any(|gap| gap.code() == "contradictory-owner-attestations" && gap.count() == 1)
+    );
+}
+
 struct RejectCandidateCreation;
 
 impl ReadinessEvidenceStorage for RejectCandidateCreation {
@@ -1714,6 +1873,21 @@ fn run_git(project: &Path, arguments: &[&str]) {
         "Git fixture command failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn git_stdout(project: &Path, arguments: &[&str]) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(project)
+        .args(arguments)
+        .output()
+        .expect("Git fixture command should start");
+    assert!(
+        output.status.success(),
+        "Git fixture command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).expect("Git fixture output should be Unicode")
 }
 
 fn run_git_with_identity(project: &Path, arguments: &[&str]) {
