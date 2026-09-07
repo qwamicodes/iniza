@@ -197,6 +197,7 @@ pub struct ScanRequest {
     cross_mounts: bool,
     exclusions: Vec<PathBuf>,
     optional_items: Vec<PathBuf>,
+    reviewed_inclusions: Vec<PathBuf>,
     recipes: Vec<String>,
     destination_preference: Option<PathBuf>,
     publication_policy: PublicationPolicy,
@@ -217,6 +218,7 @@ impl ScanRequest {
             cross_mounts: false,
             exclusions: Vec::new(),
             optional_items: Vec::new(),
+            reviewed_inclusions: Vec::new(),
             recipes: Vec::new(),
             destination_preference: None,
             publication_policy: PublicationPolicy::ProtectLocallyOnly,
@@ -236,6 +238,11 @@ impl ScanRequest {
 
     pub fn mark_optional(mut self, relative_path: impl Into<PathBuf>) -> Self {
         self.optional_items.push(relative_path.into());
+        self
+    }
+
+    pub fn include_reviewed(mut self, relative_path: impl Into<PathBuf>) -> Self {
+        self.reviewed_inclusions.push(relative_path.into());
         self
     }
 
@@ -302,6 +309,26 @@ impl<F: SourceFilesystem> PlanEngine<F> {
                 "optional Migration Item must be a safe relative path".to_owned(),
             ));
         }
+        if request
+            .reviewed_inclusions
+            .iter()
+            .any(|path| !is_safe_relative_request_path(path))
+        {
+            return Err(CoreError::InvalidPlan(
+                "reviewed inclusion must be a safe relative path".to_owned(),
+            ));
+        }
+        if request.reviewed_inclusions.iter().any(|reviewed_path| {
+            request.exclusions.iter().any(|excluded_path| {
+                reviewed_path == excluded_path
+                    || reviewed_path.starts_with(excluded_path)
+                    || excluded_path.starts_with(reviewed_path)
+            })
+        }) {
+            return Err(CoreError::InvalidPlan(
+                "reviewed inclusion conflicts with a Plan exclusion".to_owned(),
+            ));
+        }
         let root = self
             .source
             .canonicalize(&request.approved_root)
@@ -361,7 +388,35 @@ impl<F: SourceFilesystem> PlanEngine<F> {
         {
             mark_changed(root_item);
         }
-        apply_request_policy(&mut items, &request.exclusions, &request.optional_items);
+        if request.reviewed_inclusions.iter().any(|reviewed_path| {
+            !items.iter().any(|item| {
+                (item.relative_path == *reviewed_path
+                    || item.relative_path.starts_with(reviewed_path))
+                    && item.disposition == Disposition::RequiresReview
+            })
+        }) {
+            return Err(CoreError::InvalidPlan(
+                "reviewed inclusion does not match a review-required Migration Item".to_owned(),
+            ));
+        }
+        if request.reviewed_inclusions.iter().any(|reviewed_path| {
+            items.iter().any(|item| {
+                (item.relative_path == *reviewed_path
+                    || item.relative_path.starts_with(reviewed_path))
+                    && item.disposition == Disposition::RequiresReview
+                    && item.kind != MigrationItemKind::SymbolicLink
+            })
+        }) {
+            return Err(CoreError::InvalidPlan(
+                "reviewed inclusion does not match a stable symbolic link".to_owned(),
+            ));
+        }
+        apply_request_policy(
+            &mut items,
+            &request.exclusions,
+            &request.optional_items,
+            &request.reviewed_inclusions,
+        );
         items.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
 
         let mut recipes = request.recipes;
@@ -515,6 +570,7 @@ fn apply_request_policy(
     items: &mut [MigrationItem],
     exclusions: &[PathBuf],
     optional_items: &[PathBuf],
+    reviewed_inclusions: &[PathBuf],
 ) {
     for item in items {
         if optional_items
@@ -529,6 +585,14 @@ fn apply_request_policy(
         {
             item.disposition = Disposition::Excluded;
             item.explanation = "excluded by reviewed Plan request".to_owned();
+        }
+        if item.disposition == Disposition::RequiresReview
+            && reviewed_inclusions
+                .iter()
+                .any(|path| item.relative_path == *path || item.relative_path.starts_with(path))
+        {
+            item.disposition = Disposition::Included;
+            item.explanation = "included by explicit owner review".to_owned();
         }
     }
 }

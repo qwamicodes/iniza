@@ -1,6 +1,6 @@
 # COKS-40 reviewed Plan decision interface
 
-- Status: Proposed for owner confirmation
+- Status: Accepted and implemented
 - Date: 2026-09-07
 - Issue: COKS-40
 
@@ -47,7 +47,7 @@ The existing review loop remains:
 
 There is no partial approval of one Plan hash. Partial selection means revising subpath decisions and producing a new complete Plan for review.
 
-## Confirmed test seams after owner approval
+## Confirmed test seams
 
 Behavior tests will use `PlanEngine::scan(ScanRequest)` and the supported `iniza scan` command:
 
@@ -59,3 +59,10 @@ Behavior tests will use `PlanEngine::scan(ScanRequest)` and the supported `iniza
 6. Human output shows the local reviewed path; machine output remains path-free and content-free.
 
 Confirming this seam authorizes only test-driven implementation of the Plan review decision. It does not approve the real Plan, read protected content, contact remotes, publish Git state, create a Bundle, delete data, or authorize machine erasure.
+
+## Owner decision
+
+- [x] I confirm the six COKS-40 reviewed-inclusion seams.
+- Owner: Kwaame Ofori-adjekum
+- Decision date: 2026-09-07
+- Notes: The decision authorizes this Plan-review interface only. The real Project and developer-state Plans remain unapproved and all later remote, Bundle, deletion, and machine-erasure boundaries remain separate.

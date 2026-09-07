@@ -3,7 +3,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use iniza::Plan;
+#[cfg(unix)]
+use std::os::unix::fs::symlink;
+
+use iniza::{Disposition, Plan, ProtectionRequirement};
 
 struct TestDirectory {
     path: PathBuf,
@@ -39,6 +42,103 @@ fn iniza(arguments: &[&str]) -> Output {
         .args(arguments)
         .output()
         .expect("iniza should run")
+}
+
+#[cfg(unix)]
+#[test]
+fn owner_can_record_a_reviewed_symbolic_link_through_the_scan_command() {
+    let directory = TestDirectory::new("include-reviewed");
+    let root = directory.path().join("developer-state");
+    let unreviewed_plan_path = directory.path().join("unreviewed.toml");
+    let plan_path = directory.path().join("iniza.toml");
+    fs::create_dir(&root).expect("approved root should be created");
+    symlink("missing-target", root.join("reviewed-link")).expect("symbolic link should be created");
+
+    let unreviewed_scan = iniza(&[
+        "scan",
+        root.to_str().expect("root path should be text"),
+        "--output-plan",
+        unreviewed_plan_path
+            .to_str()
+            .expect("Plan path should be text"),
+    ]);
+    assert!(unreviewed_scan.status.success());
+
+    let scan = iniza(&[
+        "scan",
+        root.to_str().expect("root path should be text"),
+        "--include-reviewed",
+        "reviewed-link",
+        "--output-plan",
+        plan_path.to_str().expect("Plan path should be text"),
+    ]);
+
+    assert!(
+        scan.status.success(),
+        "reviewed inclusion should succeed: {}",
+        String::from_utf8_lossy(&scan.stderr)
+    );
+    let plan = Plan::read_from(&plan_path).expect("written Plan should be readable");
+    let reviewed_link = plan
+        .items()
+        .iter()
+        .find(|item| item.relative_path == Path::new("reviewed-link"))
+        .expect("reviewed link should remain visible");
+    assert_eq!(reviewed_link.disposition, Disposition::Included);
+    assert_eq!(
+        reviewed_link.protection_requirement,
+        ProtectionRequirement::MustProtect
+    );
+    assert_eq!(
+        reviewed_link.explanation,
+        "included by explicit owner review"
+    );
+
+    let unreviewed_plan =
+        Plan::read_from(&unreviewed_plan_path).expect("unreviewed Plan should be readable");
+    assert_ne!(
+        unreviewed_plan
+            .approval_hash()
+            .expect("unreviewed Plan should hash"),
+        plan.approval_hash().expect("reviewed Plan should hash")
+    );
+
+    let human_show = iniza(&[
+        "plan",
+        "show",
+        "--plan",
+        plan_path.to_str().expect("Plan path should be text"),
+    ]);
+    assert!(human_show.status.success());
+    let human_text = String::from_utf8_lossy(&human_show.stdout);
+    assert!(human_text.contains("reviewed-link"));
+    assert!(human_text.contains("included by explicit owner review"));
+
+    let machine_show = iniza(&[
+        "--json",
+        "plan",
+        "show",
+        "--plan",
+        plan_path.to_str().expect("Plan path should be text"),
+    ]);
+    assert!(machine_show.status.success());
+    let machine_text = String::from_utf8_lossy(&machine_show.stdout);
+    assert!(!machine_text.contains("reviewed-link"));
+    assert!(!machine_text.contains(&root.display().to_string()));
+
+    let diff = iniza(&[
+        "plan",
+        "diff",
+        unreviewed_plan_path
+            .to_str()
+            .expect("Plan path should be text"),
+        plan_path.to_str().expect("Plan path should be text"),
+    ]);
+    assert!(diff.status.success());
+    let diff_text = String::from_utf8_lossy(&diff.stdout);
+    assert!(diff_text.contains("reviewed-link Disposition changed"));
+    assert!(diff_text.contains("RequiresReview to Included"));
+    assert!(diff_text.contains("reviewed-link coverage explanation changed"));
 }
 
 #[test]

@@ -37,6 +37,7 @@ iniza scan <ROOT>
   --raw-application-folder <HOME_RELATIVE_PATH>...
   --exclude <RELATIVE_PATH>...
   --optional <RELATIVE_PATH>...
+  --include-reviewed <RELATIVE_PATH>...
   --recipe <NAME>...
   --destination <BUNDLE_PATH>
   --publication-policy <protect-locally-only|review-separately>
@@ -45,6 +46,8 @@ iniza scan <ROOT>
 ```
 
 Directory scanning is read-only metadata discovery beneath exactly one explicit approved root. The filesystem root is rejected as too broad. Relative exclusions and Optional classifications remain visible in the Plan. Symbolic links are recorded but never followed. Mount boundaries are recorded and not crossed unless `--cross-mounts` is explicitly enabled. A regular-file source continues to create a development-only fixture Plan for the `fixture` workflow.
+
+`--include-reviewed` records an explicit positive review decision for an exact symbolic link or a subtree containing review-required symbolic links. It promotes only stable symbolic-link observations from Requires Review to Included, never follows their targets, preserves their Protection Requirement, and changes the canonical Plan hash. Unsafe or missing paths, overlap with an exclusion, changed source state, mount-boundary state, Unsupported items, and Unavailable items fail closed rather than being promoted. Repeated `--exclude`, `--optional`, and `--include-reviewed` decisions let the owner revise exact paths or subtrees before approving one complete final Plan hash.
 
 `--list-protection-candidates` treats `<ROOT>` as the reviewed macOS home and reports curated Secure Shell, Git, Bash, Zsh, Visual Studio Code, Homebrew, language-tool, and regenerable-state candidates without reading candidate file contents. Human output identifies sources, sensitivity, portability, proposed Disposition, Protection Requirement, availability, validation, and unverified account-sync claims. Versioned JavaScript Object Notation output omits absolute paths and protected content.
 

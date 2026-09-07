@@ -573,6 +573,7 @@ fn run_scan(
     let mut output_plan = None;
     let mut exclusions = Vec::new();
     let mut optional_items = Vec::new();
+    let mut reviewed_inclusions = Vec::new();
     let mut recipes = Vec::new();
     let mut destination = None;
     let mut publication_policy = PublicationPolicy::ProtectLocallyOnly;
@@ -597,6 +598,12 @@ fn run_scan(
             }
             "--optional" => {
                 optional_items.push(PathBuf::from(
+                    arguments.get(index + 1).ok_or_else(scan_usage)?,
+                ));
+                index += 2;
+            }
+            "--include-reviewed" => {
+                reviewed_inclusions.push(PathBuf::from(
                     arguments.get(index + 1).ok_or_else(scan_usage)?,
                 ));
                 index += 2;
@@ -686,6 +693,9 @@ fn run_scan(
         for optional_item in optional_items {
             request = request.mark_optional(optional_item);
         }
+        for reviewed_inclusion in reviewed_inclusions {
+            request = request.include_reviewed(reviewed_inclusion);
+        }
         for recipe in recipes {
             request = request.with_recipe(recipe);
         }
@@ -715,6 +725,9 @@ fn run_scan(
             for optional_item in optional_items {
                 request = request.mark_optional(optional_item);
             }
+            for reviewed_inclusion in reviewed_inclusions {
+                request = request.include_reviewed(reviewed_inclusion);
+            }
             for recipe in recipes {
                 request = request.with_recipe(recipe);
             }
@@ -727,6 +740,7 @@ fn run_scan(
         } else {
             if !exclusions.is_empty()
                 || !optional_items.is_empty()
+                || !reviewed_inclusions.is_empty()
                 || !recipes.is_empty()
                 || destination.is_some()
                 || publication_policy != PublicationPolicy::ProtectLocallyOnly
@@ -828,7 +842,7 @@ fn project_audit_usage() -> CliError {
 
 fn scan_usage() -> CliError {
     CliError::Usage(
-        "usage: iniza scan <SOURCE> (--list-protection-candidates [--raw-application-folder <HOME_RELATIVE_PATH>] | --candidate <ID>... --output-plan <PLAN> [--raw-application-folder <HOME_RELATIVE_PATH>] | --output-plan <PLAN> [--exclude <RELATIVE_PATH>] [--optional <RELATIVE_PATH>] [--recipe <NAME>] [--destination <BUNDLE_PATH>] [--publication-policy <protect-locally-only|review-separately>] [--cross-mounts])"
+        "usage: iniza scan <SOURCE> (--list-protection-candidates [--raw-application-folder <HOME_RELATIVE_PATH>] | --candidate <ID>... --output-plan <PLAN> [--raw-application-folder <HOME_RELATIVE_PATH>] | --output-plan <PLAN> [--exclude <RELATIVE_PATH>] [--optional <RELATIVE_PATH>] [--include-reviewed <RELATIVE_PATH>] [--recipe <NAME>] [--destination <BUNDLE_PATH>] [--publication-policy <protect-locally-only|review-separately>] [--cross-mounts])"
             .to_owned(),
     )
 }

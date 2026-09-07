@@ -171,6 +171,180 @@ fn escaping_symbolic_links_are_visible_blocking_gaps_and_never_followed() {
     assert_eq!(summary.optional_warnings, 0);
 }
 
+#[cfg(unix)]
+#[test]
+fn owner_can_include_one_reviewed_symbolic_link_without_following_its_target() {
+    let directory = TestDirectory::new("reviewed-symbolic-link");
+    let root = directory.path().join("approved");
+    let outside = directory.path().join("outside");
+    fs::create_dir(&root).expect("approved root should be created");
+    fs::create_dir(&outside).expect("outside directory should be created");
+    fs::write(outside.join("must-not-be-discovered.txt"), b"outside")
+        .expect("outside fixture should be written");
+    symlink(&outside, root.join("reviewed-link")).expect("symbolic link should be created");
+
+    let plan = PlanEngine::local()
+        .scan(ScanRequest::for_directory(&root).include_reviewed("reviewed-link"))
+        .expect("an exact reviewed symbolic link should be included");
+
+    assert_eq!(
+        plan.items()
+            .iter()
+            .map(|item| item.relative_path.as_path())
+            .collect::<Vec<_>>(),
+        vec![Path::new("."), Path::new("reviewed-link")]
+    );
+    let reviewed_link = plan
+        .items()
+        .iter()
+        .find(|item| item.relative_path == Path::new("reviewed-link"))
+        .expect("reviewed link should remain visible");
+    assert_eq!(reviewed_link.kind, MigrationItemKind::SymbolicLink);
+    assert_eq!(reviewed_link.disposition, Disposition::Included);
+    assert_eq!(
+        reviewed_link.protection_requirement,
+        ProtectionRequirement::MustProtect
+    );
+    assert_eq!(
+        reviewed_link.explanation,
+        "included by explicit owner review"
+    );
+    assert_eq!(plan.coverage_summary().must_protect_blocking, 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn reviewed_directory_includes_only_its_review_required_link_descendants() {
+    let directory = TestDirectory::new("reviewed-directory");
+    let root = directory.path().join("approved");
+    fs::create_dir_all(root.join("skills")).expect("approved root should be created");
+    fs::write(root.join("skills/settings.txt"), b"ordinary included state")
+        .expect("ordinary fixture should be written");
+    symlink("settings.txt", root.join("skills/settings-link"))
+        .expect("symbolic link should be created");
+
+    let plan = PlanEngine::local()
+        .scan(ScanRequest::for_directory(&root).include_reviewed("skills"))
+        .expect("a reviewed directory should include its review-required links");
+
+    let settings = plan
+        .items()
+        .iter()
+        .find(|item| item.relative_path == Path::new("skills/settings.txt"))
+        .expect("ordinary state should remain present");
+    assert_eq!(settings.disposition, Disposition::Included);
+    assert_eq!(
+        settings.explanation,
+        "discovered beneath an explicitly approved root"
+    );
+    let link = plan
+        .items()
+        .iter()
+        .find(|item| item.relative_path == Path::new("skills/settings-link"))
+        .expect("reviewed link should remain present");
+    assert_eq!(link.disposition, Disposition::Included);
+    assert_eq!(link.explanation, "included by explicit owner review");
+    assert_eq!(plan.coverage_summary().must_protect_blocking, 0);
+}
+
+#[test]
+fn unsafe_reviewed_inclusion_is_rejected_before_it_enters_a_plan() {
+    let directory = TestDirectory::new("unsafe-reviewed-inclusion");
+    let root = directory.path().join("approved");
+    fs::create_dir(&root).expect("approved root should be created");
+
+    let error = PlanEngine::local()
+        .scan(ScanRequest::for_directory(&root).include_reviewed("../outside"))
+        .expect_err("an unsafe reviewed inclusion must be rejected");
+
+    assert!(matches!(
+        error,
+        CoreError::InvalidPlan(message)
+            if message == "reviewed inclusion must be a safe relative path"
+    ));
+}
+
+#[test]
+fn missing_reviewed_inclusion_is_rejected_instead_of_becoming_a_no_op() {
+    let directory = TestDirectory::new("missing-reviewed-inclusion");
+    let root = directory.path().join("approved");
+    fs::create_dir(&root).expect("approved root should be created");
+
+    let error = PlanEngine::local()
+        .scan(ScanRequest::for_directory(&root).include_reviewed("missing-link"))
+        .expect_err("a missing reviewed inclusion must be rejected");
+
+    assert!(matches!(
+        error,
+        CoreError::InvalidPlan(message)
+            if message == "reviewed inclusion does not match a review-required Migration Item"
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn overlapping_exclusion_and_reviewed_inclusion_are_rejected() {
+    let directory = TestDirectory::new("conflicting-reviewed-inclusion");
+    let root = directory.path().join("approved");
+    fs::create_dir_all(root.join("skills")).expect("approved root should be created");
+    symlink("missing-target", root.join("skills/reviewed-link"))
+        .expect("symbolic link should be created");
+
+    let error = PlanEngine::local()
+        .scan(
+            ScanRequest::for_directory(&root)
+                .exclude("skills")
+                .include_reviewed("skills/reviewed-link"),
+        )
+        .expect_err("overlapping decisions must be rejected");
+
+    assert!(matches!(
+        error,
+        CoreError::InvalidPlan(message)
+            if message == "reviewed inclusion conflicts with a Plan exclusion"
+    ));
+}
+
+#[test]
+fn reviewed_inclusion_cannot_promote_changed_source_state() {
+    let error = PlanEngine::with_source(RiskSource::default())
+        .scan(ScanRequest::for_directory("/synthetic/approved").include_reviewed("changing.txt"))
+        .expect_err("changed source state must remain blocking");
+
+    assert!(matches!(
+        error,
+        CoreError::InvalidPlan(message)
+            if message == "reviewed inclusion does not match a stable symbolic link"
+    ));
+}
+
+#[test]
+fn reviewed_inclusion_cannot_promote_unsupported_or_unavailable_state() {
+    for (relative_path, expected_message) in [
+        (
+            "worker.sock",
+            "reviewed inclusion does not match a review-required Migration Item",
+        ),
+        (
+            "private.txt",
+            "reviewed inclusion does not match a review-required Migration Item",
+        ),
+        (
+            "mounted",
+            "reviewed inclusion does not match a stable symbolic link",
+        ),
+    ] {
+        let error = PlanEngine::with_source(RiskSource::default())
+            .scan(ScanRequest::for_directory("/synthetic/approved").include_reviewed(relative_path))
+            .expect_err("review cannot promote unverified filesystem state");
+
+        assert!(matches!(
+            error,
+            CoreError::InvalidPlan(message) if message == expected_message
+        ));
+    }
+}
+
 #[test]
 fn external_filesystem_risks_are_classified_without_hiding_or_crossing_them() {
     let plan = PlanEngine::with_source(RiskSource::default())
