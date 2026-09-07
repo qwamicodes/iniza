@@ -142,7 +142,7 @@ If a partial owner rehearsal retains an `iniza-coks-36-owner-rehearsal-<process>
 
 ## Known limitations
 
-- Until the real owner-service rehearsal and Owner Attestation are complete, COKS-36 is not complete.
+- The 2026-09-07 owner-service rehearsal completed with synthetic Bundle identity `2527de6bf62b28248caa05cf4876e17f`. Exact retrieval independently authenticated the Bundle at Unix time `1788802068`; the owner confirmed external hosting, fresh-device sign-in, and the independent multi-factor recovery path at Unix time `1788802503`. The exact vault item identifier, service address, account identity, session, and Recovery Secret are intentionally absent from this tracked document. The retained Secure Note remains the owner's external state.
 - Owner Dogfood proves only the reviewed service and official client version; compatibility with every Bitwarden-compatible deployment is not promised.
 - The harness deliberately uses synthetic content. Personal migration capture and full command-line orchestration remain later Owner Dogfood work.
 - Successful Vaultwarden recovery does not prove Offline Recovery Key separation, Verified Copies, Restore rehearsals, repository publication, conventional backups, Readiness Evidence, or permission to erase the old Mac.

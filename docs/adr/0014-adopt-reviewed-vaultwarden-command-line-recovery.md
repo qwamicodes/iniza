@@ -1,6 +1,6 @@
 # Adopt reviewed Vaultwarden recovery through the official Bitwarden command-line client
 
-- Status: Accepted for synthetic and duplicated data; real owner-service rehearsal and Owner Attestation remain required
+- Status: Accepted for synthetic and duplicated data; real owner-service rehearsal and Owner Attestation completed 2026-09-07
 - Date: 2026-09-07
 - Issue: COKS-36
 

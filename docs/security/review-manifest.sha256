@@ -19,5 +19,5 @@ d5b5b39cd19ffed0d5aaa72c0baca9d990de7c6374b6c45ee040fe6f43732183  docs/adr/0005-
 41789acf0e825b1f463d6f9807c3c9815027fcfc8c7cb3e33dfe672e79b58d61  docs/adr/0008-prototype-authenticated-pack-resume.md
 be560f03e1eb2079cce3433e228311c9a2c09da5d7175cffdf0e592dbd739ec5  docs/adr/0009-adopt-verified-copy-transaction.md
 e2b03f6a93154b9333bd9946e1f5f6c7af1ad087344be4fcff029994e595522d  docs/adr/0011-adopt-restrictive-offline-recovery-document.md
-0dade4001b738534b8065c73bd720fd9dc4a70d64cd89a5badeb9b0c78a77dad  docs/adr/0014-adopt-reviewed-vaultwarden-command-line-recovery.md
+ba0e83bec808226a0e26a00e021327487275c036cf991da6b332bc0928404e34  docs/adr/0014-adopt-reviewed-vaultwarden-command-line-recovery.md
 8d93e9d0c0e3e0636107ef358f321d09ea79a63d32722131a32b646702168d0c  docs/security/iniza.cdx.json

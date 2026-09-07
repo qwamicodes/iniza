@@ -68,7 +68,7 @@ To refresh advisory evidence, use cargo-audit with the exact `Cargo.lock`, fail 
 - Iniza declares no project license, and no reviewed cargo-deny license/source/duplicate policy exists.
 - The lockfile has eleven duplicate-version warning families recorded in the dependency-policy audit.
 - The bounded tracked-repository pattern check is not an independent entropy-based secret scan.
-- The real owner Vaultwarden transaction, physical Offline Recovery Key rehearsal, real Bundle capture, two Verified Copies, conventional backup, and both Restore Rehearsal environments remain incomplete.
+- The real owner-service Vaultwarden transaction using synthetic Bundle data and its external-service, fresh-device, and independent multi-factor Owner Attestations completed on 2026-09-07. Physical Offline Recovery Key rehearsal, real Bundle capture, two Verified Copies, conventional backup, and both Restore Rehearsal environments remain incomplete.
 
 ## Expected deliverable
 
