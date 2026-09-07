@@ -12,10 +12,10 @@ use iniza::{
     GitProcess, GitProcessOutput, InstalledGit, PlanEngine, ProjectAuditEngine,
     ProjectAuditRequest, ProjectCapsuleBlockingFeature, ProjectCapsuleCaptureRequest,
     ProjectCapsuleCaptureState, ProjectCapsuleComparisonRequest, ProjectCapsuleEngine,
-    ProjectCapsuleIgnoredRecommendation, ProjectCapsuleRepresentation, ProjectCapsuleReview,
-    ProjectCapsuleReviewDecision, ProjectCapsuleReviewDecisionKind, ProjectCapsuleReviewRequest,
-    ProjectCapsuleSupportedState, ProjectCapsuleValidationRequest, RestoreEngine, RestoreRequest,
-    ScanRequest,
+    ProjectCapsuleIgnoredRecommendation, ProjectCapsuleRehearsalRequest,
+    ProjectCapsuleRepresentation, ProjectCapsuleReview, ProjectCapsuleReviewDecision,
+    ProjectCapsuleReviewDecisionKind, ProjectCapsuleReviewRequest, ProjectCapsuleSupportedState,
+    ProjectCapsuleValidationRequest, RecoveryMethod, RestoreEngine, RestoreRequest, ScanRequest,
 };
 
 static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -805,6 +805,83 @@ fn reviewed_capture_encrypts_sensitive_state_and_excludes_reproducible_generated
         !restore.join("node_modules/example/generated.js").exists(),
         "explicitly excluded reproducible generated state must not enter the Bundle"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn verified_capture_rehearses_as_restorable_without_consulting_the_source_project() {
+    let directory = TestDirectory::new("source-independent-rehearsal");
+    let project = directory.path.join("owner-project");
+    let bundle = directory.path.join("project-capsule.iniza");
+    let restore = directory.path.join("restored-project");
+    fs::create_dir_all(&project).expect("Project should be created");
+    git(&project, &["init", "-q", "--initial-branch=main"]);
+    fs::write(project.join("tracked.txt"), "committed content\n")
+        .expect("tracked fixture should be written");
+    git(&project, &["add", "tracked.txt"]);
+    commit(
+        &project,
+        "Create source-independent fixture",
+        "2026-01-01T00:00:00Z",
+    );
+    fs::write(project.join("tracked.txt"), "unstaged protected content\n")
+        .expect("unstaged fixture should be written");
+    fs::write(
+        project.join("untracked.txt"),
+        "untracked protected content\n",
+    )
+    .expect("untracked fixture should be written");
+    let mut plan = PlanEngine::local()
+        .scan(ScanRequest::for_directory(&project))
+        .expect("Project Plan should scan");
+    let plan_hash = plan.approval_hash().expect("Project Plan should hash");
+    plan.approve(&plan_hash).expect("exact Plan should approve");
+    let audit = ProjectAuditEngine::local()
+        .audit(ProjectAuditRequest::from_plan(&plan))
+        .expect("Project should audit");
+    let project_audit = audit.projects().first().expect("Project should be present");
+    let review = ProjectCapsuleEngine::local()
+        .review(ProjectCapsuleReviewRequest::new(&plan, project_audit))
+        .expect("Project Capsule review should complete");
+    assert!(review.is_complete());
+    let review_hash = review.review_hash().to_owned();
+    let capture = ProjectCapsuleEngine::local()
+        .capture(ProjectCapsuleCaptureRequest::new(
+            &plan,
+            project_audit,
+            &review,
+            review_hash,
+            &bundle,
+        ))
+        .expect("verified Project Capsule should capture");
+    let expectation = capture
+        .expectation()
+        .expect("verified unchanged capture should produce an expectation")
+        .clone();
+    fs::remove_dir_all(&project).expect("source Project should be made unavailable");
+
+    let receipt = ProjectCapsuleEngine::local()
+        .rehearse(ProjectCapsuleRehearsalRequest::new(
+            &bundle,
+            &expectation,
+            capture.offline_recovery_key(),
+            &restore,
+        ))
+        .expect("Restore Rehearsal should validate without the source Project");
+
+    assert!(receipt.is_restorable(), "{receipt:#?}");
+    assert_eq!(receipt.recovery_method(), RecoveryMethod::Offline);
+    assert_eq!(
+        fs::read(restore.join("tracked.txt")).expect("unstaged state should restore"),
+        b"unstaged protected content\n"
+    );
+    assert_eq!(
+        fs::read(restore.join("untracked.txt")).expect("untracked state should restore"),
+        b"untracked protected content\n"
+    );
+    let visible = format!("{receipt:?}{}", receipt.machine_json_result());
+    assert!(!visible.contains("owner-project"));
+    assert!(!visible.contains(&directory.path.to_string_lossy().to_string()));
 }
 
 #[cfg(unix)]

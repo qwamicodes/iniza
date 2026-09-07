@@ -54,11 +54,12 @@ pub use project_audit::{
 pub use project_capsule::{
     ProjectCapsuleBlockingFeature, ProjectCapsuleCandidateReport, ProjectCapsuleCaptureReport,
     ProjectCapsuleCaptureRequest, ProjectCapsuleCaptureState, ProjectCapsuleComparisonReport,
-    ProjectCapsuleComparisonRequest, ProjectCapsuleEngine, ProjectCapsuleIgnoredRecommendation,
-    ProjectCapsuleIgnoredReview, ProjectCapsuleRepresentation, ProjectCapsuleReview,
-    ProjectCapsuleReviewDecision, ProjectCapsuleReviewDecisionKind, ProjectCapsuleReviewRequest,
-    ProjectCapsuleSupportReport, ProjectCapsuleSupportedState, ProjectCapsuleValidationReport,
-    ProjectCapsuleValidationRequest,
+    ProjectCapsuleComparisonRequest, ProjectCapsuleEngine, ProjectCapsuleExpectation,
+    ProjectCapsuleIgnoredRecommendation, ProjectCapsuleIgnoredReview,
+    ProjectCapsuleRehearsalReceipt, ProjectCapsuleRehearsalRequest, ProjectCapsuleRepresentation,
+    ProjectCapsuleReview, ProjectCapsuleReviewDecision, ProjectCapsuleReviewDecisionKind,
+    ProjectCapsuleReviewRequest, ProjectCapsuleSupportReport, ProjectCapsuleSupportedState,
+    ProjectCapsuleValidationReport, ProjectCapsuleValidationRequest,
 };
 pub use protection_candidates::{
     CandidatePortability, CandidateSensitivity, CandidateSourceKind, CandidateValidation,

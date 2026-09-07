@@ -4,6 +4,7 @@ use std::fmt;
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
 use std::os::unix::fs::{PermissionsExt, symlink};
@@ -11,8 +12,8 @@ use std::os::unix::fs::{PermissionsExt, symlink};
 use crate::{
     BundleEngine, BundleVerification, CoreError, Disposition, GitProcess, IgnoredReview,
     InstalledGit, MigrationItemKind, PackReport, PackRequest, Plan, PlanApprovalState, PlanEngine,
-    ProjectAudit, ProjectHead, ProjectKind, RecoverySecret, RestoreEngine, RestoreRequest,
-    ScanRequest, VerifyRequest,
+    ProjectAudit, ProjectHead, ProjectKind, RecoveryMethod, RecoverySecret, RestoreEngine,
+    RestoreRequest, ScanRequest, VerifyRequest,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -234,6 +235,7 @@ pub struct ProjectCapsuleCaptureReport {
     bundle_bytes: u64,
     verification: BundleVerification,
     pack: PackReport,
+    expectation: Option<ProjectCapsuleExpectation>,
 }
 
 impl fmt::Debug for ProjectCapsuleCaptureReport {
@@ -299,6 +301,10 @@ impl ProjectCapsuleCaptureReport {
         self.pack.offline_recovery_key()
     }
 
+    pub fn expectation(&self) -> Option<&ProjectCapsuleExpectation> {
+        self.expectation.as_ref()
+    }
+
     pub fn human_result(&self) -> String {
         format!(
             "Project Capsule capture\n  state: {}\n  representation: full-repository-snapshot\n  encrypted Bundle: {} bytes\n  authenticated Project: {} bytes\n  next action: {}",
@@ -335,6 +341,110 @@ impl ProjectCapsuleCaptureReport {
                 "authenticated_project_bytes": self.verification.authenticated_bytes,
                 "restore_rehearsal": "not-performed",
                 "synchronized": "not-evaluated",
+            },
+            "warnings": [],
+            "errors": [],
+        })
+        .to_string()
+    }
+}
+
+#[derive(Clone)]
+pub struct ProjectCapsuleExpectation {
+    project_id: String,
+    plan_hash: String,
+    review_hash: String,
+    bundle_identity: String,
+    captured_unix_seconds: u64,
+    observation: ProjectObservation,
+    reviewed_ignored_paths: Vec<PathBuf>,
+}
+
+impl fmt::Debug for ProjectCapsuleExpectation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProjectCapsuleExpectation")
+            .field("project_id", &self.project_id)
+            .field("plan_hash", &self.plan_hash)
+            .field("review_hash", &self.review_hash)
+            .field("bundle_identity", &self.bundle_identity)
+            .field("captured_unix_seconds", &self.captured_unix_seconds)
+            .field("reviewed_ignored_count", &self.reviewed_ignored_paths.len())
+            .finish()
+    }
+}
+
+pub struct ProjectCapsuleRehearsalRequest<'a> {
+    bundle: PathBuf,
+    expectation: &'a ProjectCapsuleExpectation,
+    recovery_secret: &'a RecoverySecret,
+    destination: PathBuf,
+}
+
+impl<'a> ProjectCapsuleRehearsalRequest<'a> {
+    pub fn new(
+        bundle: impl Into<PathBuf>,
+        expectation: &'a ProjectCapsuleExpectation,
+        recovery_secret: &'a RecoverySecret,
+        destination: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            bundle: bundle.into(),
+            expectation,
+            recovery_secret,
+            destination: destination.into(),
+        }
+    }
+}
+
+pub struct ProjectCapsuleRehearsalReceipt {
+    restorable: bool,
+    recovery_method: RecoveryMethod,
+    project_id: String,
+    bundle_identity: String,
+    validation: ProjectCapsuleValidationReport,
+}
+
+impl fmt::Debug for ProjectCapsuleRehearsalReceipt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProjectCapsuleRehearsalReceipt")
+            .field("restorable", &self.restorable)
+            .field("recovery_method", &self.recovery_method)
+            .field("project_id", &self.project_id)
+            .field("bundle_identity", &self.bundle_identity)
+            .field("findings", &self.validation.findings())
+            .finish()
+    }
+}
+
+impl ProjectCapsuleRehearsalReceipt {
+    pub fn is_restorable(&self) -> bool {
+        self.restorable
+    }
+
+    pub fn recovery_method(&self) -> RecoveryMethod {
+        self.recovery_method
+    }
+
+    pub fn validation(&self) -> &ProjectCapsuleValidationReport {
+        &self.validation
+    }
+
+    pub fn machine_json_result(&self) -> String {
+        serde_json::json!({
+            "schema_version": 1,
+            "command": "project capsule rehearse",
+            "status": if self.restorable { "restorable" } else { "unverified" },
+            "data": {
+                "project_id": self.project_id,
+                "bundle_identity": self.bundle_identity,
+                "recovery_method": match self.recovery_method {
+                    RecoveryMethod::Vaultwarden => "vaultwarden",
+                    RecoveryMethod::Offline => "offline",
+                },
+                "restorable": self.restorable,
+                "validation_findings": self.validation.findings(),
             },
             "warnings": [],
             "errors": [],
@@ -802,6 +912,19 @@ impl<G: GitProcess> ProjectCapsuleEngine<G> {
         } else {
             ProjectCapsuleCaptureState::ChangedAndUnverified
         };
+        let expectation = if state == ProjectCapsuleCaptureState::Verified {
+            Some(ProjectCapsuleExpectation {
+                project_id: request.project.id().to_owned(),
+                plan_hash: request.plan.approval_hash()?,
+                review_hash: request.review_hash.clone(),
+                bundle_identity: verification.bundle_identity().to_owned(),
+                captured_unix_seconds: project_capsule_unix_time_now()?,
+                observation: expected.clone(),
+                reviewed_ignored_paths,
+            })
+        } else {
+            None
+        };
         Ok(ProjectCapsuleCaptureReport {
             state,
             pre_capture_hash: expected.digest,
@@ -809,6 +932,39 @@ impl<G: GitProcess> ProjectCapsuleEngine<G> {
             bundle_bytes: file_len(&request.destination)?,
             verification,
             pack,
+            expectation,
+        })
+    }
+
+    pub fn rehearse(
+        &self,
+        request: ProjectCapsuleRehearsalRequest<'_>,
+    ) -> Result<ProjectCapsuleRehearsalReceipt, CoreError> {
+        let verification = BundleEngine::local()
+            .verify(VerifyRequest::new(&request.bundle, request.recovery_secret))?;
+        if verification.bundle_identity() != request.expectation.bundle_identity {
+            return Err(CoreError::InvalidPlan(
+                "Project Capsule expectation does not belong to the selected Bundle".to_owned(),
+            ));
+        }
+        RestoreEngine::local().restore(RestoreRequest::new(
+            &request.bundle,
+            &request.destination,
+            request.recovery_secret,
+        ))?;
+        let validation = validate_project(
+            &self.git,
+            &request.expectation.observation,
+            &request.destination,
+            &request.expectation.reviewed_ignored_paths,
+            &[],
+        )?;
+        Ok(ProjectCapsuleRehearsalReceipt {
+            restorable: validation.is_faithful(),
+            recovery_method: request.recovery_secret.method(),
+            project_id: request.expectation.project_id.clone(),
+            bundle_identity: verification.bundle_identity().to_owned(),
+            validation,
         })
     }
 
@@ -1400,6 +1556,13 @@ fn included_reviewed_ignored_paths(review: &ProjectCapsuleReview) -> Vec<PathBuf
         })
         .map(|candidate| candidate.relative_path.clone())
         .collect()
+}
+
+fn project_capsule_unix_time_now() -> Result<u64, CoreError> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .map_err(|_| CoreError::InvalidPlan("system clock is before the Unix epoch".to_owned()))
 }
 
 #[derive(Debug, Clone)]
