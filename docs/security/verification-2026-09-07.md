@@ -49,6 +49,8 @@ That line obtains the session at runtime and contains no stored credential value
 
 This pattern check is deliberately reported as narrow evidence. It is not entropy-based secret scanning, does not inspect untracked personal files, and cannot prove that arbitrary protected content is absent. A later release review must use an independent secret scanner and review its findings.
 
+A subsequent checksum-verified [Gitleaks scan of the complete tracked Git history](secret-scan-2026-09-07.md) returned zero findings. Its separate scope and limitations remain in force; it does not retroactively make this bounded pattern check broader.
+
 ## Remaining gates
 
 This snapshot does not prove the real owner Vaultwarden transaction, physical Offline Recovery Key separation, real Bundle capture, two Verified Copies, fresh-environment Restore Rehearsals, Project synchronization, conventional backup, command-line orchestration, fuzzing, or independent review. No machine-erasure conclusion can be derived from it.

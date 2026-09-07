@@ -79,6 +79,8 @@ The same exact lockfile now has a deterministic, path-redacted [CycloneDX 1.5 so
 
 The [2026-09-07 automated verification snapshot](security/verification-2026-09-07.md) records 284 passing tests with zero failures and zero ignored tests, strict Clippy and formatting success, and the bounded tracked-repository secret-pattern check. It lists the remaining gates explicitly rather than treating green automation as Owner Dogfood approval.
 
+A checksum-verified [Gitleaks scan of all fifty reachable Git revisions](security/secret-scan-2026-09-07.md) returned zero findings using the scanner's default rules and no allow-list. Its limitations remain explicit; it does not inspect untracked personal files, external services, or future commits.
+
 The [dependency policy audit](security/dependency-policy-audit-2026-09-07.md) reports zero advisory and source-origin findings, while retaining the unresolved Iniza license decision and eleven duplicate-version families for explicit review. No allow-list or duplicate suppression has been inferred.
 
 The bounded [independent security review package](security/independent-review-package.md) now identifies the exact security-sensitive source, decisions, tests, reproduction commands, unresolved gaps, and reviewer deliverable. Its SHA-256 manifest permits a reviewer to detect drift. Preparing the package is not independent acceptance, so the format restriction remains unchanged.
