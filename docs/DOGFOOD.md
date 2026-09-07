@@ -57,7 +57,7 @@ The following observations were collected on 2026-09-07 as preliminary host meta
 - The official Bitwarden command-line client version 2026.8.0 is installed and passes Iniza's non-credentialed executable and interpreter review. The real owner-service recovery transaction, fresh-device sign-in, and independent multi-factor recovery confirmation remain incomplete.
 - A writable two-terabyte external Universal Serial Bus volume is mounted with approximately 832 gigabytes free and a verified Self-Monitoring, Analysis and Reporting Technology status. It uses exFAT and is only a candidate encrypted Bundle destination: it cannot prove restored macOS ownership or extended metadata, has not been selected by the owner, and cannot also satisfy the separately stored Offline Recovery Key failure domain.
 - Time Machine is not running and reports no configured destination. No current conventional-backup validation or representative Restore Attestation has been recorded.
-- The documented projects root occupies approximately 16.6 gibibytes before reviewed generated exclusions. The source volume currently reports approximately 3.9 gibibytes available, which is a narrow margin for temporary artifacts and a locally materialized iCloud Verified Copy.
+- The documented projects root occupies approximately 16.6 gibibytes before reviewed generated exclusions. A refreshed read-only check at `2026-09-07T15:04:23Z` found only approximately 2.3 gibibytes available on the source data volume, down from the earlier approximately 3.9 gibibytes. This is not enough margin to assume temporary capture artifacts or a locally materialized iCloud Verified Copy will fit.
 - iCloud Drive is configured, but it shares the same reported local filesystem availability. This check does not prove cloud quota, complete local materialization, upload completion, independent availability, or enough capacity for a Verified Copy.
 - The preliminary repository-marker count is 23 rather than the original 22. COKS-40 must use Iniza discovery and owner review to determine whether every current Project is Must-Protect, Optional, excluded with a reason, or unsupported.
 
@@ -76,6 +76,12 @@ Project synchronization remains incomplete: `cashsynq` has one unpublished ahead
 On 2026-09-07 cargo-audit 0.22.2 checked the exact committed `Cargo.lock` against 1,240 advisories at RustSec database commit `faedffd5118c1835e13cca3babb6059afb1eb8d0`. All 98 locked dependencies passed with zero vulnerabilities and zero informational, unmaintained, unsound, notice, or yanked-package warnings while `--deny warnings` was active. The reproducible inputs and command are recorded in [the Owner Dogfood RustSec audit](research/owner-dogfood-rustsec-audit-2026-09-07.md).
 
 This automated result does not replace the independent cryptographic, parser, and key-lifecycle review required by ADR 0005. Real sole-copy owner data remains outside the currently accepted format scope.
+
+## Command-line orchestration evidence
+
+At repository commit `44254dba76f6a495d8f8460bc8d0ed53eba1a0ea`, the supported executable exposes Plan scan, review, validation, approval and comparison; read-only Project audit; immutable Push Plan operations; Offline Recovery Key rehearsal; authenticated inspect; and development-only fixture operations. The documented encrypted `pack`, `verify`, `copy`, `restore`, `status`, and Bitwarden connector commands are not yet wired into the executable.
+
+The reusable encrypted Bundle, Verified Copy, Restore, Offline Recovery Key, Vaultwarden, and Project Capsule transactions exist in the Rust core and have automated synthetic coverage. Those in-process interfaces do not by themselves provide the supported cross-process owner workflow required to capture and migrate this Mac. Owner Dogfood therefore remains blocked on the issue that binds both Recovery Methods and these transactions into the fail-closed command-line workflow.
 
 Owner Dogfood remains blocked until the external storage, conventional backups, current Project inventory, both Recovery Methods, and required rehearsals are present and verified.
 
