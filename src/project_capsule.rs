@@ -7,7 +7,9 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink};
+
+use sha2::{Digest, Sha256};
 
 use crate::{
     BundleEngine, BundleVerification, CoreError, Disposition, GitProcess, IgnoredReview,
@@ -31,6 +33,7 @@ pub enum ProjectCapsuleCaptureState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ProjectCapsuleSupportedState {
     AttachedCurrentState,
+    DetachedCurrentState,
     Stashes,
     LocalOnlyBranches,
     LocalOnlyTags,
@@ -38,17 +41,26 @@ pub enum ProjectCapsuleSupportedState {
     UnstagedChanges,
     UntrackedItems,
     RepositoryWithoutRemote,
+    LocallyCompleteGitLargeFileStorage,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ProjectCapsuleBlockingFeature {
     Submodules,
+    IncompleteGitLargeFileStorage,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectCapsuleSupportReport {
     supported_states: BTreeSet<ProjectCapsuleSupportedState>,
     blocking_features: BTreeSet<ProjectCapsuleBlockingFeature>,
+    git_large_file_storage_objects: Vec<ProjectCapsuleGitLargeFileStorageEvidence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ProjectCapsuleGitLargeFileStorageEvidence {
+    object_identifier: String,
+    size: u64,
 }
 
 impl ProjectCapsuleSupportReport {
@@ -358,6 +370,9 @@ pub struct ProjectCapsuleExpectation {
     captured_unix_seconds: u64,
     observation: ProjectObservation,
     reviewed_ignored_paths: Vec<PathBuf>,
+    reviewed_executable_modes: BTreeMap<PathBuf, u32>,
+    required_executable_mode_review_hash: Option<String>,
+    git_large_file_storage_objects: Vec<ProjectCapsuleGitLargeFileStorageEvidence>,
 }
 
 impl fmt::Debug for ProjectCapsuleExpectation {
@@ -370,7 +385,21 @@ impl fmt::Debug for ProjectCapsuleExpectation {
             .field("bundle_identity", &self.bundle_identity)
             .field("captured_unix_seconds", &self.captured_unix_seconds)
             .field("reviewed_ignored_count", &self.reviewed_ignored_paths.len())
+            .field(
+                "reviewed_executable_count",
+                &self.reviewed_executable_modes.len(),
+            )
+            .field(
+                "git_large_file_storage_object_count",
+                &self.git_large_file_storage_objects.len(),
+            )
             .finish()
+    }
+}
+
+impl ProjectCapsuleExpectation {
+    pub fn required_executable_mode_review_hash(&self) -> Option<&str> {
+        self.required_executable_mode_review_hash.as_deref()
     }
 }
 
@@ -379,6 +408,7 @@ pub struct ProjectCapsuleRehearsalRequest<'a> {
     expectation: &'a ProjectCapsuleExpectation,
     recovery_secret: &'a RecoverySecret,
     destination: PathBuf,
+    executable_mode_review_hash: Option<String>,
 }
 
 impl<'a> ProjectCapsuleRehearsalRequest<'a> {
@@ -393,7 +423,13 @@ impl<'a> ProjectCapsuleRehearsalRequest<'a> {
             expectation,
             recovery_secret,
             destination: destination.into(),
+            executable_mode_review_hash: None,
         }
+    }
+
+    pub fn with_executable_mode_review_hash(mut self, hash: impl Into<String>) -> Self {
+        self.executable_mode_review_hash = Some(hash.into());
+        self
     }
 }
 
@@ -778,6 +814,9 @@ impl<G: GitProcess> ProjectCapsuleEngine<G> {
         if matches!(local_state.head(), ProjectHead::Branch(_)) {
             supported_states.insert(ProjectCapsuleSupportedState::AttachedCurrentState);
         }
+        if matches!(local_state.head(), ProjectHead::Detached(_)) {
+            supported_states.insert(ProjectCapsuleSupportedState::DetachedCurrentState);
+        }
         if local_state.stash_count() > 0 {
             supported_states.insert(ProjectCapsuleSupportedState::Stashes);
         }
@@ -800,12 +839,27 @@ impl<G: GitProcess> ProjectCapsuleEngine<G> {
             supported_states.insert(ProjectCapsuleSupportedState::RepositoryWithoutRemote);
         }
         let mut blocking_features = BTreeSet::new();
+        let mut git_large_file_storage_objects = Vec::new();
         if !request.project.submodules().is_empty() {
             blocking_features.insert(ProjectCapsuleBlockingFeature::Submodules);
+        }
+        if request.project.git_large_file_storage().configured() {
+            match local_git_large_file_storage_evidence(request.project.root())? {
+                Some(objects) => {
+                    git_large_file_storage_objects = objects;
+                    supported_states
+                        .insert(ProjectCapsuleSupportedState::LocallyCompleteGitLargeFileStorage);
+                }
+                None => {
+                    blocking_features
+                        .insert(ProjectCapsuleBlockingFeature::IncompleteGitLargeFileStorage);
+                }
+            }
         }
         let support_report = ProjectCapsuleSupportReport {
             supported_states,
             blocking_features,
+            git_large_file_storage_objects,
         };
         let mut decisions = BTreeMap::new();
         for decision in request.decisions {
@@ -913,6 +967,15 @@ impl<G: GitProcess> ProjectCapsuleEngine<G> {
             ProjectCapsuleCaptureState::ChangedAndUnverified
         };
         let expectation = if state == ProjectCapsuleCaptureState::Verified {
+            let reviewed_executable_modes =
+                reviewed_executable_modes(request.project.root(), &request.reviewed_executables)?;
+            let required_executable_mode_review_hash = executable_expectation_review_hash(
+                request.project.id(),
+                &request.review_hash,
+                verification.bundle_identity(),
+                &expected,
+                &reviewed_executable_modes,
+            );
             Some(ProjectCapsuleExpectation {
                 project_id: request.project.id().to_owned(),
                 plan_hash: request.plan.approval_hash()?,
@@ -921,6 +984,13 @@ impl<G: GitProcess> ProjectCapsuleEngine<G> {
                 captured_unix_seconds: project_capsule_unix_time_now()?,
                 observation: expected.clone(),
                 reviewed_ignored_paths,
+                reviewed_executable_modes,
+                required_executable_mode_review_hash,
+                git_large_file_storage_objects: request
+                    .review
+                    .support_report
+                    .git_large_file_storage_objects
+                    .clone(),
             })
         } else {
             None
@@ -952,13 +1022,60 @@ impl<G: GitProcess> ProjectCapsuleEngine<G> {
             &request.destination,
             request.recovery_secret,
         ))?;
-        let validation = validate_project(
+        let executable_mode_approved = request
+            .expectation
+            .required_executable_mode_review_hash
+            .as_deref()
+            .is_none_or(|required| {
+                request.executable_mode_review_hash.as_deref() == Some(required)
+            });
+        if executable_mode_approved {
+            restore_expected_executable_modes(
+                &request.destination,
+                &request.expectation.reviewed_executable_modes,
+            )?;
+        }
+        let reviewed_executables = request
+            .expectation
+            .reviewed_executable_modes
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut validation = validate_project(
             &self.git,
             &request.expectation.observation,
             &request.destination,
             &request.expectation.reviewed_ignored_paths,
-            &[],
+            &reviewed_executables,
         )?;
+        validation.required_executable_mode_review_hash = request
+            .expectation
+            .required_executable_mode_review_hash
+            .clone();
+        validation.executable_mode_review_pending = !executable_mode_approved;
+        if !executable_mode_approved
+            && !validation
+                .findings
+                .iter()
+                .any(|finding| finding == "executable-mode-review")
+        {
+            validation
+                .findings
+                .push("executable-mode-review".to_owned());
+            validation.faithful = false;
+        }
+        if !request
+            .expectation
+            .git_large_file_storage_objects
+            .is_empty()
+            && local_git_large_file_storage_evidence(&request.destination)?
+                != Some(request.expectation.git_large_file_storage_objects.clone())
+        {
+            validation
+                .findings
+                .push("git-large-file-storage-evidence".to_owned());
+            validation.faithful = false;
+        }
         Ok(ProjectCapsuleRehearsalReceipt {
             restorable: validation.is_faithful(),
             recovery_method: request.recovery_secret.method(),
@@ -1403,6 +1520,11 @@ fn project_capsule_review_hash(
         hasher.update(&(name.len() as u64).to_le_bytes());
         hasher.update(name.as_bytes());
     }
+    for object in &support_report.git_large_file_storage_objects {
+        hasher.update(&(object.object_identifier.len() as u64).to_le_bytes());
+        hasher.update(object.object_identifier.as_bytes());
+        hasher.update(&object.size.to_le_bytes());
+    }
     for candidate in ignored_candidates {
         hasher.update(&(candidate.candidate_id.len() as u64).to_le_bytes());
         hasher.update(candidate.candidate_id.as_bytes());
@@ -1514,12 +1636,25 @@ fn validate_capture_request(
         ));
     }
     if !request.project.submodules().is_empty()
-        || request.project.git_large_file_storage().configured()
         || root.join(".git/objects/info/alternates").exists()
         || root.join(".git/worktrees").exists()
     {
         return Err(CoreError::InvalidPlan(
             "Project Capsule capture found unsupported repository state".to_owned(),
+        ));
+    }
+    if request.project.git_large_file_storage().configured()
+        && local_git_large_file_storage_evidence(root)?
+            != Some(
+                request
+                    .review
+                    .support_report
+                    .git_large_file_storage_objects
+                    .clone(),
+            )
+    {
+        return Err(CoreError::InvalidPlan(
+            "Project Capsule capture requires a fresh Git Large File Storage review".to_owned(),
         ));
     }
     let ignored = ignored_paths(git, root)?;
@@ -1556,6 +1691,252 @@ fn included_reviewed_ignored_paths(review: &ProjectCapsuleReview) -> Vec<PathBuf
         })
         .map(|candidate| candidate.relative_path.clone())
         .collect()
+}
+
+fn local_git_large_file_storage_evidence(
+    root: &Path,
+) -> Result<Option<Vec<ProjectCapsuleGitLargeFileStorageEvidence>>, CoreError> {
+    let mut objects = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory).map_err(|source| CoreError::Io {
+            action: "inspect Git Large File Storage pointers",
+            path: directory.clone(),
+            source,
+        })? {
+            let entry = entry.map_err(|source| CoreError::Io {
+                action: "inspect Git Large File Storage pointer entry",
+                path: directory.clone(),
+                source,
+            })?;
+            if entry.path() == root.join(".git") {
+                continue;
+            }
+            let metadata = fs::symlink_metadata(entry.path()).map_err(|source| CoreError::Io {
+                action: "inspect Git Large File Storage pointer type",
+                path: entry.path(),
+                source,
+            })?;
+            if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                if entry.path() != root && entry.path().join(".git").exists() {
+                    continue;
+                }
+                pending.push(entry.path());
+                continue;
+            }
+            if !metadata.is_file() || metadata.len() > 1024 {
+                continue;
+            }
+            let bytes = read_regular_file_without_following(
+                &entry.path(),
+                "read Git Large File Storage pointer",
+            )?;
+            if !bytes.starts_with(b"version https://git-lfs.github.com/spec/v1\n") {
+                continue;
+            }
+            let Some((object_identifier, size)) = parse_git_large_file_storage_pointer(&bytes)
+            else {
+                return Ok(None);
+            };
+            let object = root
+                .join(".git/lfs/objects")
+                .join(&object_identifier[..2])
+                .join(&object_identifier[2..4])
+                .join(&object_identifier);
+            let Ok(object_metadata) = fs::symlink_metadata(&object) else {
+                return Ok(None);
+            };
+            if !object_metadata.is_file() || object_metadata.len() != size {
+                return Ok(None);
+            }
+            let mut file = open_regular_file_without_following(
+                &object,
+                "open local Git Large File Storage object",
+            )?;
+            let mut hasher = Sha256::new();
+            let mut buffer = [0_u8; 64 * 1024];
+            loop {
+                let read = file.read(&mut buffer).map_err(|source| CoreError::Io {
+                    action: "hash local Git Large File Storage object",
+                    path: object.clone(),
+                    source,
+                })?;
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..read]);
+            }
+            let Some(expected_digest) = decode_sha256_identifier(&object_identifier) else {
+                return Ok(None);
+            };
+            if hasher.finalize()[..] != expected_digest {
+                return Ok(None);
+            }
+            objects.push(ProjectCapsuleGitLargeFileStorageEvidence {
+                object_identifier,
+                size,
+            });
+        }
+    }
+    objects.sort();
+    objects.dedup();
+    Ok(Some(objects))
+}
+
+fn parse_git_large_file_storage_pointer(bytes: &[u8]) -> Option<(String, u64)> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let mut lines = text.lines();
+    if lines.next()? != "version https://git-lfs.github.com/spec/v1" {
+        return None;
+    }
+    let object_identifier = lines.next()?.strip_prefix("oid sha256:")?;
+    if object_identifier.len() != 64
+        || !object_identifier
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return None;
+    }
+    let size = lines.next()?.strip_prefix("size ")?.parse().ok()?;
+    if lines.next().is_some() {
+        return None;
+    }
+    Some((object_identifier.to_owned(), size))
+}
+
+fn decode_sha256_identifier(identifier: &str) -> Option<[u8; 32]> {
+    if identifier.len() != 64 {
+        return None;
+    }
+    let mut decoded = [0_u8; 32];
+    for (index, pair) in identifier.as_bytes().chunks_exact(2).enumerate() {
+        let high = (pair[0] as char).to_digit(16)? as u8;
+        let low = (pair[1] as char).to_digit(16)? as u8;
+        decoded[index] = (high << 4) | low;
+    }
+    Some(decoded)
+}
+
+fn read_regular_file_without_following(
+    path: &Path,
+    action: &'static str,
+) -> Result<Vec<u8>, CoreError> {
+    let mut file = open_regular_file_without_following(path, action)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|source| CoreError::Io {
+            action,
+            path: path.to_path_buf(),
+            source,
+        })?;
+    Ok(bytes)
+}
+
+fn open_regular_file_without_following(
+    path: &Path,
+    action: &'static str,
+) -> Result<fs::File, CoreError> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    options.open(path).map_err(|source| CoreError::Io {
+        action,
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+fn reviewed_executable_modes(
+    root: &Path,
+    reviewed_executables: &[PathBuf],
+) -> Result<BTreeMap<PathBuf, u32>, CoreError> {
+    let mut modes = BTreeMap::new();
+    for relative in reviewed_executables {
+        let metadata =
+            fs::symlink_metadata(root.join(relative)).map_err(|source| CoreError::Io {
+                action: "inspect reviewed Project executable mode",
+                path: root.join(relative),
+                source,
+            })?;
+        if !metadata.is_file() || !is_executable(&metadata) {
+            return Err(CoreError::InvalidPlan(
+                "reviewed Project executable is not an executable regular file".to_owned(),
+            ));
+        }
+        #[cfg(unix)]
+        let mode = metadata.permissions().mode() & 0o777;
+        #[cfg(not(unix))]
+        let mode = 0_u32;
+        modes.insert(relative.clone(), mode);
+    }
+    Ok(modes)
+}
+
+fn executable_expectation_review_hash(
+    project_id: &str,
+    review_hash: &str,
+    bundle_identity: &str,
+    observation: &ProjectObservation,
+    reviewed_executable_modes: &BTreeMap<PathBuf, u32>,
+) -> Option<String> {
+    if reviewed_executable_modes.is_empty() {
+        return None;
+    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"iniza Project Capsule executable expectation v1\0");
+    for field in [
+        project_id.as_bytes(),
+        review_hash.as_bytes(),
+        bundle_identity.as_bytes(),
+        observation.digest.as_bytes(),
+    ] {
+        hasher.update(&(field.len() as u64).to_le_bytes());
+        hasher.update(field);
+    }
+    for (path, mode) in reviewed_executable_modes {
+        let path = path.to_string_lossy();
+        hasher.update(&(path.len() as u64).to_le_bytes());
+        hasher.update(path.as_bytes());
+        hasher.update(&mode.to_le_bytes());
+    }
+    Some(format!(
+        "project_capsule_mode_review_blake3_{}",
+        hasher.finalize().to_hex()
+    ))
+}
+
+fn restore_expected_executable_modes(
+    restored: &Path,
+    reviewed_executable_modes: &BTreeMap<PathBuf, u32>,
+) -> Result<(), CoreError> {
+    for (relative, mode) in reviewed_executable_modes {
+        if relative.starts_with(".git/hooks") {
+            return Err(CoreError::InvalidPlan(
+                "Git hooks cannot receive executable-mode approval".to_owned(),
+            ));
+        }
+        let destination = restored.join(relative);
+        let metadata = fs::symlink_metadata(&destination).map_err(|source| CoreError::Io {
+            action: "inspect reviewed executable Restore",
+            path: destination.clone(),
+            source,
+        })?;
+        if !metadata.is_file() {
+            return Err(CoreError::InvalidPlan(
+                "reviewed executable Restore is not a regular file".to_owned(),
+            ));
+        }
+        #[cfg(unix)]
+        fs::set_permissions(&destination, fs::Permissions::from_mode(*mode)).map_err(|source| {
+            CoreError::Io {
+                action: "restore expectation-bound executable mode",
+                path: destination,
+                source,
+            }
+        })?;
+    }
+    Ok(())
 }
 
 fn project_capsule_unix_time_now() -> Result<u64, CoreError> {

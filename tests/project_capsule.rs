@@ -204,6 +204,161 @@ fn project_capsule_review_reports_submodules_as_blocking_without_creating_a_bund
 
 #[cfg(unix)]
 #[test]
+fn project_capsule_review_supports_only_locally_complete_git_large_file_storage() {
+    let directory = TestDirectory::new("review-git-large-file-storage");
+    let project = directory.path.join("owner-project");
+    let object_identifier = "98c39e64f19da3a96f045b55438f021cf57b22112b17be5fc857b41ff854089d";
+    let object = project
+        .join(".git/lfs/objects/98/c3")
+        .join(object_identifier);
+    fs::create_dir_all(&project).expect("Project should be created");
+    git(&project, &["init", "-q", "--initial-branch=main"]);
+    fs::write(
+        project.join(".gitattributes"),
+        "large.bin filter=lfs diff=lfs merge=lfs -text\n",
+    )
+    .expect("Git Large File Storage attributes should be written");
+    fs::write(
+        project.join("large.bin"),
+        format!(
+            "version https://git-lfs.github.com/spec/v1\noid sha256:{object_identifier}\nsize 27\n"
+        ),
+    )
+    .expect("Git Large File Storage pointer should be written");
+    git(&project, &["add", ".gitattributes", "large.bin"]);
+    commit(
+        &project,
+        "Add synthetic Git Large File Storage pointer",
+        "2026-01-01T00:00:00Z",
+    );
+    fs::create_dir_all(object.parent().expect("object should have a parent"))
+        .expect("local object directory should be created");
+    fs::write(&object, b"synthetic large file bytes\n")
+        .expect("local Git Large File Storage object should be written");
+    let mut plan = PlanEngine::local()
+        .scan(ScanRequest::for_directory(&project))
+        .expect("Project Plan should scan");
+    let plan_hash = plan.approval_hash().expect("Project Plan should hash");
+    plan.approve(&plan_hash).expect("exact Plan should approve");
+    let audit = ProjectAuditEngine::local()
+        .audit(ProjectAuditRequest::from_plan(&plan))
+        .expect("Git Large File Storage Project should audit locally");
+    let project_audit = audit.projects().first().expect("Project should be present");
+
+    let complete = ProjectCapsuleEngine::local()
+        .review(ProjectCapsuleReviewRequest::new(&plan, project_audit))
+        .expect("local Git Large File Storage evidence should be reviewed without fetching");
+    assert!(
+        complete
+            .support_report()
+            .supports(ProjectCapsuleSupportedState::LocallyCompleteGitLargeFileStorage)
+    );
+    assert!(
+        !complete
+            .support_report()
+            .blocks(ProjectCapsuleBlockingFeature::IncompleteGitLargeFileStorage)
+    );
+
+    fs::remove_file(&object).expect("local object should be made unavailable");
+    let missing = ProjectCapsuleEngine::local()
+        .review(ProjectCapsuleReviewRequest::new(&plan, project_audit))
+        .expect("missing local object should remain visible without fetching");
+    assert!(
+        missing
+            .support_report()
+            .blocks(ProjectCapsuleBlockingFeature::IncompleteGitLargeFileStorage)
+    );
+    assert!(!missing.support_report().is_supported_for_capture());
+    assert_ne!(complete.review_hash(), missing.review_hash());
+}
+
+#[cfg(unix)]
+#[test]
+fn locally_complete_git_large_file_storage_round_trips_without_fetching() {
+    let directory = TestDirectory::new("git-large-file-storage-round-trip");
+    let project = directory.path.join("owner-project");
+    let bundle = directory.path.join("project-capsule.iniza");
+    let restore = directory.path.join("restored-project");
+    let object_identifier = "98c39e64f19da3a96f045b55438f021cf57b22112b17be5fc857b41ff854089d";
+    let relative_object = PathBuf::from(".git/lfs/objects/98/c3").join(object_identifier);
+    fs::create_dir_all(&project).expect("Project should be created");
+    git(&project, &["init", "-q", "--initial-branch=main"]);
+    fs::write(
+        project.join(".gitattributes"),
+        "large.bin filter=lfs diff=lfs merge=lfs -text\n",
+    )
+    .expect("Git Large File Storage attributes should be written");
+    fs::write(
+        project.join("large.bin"),
+        format!(
+            "version https://git-lfs.github.com/spec/v1\noid sha256:{object_identifier}\nsize 27\n"
+        ),
+    )
+    .expect("Git Large File Storage pointer should be written");
+    git(&project, &["add", ".gitattributes", "large.bin"]);
+    commit(
+        &project,
+        "Add synthetic Git Large File Storage pointer",
+        "2026-01-01T00:00:00Z",
+    );
+    fs::create_dir_all(
+        project
+            .join(&relative_object)
+            .parent()
+            .expect("object should have a parent"),
+    )
+    .expect("local object directory should be created");
+    fs::write(
+        project.join(&relative_object),
+        b"synthetic large file bytes\n",
+    )
+    .expect("local Git Large File Storage object should be written");
+    let mut plan = PlanEngine::local()
+        .scan(ScanRequest::for_directory(&project))
+        .expect("Project Plan should scan");
+    let plan_hash = plan.approval_hash().expect("Project Plan should hash");
+    plan.approve(&plan_hash).expect("exact Plan should approve");
+    let audit = ProjectAuditEngine::local()
+        .audit(ProjectAuditRequest::from_plan(&plan))
+        .expect("Git Large File Storage Project should audit locally");
+    let project_audit = audit.projects().first().expect("Project should be present");
+    let review = ProjectCapsuleEngine::local()
+        .review(ProjectCapsuleReviewRequest::new(&plan, project_audit))
+        .expect("locally complete Git Large File Storage should be reviewed");
+    let review_hash = review.review_hash().to_owned();
+    let capture = ProjectCapsuleEngine::local()
+        .capture(ProjectCapsuleCaptureRequest::new(
+            &plan,
+            project_audit,
+            &review,
+            review_hash,
+            &bundle,
+        ))
+        .expect("locally complete Git Large File Storage should capture");
+    let expectation = capture
+        .expectation()
+        .expect("verified capture should produce an expectation")
+        .clone();
+    fs::remove_dir_all(&project).expect("source Project should be made unavailable");
+
+    let receipt = ProjectCapsuleEngine::local()
+        .rehearse(ProjectCapsuleRehearsalRequest::new(
+            &bundle,
+            &expectation,
+            capture.offline_recovery_key(),
+            &restore,
+        ))
+        .expect("local Git Large File Storage Restore Rehearsal should complete");
+
+    assert!(receipt.is_restorable(), "{receipt:#?}");
+    assert_eq!(
+        fs::read(restore.join(relative_object)).expect("local object should restore"),
+        b"synthetic large file bytes\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn both_project_capsule_representations_restore_the_complete_reviewed_dirty_project() {
     let directory = TestDirectory::new("dirty-round-trip");
     let project = directory.path.join("owner-project");
@@ -882,6 +1037,212 @@ fn verified_capture_rehearses_as_restorable_without_consulting_the_source_projec
     let visible = format!("{receipt:?}{}", receipt.machine_json_result());
     assert!(!visible.contains("owner-project"));
     assert!(!visible.contains(&directory.path.to_string_lossy().to_string()));
+}
+
+#[cfg(unix)]
+#[test]
+fn detached_unreferenced_current_state_is_supported_by_source_independent_rehearsal() {
+    let directory = TestDirectory::new("detached-source-independent-rehearsal");
+    let project = directory.path.join("owner-project");
+    let bundle = directory.path.join("project-capsule.iniza");
+    let restore = directory.path.join("restored-project");
+    fs::create_dir_all(&project).expect("Project should be created");
+    git(&project, &["init", "-q", "--initial-branch=main"]);
+    fs::write(project.join("tracked.txt"), "attached base\n")
+        .expect("base fixture should be written");
+    git(&project, &["add", "tracked.txt"]);
+    commit(&project, "Create attached base", "2026-01-01T00:00:00Z");
+    git(&project, &["checkout", "--detach", "-q"]);
+    fs::write(
+        project.join("detached.txt"),
+        "unreferenced current commit\n",
+    )
+    .expect("detached fixture should be written");
+    git(&project, &["add", "detached.txt"]);
+    commit(
+        &project,
+        "Create detached current state",
+        "2026-01-02T00:00:00Z",
+    );
+    let expected_head = git_stdout(&project, &["rev-parse", "HEAD"])
+        .trim()
+        .to_owned();
+    let mut plan = PlanEngine::local()
+        .scan(ScanRequest::for_directory(&project))
+        .expect("detached Project Plan should scan");
+    let plan_hash = plan.approval_hash().expect("Project Plan should hash");
+    plan.approve(&plan_hash).expect("exact Plan should approve");
+    let audit = ProjectAuditEngine::local()
+        .audit(ProjectAuditRequest::from_plan(&plan))
+        .expect("detached Project should audit");
+    let project_audit = audit.projects().first().expect("Project should be present");
+    let review = ProjectCapsuleEngine::local()
+        .review(ProjectCapsuleReviewRequest::new(&plan, project_audit))
+        .expect("detached Project should be reviewable");
+    assert!(
+        review
+            .support_report()
+            .supports(ProjectCapsuleSupportedState::DetachedCurrentState)
+    );
+    let review_hash = review.review_hash().to_owned();
+    let capture = ProjectCapsuleEngine::local()
+        .capture(ProjectCapsuleCaptureRequest::new(
+            &plan,
+            project_audit,
+            &review,
+            review_hash,
+            &bundle,
+        ))
+        .expect("detached Project should capture");
+    let expectation = capture
+        .expectation()
+        .expect("verified detached capture should produce an expectation")
+        .clone();
+    fs::remove_dir_all(&project).expect("source Project should be made unavailable");
+
+    let receipt = ProjectCapsuleEngine::local()
+        .rehearse(ProjectCapsuleRehearsalRequest::new(
+            &bundle,
+            &expectation,
+            capture.offline_recovery_key(),
+            &restore,
+        ))
+        .expect("detached Restore Rehearsal should not consult the source");
+
+    assert!(receipt.is_restorable(), "{receipt:#?}");
+    assert!(receipt.validation().current_state_is_detached());
+    assert_eq!(receipt.validation().head_object_identifier(), expected_head);
+}
+
+#[cfg(unix)]
+#[test]
+fn complete_dirty_state_rehearses_independently_through_both_recovery_methods() {
+    let directory = TestDirectory::new("complete-source-independent-rehearsal");
+    let project = directory.path.join("owner-project");
+    let bundle = directory.path.join("project-capsule.iniza");
+    let offline_restore = directory.path.join("offline-restored-project");
+    let vaultwarden_restore = directory.path.join("vaultwarden-restored-project");
+    let script_sentinel = directory.path.join("script-ran");
+    let hook_sentinel = directory.path.join("hook-ran");
+    create_dirty_project_fixture(&project, &script_sentinel, &hook_sentinel);
+    retain_only_reviewed_environment_candidate(&project);
+    let mut plan = PlanEngine::local()
+        .scan(ScanRequest::for_directory(&project))
+        .expect("dirty Project Plan should scan");
+    let plan_hash = plan.approval_hash().expect("Project Plan should hash");
+    plan.approve(&plan_hash).expect("exact Plan should approve");
+    let audit = ProjectAuditEngine::local()
+        .audit(ProjectAuditRequest::from_plan(&plan))
+        .expect("dirty Project should audit");
+    let project_audit = audit.projects().first().expect("Project should be present");
+    let review = complete_encrypted_ignored_review(&plan, project_audit);
+    let review_hash = review.review_hash().to_owned();
+    let capture = ProjectCapsuleEngine::local()
+        .capture(
+            ProjectCapsuleCaptureRequest::new(&plan, project_audit, &review, review_hash, &bundle)
+                .with_reviewed_executable("scripts/rebuild.sh"),
+        )
+        .expect("complete dirty Project should capture");
+    let expectation = capture
+        .expectation()
+        .expect("verified dirty capture should produce an expectation")
+        .clone();
+    let executable_review_hash = expectation
+        .required_executable_mode_review_hash()
+        .expect("reviewed executable should require an exact Bundle-bound hash")
+        .to_owned();
+    fs::remove_dir_all(&project).expect("source Project should be made unavailable");
+
+    let offline = ProjectCapsuleEngine::local()
+        .rehearse(
+            ProjectCapsuleRehearsalRequest::new(
+                &bundle,
+                &expectation,
+                capture.offline_recovery_key(),
+                &offline_restore,
+            )
+            .with_executable_mode_review_hash(&executable_review_hash),
+        )
+        .expect("Offline Recovery Key rehearsal should complete");
+    let vaultwarden = ProjectCapsuleEngine::local()
+        .rehearse(
+            ProjectCapsuleRehearsalRequest::new(
+                &bundle,
+                &expectation,
+                capture.vaultwarden_recovery_secret(),
+                &vaultwarden_restore,
+            )
+            .with_executable_mode_review_hash(&executable_review_hash),
+        )
+        .expect("Vaultwarden Recovery Secret rehearsal should complete");
+
+    assert!(offline.is_restorable(), "{offline:#?}");
+    assert!(vaultwarden.is_restorable(), "{vaultwarden:#?}");
+    assert_eq!(offline.recovery_method(), RecoveryMethod::Offline);
+    assert_eq!(vaultwarden.recovery_method(), RecoveryMethod::Vaultwarden);
+    for restored in [&offline_restore, &vaultwarden_restore] {
+        assert_eq!(
+            fs::read(restored.join("staged.txt")).expect("staged worktree state should restore"),
+            b"selected staged content\n"
+        );
+        assert_eq!(
+            git_bytes(restored, &["show", ":staged.txt"]),
+            b"selected staged content\n"
+        );
+        assert_eq!(
+            fs::read(restored.join("binary.dat")).expect("binary worktree state should restore"),
+            [0_u8, 255, 16, 32, 48, 64, 80, 96]
+        );
+        assert_eq!(
+            fs::read(restored.join(".env.local")).expect("reviewed ignored state should restore"),
+            b"SYNTHETIC_ONLY=true\n"
+        );
+        assert_eq!(
+            fs::read_link(restored.join("current-config"))
+                .expect("safe symbolic link should restore"),
+            PathBuf::from("config/development.json")
+        );
+        assert!(restored.join("uploads/empty").is_dir());
+        assert_ne!(
+            fs::metadata(restored.join("scripts/rebuild.sh"))
+                .expect("reviewed executable should restore")
+                .permissions()
+                .mode()
+                & 0o111,
+            0
+        );
+        assert_eq!(
+            fs::metadata(restored.join(".git/hooks/pre-commit"))
+                .expect("hook should restore as evidence")
+                .permissions()
+                .mode()
+                & 0o111,
+            0
+        );
+        assert_eq!(
+            offline
+                .validation()
+                .reference_object_identifier("refs/heads/feature/local"),
+            Some("d5fab99845a315081adb2f64f5a50df4fec18ade")
+        );
+        assert_eq!(
+            offline
+                .validation()
+                .reference_object_identifier("refs/stash"),
+            Some("b52e9e9858a1e2db1386288dae75d549a681ee47")
+        );
+        assert_eq!(
+            offline
+                .validation()
+                .reference_object_identifier("refs/tags/owner-snapshot"),
+            Some("c03a07a58990d68ea6c78b79a1ba3c27baf5c088")
+        );
+    }
+    assert!(
+        !script_sentinel.exists(),
+        "reviewed executable must never run"
+    );
+    assert!(!hook_sentinel.exists(), "Git hook must never run");
 }
 
 #[cfg(unix)]
