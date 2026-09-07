@@ -77,12 +77,14 @@ pub enum ProjectCapsuleIgnoredRecommendation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProjectCapsuleReviewDecisionKind {
     IncludeAsEncryptedReviewedState,
+    ExcludeAsReproducibleGeneratedState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectCapsuleReviewDecision {
     candidate_id: String,
     kind: ProjectCapsuleReviewDecisionKind,
+    owner_reason: Option<String>,
 }
 
 impl ProjectCapsuleReviewDecision {
@@ -90,6 +92,18 @@ impl ProjectCapsuleReviewDecision {
         Self {
             candidate_id: candidate_id.into(),
             kind: ProjectCapsuleReviewDecisionKind::IncludeAsEncryptedReviewedState,
+            owner_reason: None,
+        }
+    }
+
+    pub fn exclude_as_reproducible_generated_state(
+        candidate_id: impl Into<String>,
+        owner_reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            candidate_id: candidate_id.into(),
+            kind: ProjectCapsuleReviewDecisionKind::ExcludeAsReproducibleGeneratedState,
+            owner_reason: Some(owner_reason.into()),
         }
     }
 }
@@ -97,8 +111,10 @@ impl ProjectCapsuleReviewDecision {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectCapsuleIgnoredReview {
     candidate_id: String,
+    relative_path: PathBuf,
     recommendation: ProjectCapsuleIgnoredRecommendation,
     decision: Option<ProjectCapsuleReviewDecisionKind>,
+    owner_reason: Option<String>,
 }
 
 impl ProjectCapsuleIgnoredReview {
@@ -112,6 +128,10 @@ impl ProjectCapsuleIgnoredReview {
 
     pub fn decision(&self) -> Option<ProjectCapsuleReviewDecisionKind> {
         self.decision
+    }
+
+    pub fn owner_reason(&self) -> Option<&str> {
+        self.owner_reason.as_deref()
     }
 }
 
@@ -138,6 +158,9 @@ impl<'a> ProjectCapsuleReviewRequest<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectCapsuleReview {
+    plan_hash: String,
+    project_id: String,
+    project_observation_hash: String,
     support_report: ProjectCapsuleSupportReport,
     ignored_candidates: Vec<ProjectCapsuleIgnoredReview>,
     review_hash: String,
@@ -161,30 +184,41 @@ impl ProjectCapsuleReview {
     pub fn review_hash(&self) -> &str {
         &self.review_hash
     }
+
+    pub fn is_complete(&self) -> bool {
+        self.support_report.is_supported_for_capture()
+            && self
+                .ignored_candidates
+                .iter()
+                .all(|candidate| candidate.decision.is_some())
+    }
 }
 
 pub struct ProjectCapsuleCaptureRequest<'a> {
     plan: &'a Plan,
     project: &'a ProjectAudit,
+    review: &'a ProjectCapsuleReview,
+    review_hash: String,
     destination: PathBuf,
-    reviewed_ignored_paths: Vec<PathBuf>,
     reviewed_executables: Vec<PathBuf>,
 }
 
 impl<'a> ProjectCapsuleCaptureRequest<'a> {
-    pub fn new(plan: &'a Plan, project: &'a ProjectAudit, destination: impl Into<PathBuf>) -> Self {
+    pub fn new(
+        plan: &'a Plan,
+        project: &'a ProjectAudit,
+        review: &'a ProjectCapsuleReview,
+        review_hash: impl Into<String>,
+        destination: impl Into<PathBuf>,
+    ) -> Self {
         Self {
             plan,
             project,
+            review,
+            review_hash: review_hash.into(),
             destination: destination.into(),
-            reviewed_ignored_paths: Vec::new(),
             reviewed_executables: Vec::new(),
         }
-    }
-
-    pub fn with_reviewed_ignored_path(mut self, path: impl Into<PathBuf>) -> Self {
-        self.reviewed_ignored_paths.push(path.into());
-        self
     }
 
     pub fn with_reviewed_executable(mut self, path: impl Into<PathBuf>) -> Self {
@@ -666,7 +700,10 @@ impl<G: GitProcess> ProjectCapsuleEngine<G> {
         let mut decisions = BTreeMap::new();
         for decision in request.decisions {
             if decisions
-                .insert(decision.candidate_id, decision.kind)
+                .insert(
+                    decision.candidate_id,
+                    (decision.kind, decision.owner_reason),
+                )
                 .is_some()
             {
                 return Err(CoreError::InvalidPlan(
@@ -678,19 +715,41 @@ impl<G: GitProcess> ProjectCapsuleEngine<G> {
             .project
             .ignored_candidates()
             .iter()
-            .map(|candidate| ProjectCapsuleIgnoredReview {
-                candidate_id: candidate.id().to_owned(),
-                recommendation: match candidate.review() {
+            .map(|candidate| {
+                let recommendation = match candidate.review() {
                     IgnoredReview::RequiresReview => {
                         ProjectCapsuleIgnoredRecommendation::RequiresExplicitDecision
                     }
                     IgnoredReview::SuggestedExclusion => {
                         ProjectCapsuleIgnoredRecommendation::ExcludeReproducibleGeneratedState
                     }
-                },
-                decision: decisions.remove(candidate.id()),
+                };
+                let decision = decisions.remove(candidate.id());
+                if let Some((kind, owner_reason)) = &decision
+                    && (*kind
+                        == ProjectCapsuleReviewDecisionKind::ExcludeAsReproducibleGeneratedState
+                        && (recommendation
+                            != ProjectCapsuleIgnoredRecommendation::ExcludeReproducibleGeneratedState
+                            || owner_reason
+                                .as_deref()
+                                .map(str::trim)
+                                .unwrap_or_default()
+                                .is_empty()))
+                {
+                    return Err(CoreError::InvalidPlan(
+                        "Project Capsule generated-state exclusion requires an audited reproducible candidate and owner-visible reason"
+                            .to_owned(),
+                    ));
+                }
+                Ok(ProjectCapsuleIgnoredReview {
+                    candidate_id: candidate.id().to_owned(),
+                    relative_path: candidate.relative_path().to_path_buf(),
+                    recommendation,
+                    decision: decision.as_ref().map(|(kind, _)| *kind),
+                    owner_reason: decision.and_then(|(_, reason)| reason),
+                })
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, CoreError>>()?;
         if !decisions.is_empty() {
             return Err(CoreError::InvalidPlan(
                 "Project Capsule review decision does not identify an audited ignored candidate"
@@ -704,7 +763,17 @@ impl<G: GitProcess> ProjectCapsuleEngine<G> {
             &support_report,
             &ignored_candidates,
         )?;
+        let plan_hash = request.plan.approval_hash()?;
+        let project_observation_hash = request
+            .project
+            .local_state()
+            .observation_hash()
+            .unwrap_or_default()
+            .to_owned();
         Ok(ProjectCapsuleReview {
+            plan_hash,
+            project_id: request.project.id().to_owned(),
+            project_observation_hash,
             support_report,
             ignored_candidates,
             review_hash,
@@ -717,9 +786,9 @@ impl<G: GitProcess> ProjectCapsuleEngine<G> {
     ) -> Result<ProjectCapsuleCaptureReport, CoreError> {
         validate_capture_request(&self.git, &mut request)?;
         let root = request.project.root();
-        let expected = observe_project(&self.git, root, &request.reviewed_ignored_paths)?;
-        let excluded_ignored =
-            unreviewed_ignored_paths(&self.git, root, &request.reviewed_ignored_paths)?;
+        let reviewed_ignored_paths = included_reviewed_ignored_paths(request.review);
+        let expected = observe_project(&self.git, root, &reviewed_ignored_paths)?;
+        let excluded_ignored = unreviewed_ignored_paths(&self.git, root, &reviewed_ignored_paths)?;
         let capsule_plan = approved_capsule_plan(root, &excluded_ignored)?;
         let engine = BundleEngine::local();
         let pack = engine.pack(PackRequest::new(&capsule_plan, &request.destination))?;
@@ -727,8 +796,7 @@ impl<G: GitProcess> ProjectCapsuleEngine<G> {
             &request.destination,
             pack.offline_recovery_key(),
         ))?;
-        let post_capture_hash =
-            observe_project(&self.git, root, &request.reviewed_ignored_paths)?.digest;
+        let post_capture_hash = observe_project(&self.git, root, &reviewed_ignored_paths)?.digest;
         let state = if expected.digest == post_capture_hash {
             ProjectCapsuleCaptureState::Verified
         } else {
@@ -1188,6 +1256,9 @@ fn project_capsule_review_hash(
         let decision = format!("{:?}", candidate.decision);
         hasher.update(&(decision.len() as u64).to_le_bytes());
         hasher.update(decision.as_bytes());
+        let owner_reason = candidate.owner_reason.as_deref().unwrap_or_default();
+        hasher.update(&(owner_reason.len() as u64).to_le_bytes());
+        hasher.update(owner_reason.as_bytes());
     }
     Ok(format!(
         "project_capsule_review_blake3_{}",
@@ -1199,19 +1270,40 @@ fn validate_capture_request(
     git: &impl GitProcess,
     request: &mut ProjectCapsuleCaptureRequest<'_>,
 ) -> Result<(), CoreError> {
-    request.reviewed_ignored_paths.sort();
-    request.reviewed_ignored_paths.dedup();
     request.reviewed_executables.sort();
     request.reviewed_executables.dedup();
-    validate_reviewed_paths(
-        &request.reviewed_ignored_paths,
-        &request.reviewed_executables,
-    )?;
+    let reviewed_ignored_paths = included_reviewed_ignored_paths(request.review);
+    validate_reviewed_paths(&reviewed_ignored_paths, &request.reviewed_executables)?;
     if !request.plan.is_directory_plan()
         || request.plan.approval_state()? != PlanApprovalState::Approved
     {
         return Err(CoreError::InvalidPlan(
             "Project Capsule capture requires an approved, non-stale directory Plan".to_owned(),
+        ));
+    }
+    if request.review_hash != request.review.review_hash {
+        return Err(CoreError::InvalidPlan(
+            "Project Capsule capture review hash does not match the completed review".to_owned(),
+        ));
+    }
+    let plan_hash = request.plan.approval_hash()?;
+    if request.review.plan_hash != plan_hash
+        || request.review.project_id != request.project.id()
+        || request.review.project_observation_hash
+            != request
+                .project
+                .local_state()
+                .observation_hash()
+                .unwrap_or_default()
+    {
+        return Err(CoreError::InvalidPlan(
+            "Project Capsule capture review is not bound to the current Plan and Project audit"
+                .to_owned(),
+        ));
+    }
+    if !request.review.is_complete() {
+        return Err(CoreError::InvalidPlan(
+            "Project Capsule capture requires a completed review with no blocking gaps".to_owned(),
         ));
     }
     if request.project.kind() != ProjectKind::WorkingTree
@@ -1275,8 +1367,7 @@ fn validate_capture_request(
         ));
     }
     let ignored = ignored_paths(git, root)?;
-    if request
-        .reviewed_ignored_paths
+    if reviewed_ignored_paths
         .iter()
         .any(|path| !ignored.contains(path))
     {
@@ -1297,6 +1388,18 @@ fn validate_capture_request(
         }
     }
     Ok(())
+}
+
+fn included_reviewed_ignored_paths(review: &ProjectCapsuleReview) -> Vec<PathBuf> {
+    review
+        .ignored_candidates
+        .iter()
+        .filter(|candidate| {
+            candidate.decision
+                == Some(ProjectCapsuleReviewDecisionKind::IncludeAsEncryptedReviewedState)
+        })
+        .map(|candidate| candidate.relative_path.clone())
+        .collect()
 }
 
 #[derive(Debug, Clone)]

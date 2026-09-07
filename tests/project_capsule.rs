@@ -12,7 +12,7 @@ use iniza::{
     GitProcess, GitProcessOutput, InstalledGit, PlanEngine, ProjectAuditEngine,
     ProjectAuditRequest, ProjectCapsuleBlockingFeature, ProjectCapsuleCaptureRequest,
     ProjectCapsuleCaptureState, ProjectCapsuleComparisonRequest, ProjectCapsuleEngine,
-    ProjectCapsuleIgnoredRecommendation, ProjectCapsuleRepresentation,
+    ProjectCapsuleIgnoredRecommendation, ProjectCapsuleRepresentation, ProjectCapsuleReview,
     ProjectCapsuleReviewDecision, ProjectCapsuleReviewDecisionKind, ProjectCapsuleReviewRequest,
     ProjectCapsuleSupportedState, ProjectCapsuleValidationRequest, RestoreEngine, RestoreRequest,
     ScanRequest,
@@ -667,6 +667,148 @@ fn active_git_lock_blocks_comparison_before_any_output_is_created() {
 
 #[cfg(unix)]
 #[test]
+fn project_capsule_capture_requires_the_exact_completed_review_hash() {
+    let directory = TestDirectory::new("capture-review-hash");
+    let project = directory.path.join("owner-project");
+    let bundle = directory.path.join("must-not-exist.iniza");
+    create_dirty_project_fixture(
+        &project,
+        &directory.path.join("script-ran"),
+        &directory.path.join("hook-ran"),
+    );
+    fs::remove_file(project.join("unreviewed.secret"))
+        .expect("unreviewed fixture should be removed");
+    fs::write(project.join(".gitignore"), ".env.local\n")
+        .expect("single reviewed ignored candidate should remain");
+    let mut plan = PlanEngine::local()
+        .scan(ScanRequest::for_directory(&project))
+        .expect("Project Plan should scan");
+    let plan_hash = plan.approval_hash().expect("Project Plan should hash");
+    plan.approve(&plan_hash).expect("exact Plan should approve");
+    let audit = ProjectAuditEngine::local()
+        .audit(ProjectAuditRequest::from_plan(&plan))
+        .expect("Project should audit");
+    let project_audit = audit.projects().first().expect("Project should be present");
+    let ignored_id = project_audit
+        .ignored_candidates()
+        .first()
+        .expect("environment file should require review")
+        .id();
+    let review = ProjectCapsuleEngine::local()
+        .review(
+            ProjectCapsuleReviewRequest::new(&plan, project_audit).with_decision(
+                ProjectCapsuleReviewDecision::include_as_encrypted_reviewed_state(ignored_id),
+            ),
+        )
+        .expect("completed Project Capsule review should be created");
+
+    let error = ProjectCapsuleEngine::local()
+        .capture(ProjectCapsuleCaptureRequest::new(
+            &plan,
+            project_audit,
+            &review,
+            "wrong-project-capsule-review-hash",
+            &bundle,
+        ))
+        .expect_err("a mismatched review hash must block capture");
+
+    assert_eq!(
+        error.to_string(),
+        "Project Capsule capture review hash does not match the completed review"
+    );
+    assert!(!bundle.exists(), "a rejected review must create no Bundle");
+}
+
+#[cfg(unix)]
+#[test]
+fn reviewed_capture_encrypts_sensitive_state_and_excludes_reproducible_generated_state() {
+    let directory = TestDirectory::new("capture-reviewed-ignored-state");
+    let project = directory.path.join("owner-project");
+    let bundle = directory.path.join("project-capsule.iniza");
+    let restore = directory.path.join("restored-project");
+    create_dirty_project_fixture(
+        &project,
+        &directory.path.join("script-ran"),
+        &directory.path.join("hook-ran"),
+    );
+    fs::remove_file(project.join("unreviewed.secret"))
+        .expect("unreviewed fixture should be removed");
+    fs::create_dir_all(project.join("node_modules/example"))
+        .expect("generated fixture directory should be created");
+    fs::write(
+        project.join("node_modules/example/generated.js"),
+        "synthetic generated dependency\n",
+    )
+    .expect("generated fixture should be written");
+    fs::write(project.join(".gitignore"), ".env.local\nnode_modules/\n")
+        .expect("ignored review fixture should be written");
+    let mut plan = PlanEngine::local()
+        .scan(ScanRequest::for_directory(&project))
+        .expect("Project Plan should scan");
+    let plan_hash = plan.approval_hash().expect("Project Plan should hash");
+    plan.approve(&plan_hash).expect("exact Plan should approve");
+    let audit = ProjectAuditEngine::local()
+        .audit(ProjectAuditRequest::from_plan(&plan))
+        .expect("Project should audit");
+    let project_audit = audit.projects().first().expect("Project should be present");
+    let sensitive = project_audit
+        .ignored_candidates()
+        .iter()
+        .find(|candidate| candidate.relative_path() == Path::new(".env.local"))
+        .expect("sensitive ignored candidate should be present");
+    let generated = project_audit
+        .ignored_candidates()
+        .iter()
+        .find(|candidate| candidate.relative_path().starts_with("node_modules"))
+        .expect("generated ignored candidate should be present");
+    let review = ProjectCapsuleEngine::local()
+        .review(
+            ProjectCapsuleReviewRequest::new(&plan, project_audit)
+                .with_decision(
+                    ProjectCapsuleReviewDecision::include_as_encrypted_reviewed_state(
+                        sensitive.id(),
+                    ),
+                )
+                .with_decision(
+                    ProjectCapsuleReviewDecision::exclude_as_reproducible_generated_state(
+                        generated.id(),
+                        "recreated from the reviewed dependency recipe",
+                    ),
+                ),
+        )
+        .expect("every ignored candidate should receive an explicit review decision");
+    assert!(review.is_complete());
+    let review_hash = review.review_hash().to_owned();
+
+    let report = ProjectCapsuleEngine::local()
+        .capture(ProjectCapsuleCaptureRequest::new(
+            &plan,
+            project_audit,
+            &review,
+            review_hash,
+            &bundle,
+        ))
+        .expect("completed reviewed capture should succeed");
+    RestoreEngine::local()
+        .restore(RestoreRequest::new(
+            &bundle,
+            &restore,
+            report.offline_recovery_key(),
+        ))
+        .expect("reviewed Project Capsule should restore");
+
+    assert_eq!(
+        fs::read(restore.join(".env.local")).expect("reviewed sensitive state should restore"),
+        b"SYNTHETIC_ONLY=true\n"
+    );
+    assert!(
+        !restore.join("node_modules/example/generated.js").exists(),
+        "explicitly excluded reproducible generated state must not enter the Bundle"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn approved_verified_project_captures_directly_into_a_fully_verified_snapshot_bundle() {
     let directory = TestDirectory::new("production-capture");
     let project = directory.path.join("owner-project");
@@ -677,6 +819,7 @@ fn approved_verified_project_captures_directly_into_a_fully_verified_snapshot_bu
         &directory.path.join("script-ran"),
         &directory.path.join("hook-ran"),
     );
+    retain_only_reviewed_environment_candidate(&project);
     let mut plan = PlanEngine::local()
         .scan(ScanRequest::for_directory(&project))
         .expect("Project Plan should scan");
@@ -687,11 +830,12 @@ fn approved_verified_project_captures_directly_into_a_fully_verified_snapshot_bu
         .audit(ProjectAuditRequest::from_plan(&plan))
         .expect("approved Project should audit");
     let project_audit = audit.projects().first().expect("Project should be audited");
+    let review = complete_encrypted_ignored_review(&plan, project_audit);
+    let review_hash = review.review_hash().to_owned();
 
     let report = ProjectCapsuleEngine::local()
         .capture(
-            ProjectCapsuleCaptureRequest::new(&plan, project_audit, &bundle)
-                .with_reviewed_ignored_path(".env.local")
+            ProjectCapsuleCaptureRequest::new(&plan, project_audit, &review, review_hash, &bundle)
                 .with_reviewed_executable("scripts/rebuild.sh"),
         )
         .expect("approved verified Project should capture");
@@ -754,6 +898,7 @@ fn production_capture_preserves_but_does_not_rely_on_a_bundle_when_the_project_c
         &directory.path.join("script-ran"),
         &directory.path.join("hook-ran"),
     );
+    retain_only_reviewed_environment_candidate(&project);
     let mut plan = PlanEngine::local()
         .scan(ScanRequest::for_directory(&project))
         .expect("Project Plan should scan");
@@ -763,6 +908,9 @@ fn production_capture_preserves_but_does_not_rely_on_a_bundle_when_the_project_c
     let audit = ProjectAuditEngine::local()
         .audit(ProjectAuditRequest::from_plan(&plan))
         .expect("approved Project should audit");
+    let project_audit = audit.projects().first().expect("Project should be audited");
+    let review = complete_encrypted_ignored_review(&plan, project_audit);
+    let review_hash = review.review_hash().to_owned();
     let git = PostPackMutatingGit {
         installed: InstalledGit::default(),
         project: project.clone(),
@@ -771,13 +919,8 @@ fn production_capture_preserves_but_does_not_rely_on_a_bundle_when_the_project_c
 
     let report = ProjectCapsuleEngine::with_git_process(git)
         .capture(
-            ProjectCapsuleCaptureRequest::new(
-                &plan,
-                audit.projects().first().expect("Project should be audited"),
-                &bundle,
-            )
-            .with_reviewed_ignored_path(".env.local")
-            .with_reviewed_executable("scripts/rebuild.sh"),
+            ProjectCapsuleCaptureRequest::new(&plan, project_audit, &review, review_hash, &bundle)
+                .with_reviewed_executable("scripts/rebuild.sh"),
         )
         .expect("changed capture should return bounded preservation evidence");
 
@@ -809,6 +952,7 @@ fn production_capture_rejects_a_project_changed_after_its_verified_audit() {
         &directory.path.join("script-ran"),
         &directory.path.join("hook-ran"),
     );
+    retain_only_reviewed_environment_candidate(&project);
     let mut plan = PlanEngine::local()
         .scan(ScanRequest::for_directory(&project))
         .expect("Project Plan should scan");
@@ -818,18 +962,16 @@ fn production_capture_rejects_a_project_changed_after_its_verified_audit() {
     let audit = ProjectAuditEngine::local()
         .audit(ProjectAuditRequest::from_plan(&plan))
         .expect("approved Project should audit");
+    let project_audit = audit.projects().first().expect("Project should be audited");
+    let review = complete_encrypted_ignored_review(&plan, project_audit);
+    let review_hash = review.review_hash().to_owned();
     fs::write(project.join("created-after-audit.txt"), "stale audit\n")
         .expect("post-audit change should be written");
 
     let error = ProjectCapsuleEngine::local()
         .capture(
-            ProjectCapsuleCaptureRequest::new(
-                &plan,
-                audit.projects().first().expect("Project should be audited"),
-                &bundle,
-            )
-            .with_reviewed_ignored_path(".env.local")
-            .with_reviewed_executable("scripts/rebuild.sh"),
+            ProjectCapsuleCaptureRequest::new(&plan, project_audit, &review, review_hash, &bundle)
+                .with_reviewed_executable("scripts/rebuild.sh"),
         )
         .expect_err("changed Project must require a fresh audit");
 
@@ -886,6 +1028,28 @@ impl GitProcess for MutatingGit {
         }
         Ok(output)
     }
+}
+
+fn retain_only_reviewed_environment_candidate(project: &Path) {
+    fs::remove_file(project.join("unreviewed.secret"))
+        .expect("unreviewed ignored fixture should be removed");
+    fs::write(project.join(".gitignore"), ".env.local\n")
+        .expect("only the reviewed environment fixture should remain ignored");
+}
+
+fn complete_encrypted_ignored_review(
+    plan: &iniza::Plan,
+    project: &iniza::ProjectAudit,
+) -> ProjectCapsuleReview {
+    let mut request = ProjectCapsuleReviewRequest::new(plan, project);
+    for candidate in project.ignored_candidates() {
+        request = request.with_decision(
+            ProjectCapsuleReviewDecision::include_as_encrypted_reviewed_state(candidate.id()),
+        );
+    }
+    ProjectCapsuleEngine::local()
+        .review(request)
+        .expect("every ignored candidate should receive an encrypted-state decision")
 }
 
 #[cfg(unix)]
