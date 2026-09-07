@@ -59,7 +59,8 @@ pub use project_capsule::{
     ProjectCapsuleRehearsalReceipt, ProjectCapsuleRehearsalRequest, ProjectCapsuleRepresentation,
     ProjectCapsuleReview, ProjectCapsuleReviewDecision, ProjectCapsuleReviewDecisionKind,
     ProjectCapsuleReviewRequest, ProjectCapsuleSupportReport, ProjectCapsuleSupportedState,
-    ProjectCapsuleValidationReport, ProjectCapsuleValidationRequest,
+    ProjectCapsuleValidationReport, ProjectCapsuleValidationRequest, ProjectDatabaseExportReview,
+    ProjectDatabaseExportReviewRequest,
 };
 pub use protection_candidates::{
     CandidatePortability, CandidateSensitivity, CandidateSourceKind, CandidateValidation,

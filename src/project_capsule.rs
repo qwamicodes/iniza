@@ -7,7 +7,7 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt, symlink};
 
 use sha2::{Digest, Sha256};
 
@@ -91,6 +91,69 @@ pub enum ProjectCapsuleIgnoredRecommendation {
 pub enum ProjectCapsuleReviewDecisionKind {
     IncludeAsEncryptedReviewedState,
     ExcludeAsReproducibleGeneratedState,
+    ReplaceLiveDatabaseWithExport,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct ProjectDatabaseExportReview {
+    project_id: String,
+    plan_hash: String,
+    base_review_hash: String,
+    database_candidate_id: String,
+    export_item_id: String,
+    export_relative_path: PathBuf,
+    export_digest: String,
+    export_size: u64,
+    validation_description: String,
+}
+
+impl fmt::Debug for ProjectDatabaseExportReview {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProjectDatabaseExportReview")
+            .field("project_id", &self.project_id)
+            .field("plan_hash", &self.plan_hash)
+            .field("base_review_hash", &self.base_review_hash)
+            .field("database_candidate_id", &self.database_candidate_id)
+            .field("export_item_id", &self.export_item_id)
+            .field("export_digest", &self.export_digest)
+            .field("export_size", &self.export_size)
+            .field("validation", &"stable-export-bytes-only")
+            .finish()
+    }
+}
+
+pub struct ProjectDatabaseExportReviewRequest<'a> {
+    plan: &'a Plan,
+    project: &'a ProjectAudit,
+    initial_review: &'a ProjectCapsuleReview,
+    reviewed_hash: String,
+    database_candidate_id: String,
+    export_item_id: String,
+    validation_description: String,
+}
+
+impl<'a> ProjectDatabaseExportReviewRequest<'a> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        plan: &'a Plan,
+        project: &'a ProjectAudit,
+        initial_review: &'a ProjectCapsuleReview,
+        reviewed_hash: impl Into<String>,
+        database_candidate_id: impl Into<String>,
+        export_item_id: impl Into<String>,
+        validation_description: impl Into<String>,
+    ) -> Self {
+        Self {
+            plan,
+            project,
+            initial_review,
+            reviewed_hash: reviewed_hash.into(),
+            database_candidate_id: database_candidate_id.into(),
+            export_item_id: export_item_id.into(),
+            validation_description: validation_description.into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,6 +161,7 @@ pub struct ProjectCapsuleReviewDecision {
     candidate_id: String,
     kind: ProjectCapsuleReviewDecisionKind,
     owner_reason: Option<String>,
+    database_export_review: Option<ProjectDatabaseExportReview>,
 }
 
 impl ProjectCapsuleReviewDecision {
@@ -106,6 +170,7 @@ impl ProjectCapsuleReviewDecision {
             candidate_id: candidate_id.into(),
             kind: ProjectCapsuleReviewDecisionKind::IncludeAsEncryptedReviewedState,
             owner_reason: None,
+            database_export_review: None,
         }
     }
 
@@ -117,6 +182,16 @@ impl ProjectCapsuleReviewDecision {
             candidate_id: candidate_id.into(),
             kind: ProjectCapsuleReviewDecisionKind::ExcludeAsReproducibleGeneratedState,
             owner_reason: Some(owner_reason.into()),
+            database_export_review: None,
+        }
+    }
+
+    pub fn replace_live_database_with_export(review: ProjectDatabaseExportReview) -> Self {
+        Self {
+            candidate_id: review.database_candidate_id.clone(),
+            kind: ProjectCapsuleReviewDecisionKind::ReplaceLiveDatabaseWithExport,
+            owner_reason: None,
+            database_export_review: Some(review),
         }
     }
 }
@@ -128,6 +203,7 @@ pub struct ProjectCapsuleIgnoredReview {
     recommendation: ProjectCapsuleIgnoredRecommendation,
     decision: Option<ProjectCapsuleReviewDecisionKind>,
     owner_reason: Option<String>,
+    database_export_review: Option<ProjectDatabaseExportReview>,
 }
 
 impl ProjectCapsuleIgnoredReview {
@@ -373,6 +449,7 @@ pub struct ProjectCapsuleExpectation {
     reviewed_executable_modes: BTreeMap<PathBuf, u32>,
     required_executable_mode_review_hash: Option<String>,
     git_large_file_storage_objects: Vec<ProjectCapsuleGitLargeFileStorageEvidence>,
+    database_export_evidence: usize,
 }
 
 impl fmt::Debug for ProjectCapsuleExpectation {
@@ -393,6 +470,7 @@ impl fmt::Debug for ProjectCapsuleExpectation {
                 "git_large_file_storage_object_count",
                 &self.git_large_file_storage_objects.len(),
             )
+            .field("database_export_evidence", &self.database_export_evidence)
             .finish()
     }
 }
@@ -438,6 +516,7 @@ pub struct ProjectCapsuleRehearsalReceipt {
     recovery_method: RecoveryMethod,
     project_id: String,
     bundle_identity: String,
+    database_export_evidence: usize,
     validation: ProjectCapsuleValidationReport,
 }
 
@@ -449,6 +528,8 @@ impl fmt::Debug for ProjectCapsuleRehearsalReceipt {
             .field("recovery_method", &self.recovery_method)
             .field("project_id", &self.project_id)
             .field("bundle_identity", &self.bundle_identity)
+            .field("database_export_evidence", &self.database_export_evidence)
+            .field("database_consistency_automatically_verified", &false)
             .field("findings", &self.validation.findings())
             .finish()
     }
@@ -467,6 +548,14 @@ impl ProjectCapsuleRehearsalReceipt {
         &self.validation
     }
 
+    pub fn database_export_evidence(&self) -> usize {
+        self.database_export_evidence
+    }
+
+    pub fn database_consistency_was_automatically_verified(&self) -> bool {
+        false
+    }
+
     pub fn machine_json_result(&self) -> String {
         serde_json::json!({
             "schema_version": 1,
@@ -480,6 +569,8 @@ impl ProjectCapsuleRehearsalReceipt {
                     RecoveryMethod::Offline => "offline",
                 },
                 "restorable": self.restorable,
+                "database_export_evidence": self.database_export_evidence,
+                "database_consistency_automatically_verified": false,
                 "validation_findings": self.validation.findings(),
             },
             "warnings": [],
@@ -804,6 +895,91 @@ impl<G> ProjectCapsuleEngine<G> {
 }
 
 impl<G: GitProcess> ProjectCapsuleEngine<G> {
+    pub fn review_database_export(
+        &self,
+        request: ProjectDatabaseExportReviewRequest<'_>,
+    ) -> Result<ProjectDatabaseExportReview, CoreError> {
+        validate_review_request(
+            &self.git,
+            &ProjectCapsuleReviewRequest::new(request.plan, request.project),
+        )?;
+        if request.reviewed_hash != request.initial_review.review_hash
+            || request.initial_review.plan_hash != request.plan.approval_hash()?
+            || request.initial_review.project_id != request.project.id()
+            || request.initial_review.project_observation_hash
+                != request
+                    .project
+                    .local_state()
+                    .observation_hash()
+                    .unwrap_or_default()
+        {
+            return Err(CoreError::InvalidPlan(
+                "database export review does not match the initial Project Capsule review"
+                    .to_owned(),
+            ));
+        }
+        let database_candidate = request
+            .project
+            .ignored_candidates()
+            .iter()
+            .find(|candidate| candidate.id() == request.database_candidate_id)
+            .ok_or_else(|| {
+                CoreError::InvalidPlan(
+                    "database export review does not identify an ignored database candidate"
+                        .to_owned(),
+                )
+            })?;
+        if !is_live_database_path(database_candidate.relative_path()) {
+            return Err(CoreError::InvalidPlan(
+                "database export review requires an ignored live database candidate".to_owned(),
+            ));
+        }
+        let export_item = request
+            .plan
+            .items()
+            .iter()
+            .find(|item| item.id == request.export_item_id)
+            .ok_or_else(|| {
+                CoreError::InvalidPlan(
+                    "database export review does not identify a selected Migration Item".to_owned(),
+                )
+            })?;
+        if export_item.kind != MigrationItemKind::RegularFile
+            || export_item.disposition != Disposition::Included
+            || export_item.relative_path == database_candidate.relative_path()
+        {
+            return Err(CoreError::InvalidPlan(
+                "database export must be a distinct Included regular-file Migration Item"
+                    .to_owned(),
+            ));
+        }
+        if request.validation_description.trim().is_empty() {
+            return Err(CoreError::InvalidPlan(
+                "database export review requires an owner-visible validation description"
+                    .to_owned(),
+            ));
+        }
+        let export = request.project.root().join(&export_item.relative_path);
+        let first = observe_database_export(&export)?;
+        let second = observe_database_export(&export)?;
+        if first != second {
+            return Err(CoreError::InvalidPlan(
+                "database export changed between its two stable-file observations".to_owned(),
+            ));
+        }
+        Ok(ProjectDatabaseExportReview {
+            project_id: request.project.id().to_owned(),
+            plan_hash: request.plan.approval_hash()?,
+            base_review_hash: request.reviewed_hash,
+            database_candidate_id: request.database_candidate_id,
+            export_item_id: request.export_item_id,
+            export_relative_path: export_item.relative_path.clone(),
+            export_digest: first.digest,
+            export_size: first.size,
+            validation_description: request.validation_description,
+        })
+    }
+
     pub fn review(
         &self,
         request: ProjectCapsuleReviewRequest<'_>,
@@ -866,7 +1042,11 @@ impl<G: GitProcess> ProjectCapsuleEngine<G> {
             if decisions
                 .insert(
                     decision.candidate_id,
-                    (decision.kind, decision.owner_reason),
+                    (
+                        decision.kind,
+                        decision.owner_reason,
+                        decision.database_export_review,
+                    ),
                 )
                 .is_some()
             {
@@ -889,7 +1069,7 @@ impl<G: GitProcess> ProjectCapsuleEngine<G> {
                     }
                 };
                 let decision = decisions.remove(candidate.id());
-                if let Some((kind, owner_reason)) = &decision
+                if let Some((kind, owner_reason, _)) = &decision
                     && (*kind
                         == ProjectCapsuleReviewDecisionKind::ExcludeAsReproducibleGeneratedState
                         && (recommendation
@@ -905,12 +1085,30 @@ impl<G: GitProcess> ProjectCapsuleEngine<G> {
                             .to_owned(),
                     ));
                 }
+                if let Some((kind, _, database_export_review)) = &decision
+                    && *kind == ProjectCapsuleReviewDecisionKind::ReplaceLiveDatabaseWithExport
+                {
+                    let export_review = database_export_review.as_ref().ok_or_else(|| {
+                        CoreError::InvalidPlan(
+                            "Project Capsule database replacement requires stable export evidence"
+                                .to_owned(),
+                        )
+                    })?;
+                    validate_database_export_binding(
+                        request.plan,
+                        request.project,
+                        candidate.id(),
+                        candidate.relative_path(),
+                        export_review,
+                    )?;
+                }
                 Ok(ProjectCapsuleIgnoredReview {
                     candidate_id: candidate.id().to_owned(),
                     relative_path: candidate.relative_path().to_path_buf(),
                     recommendation,
-                    decision: decision.as_ref().map(|(kind, _)| *kind),
-                    owner_reason: decision.and_then(|(_, reason)| reason),
+                    decision: decision.as_ref().map(|(kind, _, _)| *kind),
+                    owner_reason: decision.as_ref().and_then(|(_, reason, _)| reason.clone()),
+                    database_export_review: decision.and_then(|(_, _, review)| review),
                 })
             })
             .collect::<Result<Vec<_>, CoreError>>()?;
@@ -991,6 +1189,7 @@ impl<G: GitProcess> ProjectCapsuleEngine<G> {
                     .support_report
                     .git_large_file_storage_objects
                     .clone(),
+                database_export_evidence: database_export_evidence_count(request.review),
             })
         } else {
             None
@@ -1081,6 +1280,7 @@ impl<G: GitProcess> ProjectCapsuleEngine<G> {
             recovery_method: request.recovery_secret.method(),
             project_id: request.expectation.project_id.clone(),
             bundle_identity: verification.bundle_identity().to_owned(),
+            database_export_evidence: request.expectation.database_export_evidence,
             validation,
         })
     }
@@ -1537,11 +1737,158 @@ fn project_capsule_review_hash(
         let owner_reason = candidate.owner_reason.as_deref().unwrap_or_default();
         hasher.update(&(owner_reason.len() as u64).to_le_bytes());
         hasher.update(owner_reason.as_bytes());
+        if let Some(export) = &candidate.database_export_review {
+            for field in [
+                export.base_review_hash.as_bytes(),
+                export.export_item_id.as_bytes(),
+                export.export_digest.as_bytes(),
+                export.validation_description.as_bytes(),
+            ] {
+                hasher.update(&(field.len() as u64).to_le_bytes());
+                hasher.update(field);
+            }
+            hasher.update(&export.export_size.to_le_bytes());
+        }
     }
     Ok(format!(
         "project_capsule_review_blake3_{}",
         hasher.finalize().to_hex()
     ))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DatabaseExportObservation {
+    digest: String,
+    size: u64,
+    device_id: u64,
+    file_id: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+}
+
+fn observe_database_export(path: &Path) -> Result<DatabaseExportObservation, CoreError> {
+    let before = fs::symlink_metadata(path).map_err(|source| CoreError::Io {
+        action: "inspect selected database export",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !before.is_file() {
+        return Err(CoreError::InvalidPlan(
+            "selected database export must be a regular file".to_owned(),
+        ));
+    }
+    let mut file = open_regular_file_without_following(path, "open selected database export")?;
+    let mut hasher = blake3::Hasher::new();
+    let mut captured = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(|source| CoreError::Io {
+            action: "hash selected database export",
+            path: path.to_path_buf(),
+            source,
+        })?;
+        if read == 0 {
+            break;
+        }
+        captured = captured.saturating_add(read as u64);
+        hasher.update(&buffer[..read]);
+    }
+    let after = file.metadata().map_err(|source| CoreError::Io {
+        action: "reinspect selected database export",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !after.is_file() || captured != before.len() || !same_database_export_file(&before, &after) {
+        return Err(CoreError::InvalidPlan(
+            "database export changed during its stable-file observation".to_owned(),
+        ));
+    }
+    #[cfg(unix)]
+    let observation = DatabaseExportObservation {
+        digest: hasher.finalize().to_hex().to_string(),
+        size: captured,
+        device_id: after.dev(),
+        file_id: after.ino(),
+        modified_seconds: after.mtime(),
+        modified_nanoseconds: after.mtime_nsec(),
+    };
+    #[cfg(not(unix))]
+    let observation = DatabaseExportObservation {
+        digest: hasher.finalize().to_hex().to_string(),
+        size: captured,
+        device_id: 0,
+        file_id: 0,
+        modified_seconds: 0,
+        modified_nanoseconds: 0,
+    };
+    Ok(observation)
+}
+
+fn same_database_export_file(before: &fs::Metadata, after: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        before.dev() == after.dev()
+            && before.ino() == after.ino()
+            && before.len() == after.len()
+            && before.mtime() == after.mtime()
+            && before.mtime_nsec() == after.mtime_nsec()
+    }
+    #[cfg(not(unix))]
+    {
+        before.len() == after.len() && before.modified().ok() == after.modified().ok()
+    }
+}
+
+fn is_live_database_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "db" | "sqlite" | "sqlite3"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn validate_database_export_binding(
+    plan: &Plan,
+    project: &ProjectAudit,
+    candidate_id: &str,
+    database_path: &Path,
+    review: &ProjectDatabaseExportReview,
+) -> Result<(), CoreError> {
+    let plan_hash = plan.approval_hash()?;
+    let export_item = plan
+        .items()
+        .iter()
+        .find(|item| item.id == review.export_item_id)
+        .ok_or_else(|| {
+            CoreError::InvalidPlan(
+                "database export review no longer identifies a selected Migration Item".to_owned(),
+            )
+        })?;
+    if review.project_id != project.id()
+        || review.plan_hash != plan_hash
+        || review.database_candidate_id != candidate_id
+        || !is_live_database_path(database_path)
+        || export_item.relative_path != review.export_relative_path
+        || export_item.kind != MigrationItemKind::RegularFile
+        || export_item.disposition != Disposition::Included
+        || export_item.relative_path == database_path
+        || review.validation_description.trim().is_empty()
+    {
+        return Err(CoreError::InvalidPlan(
+            "database export review is not bound to the current Plan and Project".to_owned(),
+        ));
+    }
+    let current = observe_database_export(&project.root().join(&review.export_relative_path))?;
+    if current.digest != review.export_digest || current.size != review.export_size {
+        return Err(CoreError::InvalidPlan(
+            "database export changed after its two stable-file observations".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_capture_request(
@@ -1583,6 +1930,17 @@ fn validate_capture_request(
         return Err(CoreError::InvalidPlan(
             "Project Capsule capture requires a completed review with no blocking gaps".to_owned(),
         ));
+    }
+    for candidate in &request.review.ignored_candidates {
+        if let Some(database_export_review) = &candidate.database_export_review {
+            validate_database_export_binding(
+                request.plan,
+                request.project,
+                &candidate.candidate_id,
+                &candidate.relative_path,
+                database_export_review,
+            )?;
+        }
     }
     if request.project.kind() != ProjectKind::WorkingTree
         || !request.project.local_audit_verified()
@@ -1691,6 +2049,18 @@ fn included_reviewed_ignored_paths(review: &ProjectCapsuleReview) -> Vec<PathBuf
         })
         .map(|candidate| candidate.relative_path.clone())
         .collect()
+}
+
+fn database_export_evidence_count(review: &ProjectCapsuleReview) -> usize {
+    review
+        .ignored_candidates
+        .iter()
+        .filter(|candidate| {
+            candidate.decision
+                == Some(ProjectCapsuleReviewDecisionKind::ReplaceLiveDatabaseWithExport)
+                && candidate.database_export_review.is_some()
+        })
+        .count()
 }
 
 fn local_git_large_file_storage_evidence(

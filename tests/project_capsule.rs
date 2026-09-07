@@ -15,7 +15,8 @@ use iniza::{
     ProjectCapsuleIgnoredRecommendation, ProjectCapsuleRehearsalRequest,
     ProjectCapsuleRepresentation, ProjectCapsuleReview, ProjectCapsuleReviewDecision,
     ProjectCapsuleReviewDecisionKind, ProjectCapsuleReviewRequest, ProjectCapsuleSupportedState,
-    ProjectCapsuleValidationRequest, RecoveryMethod, RestoreEngine, RestoreRequest, ScanRequest,
+    ProjectCapsuleValidationRequest, ProjectDatabaseExportReviewRequest, RecoveryMethod,
+    RestoreEngine, RestoreRequest, ScanRequest,
 };
 
 static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -959,6 +960,212 @@ fn reviewed_capture_encrypts_sensitive_state_and_excludes_reproducible_generated
     assert!(
         !restore.join("node_modules/example/generated.js").exists(),
         "explicitly excluded reproducible generated state must not enter the Bundle"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn live_database_is_replaced_by_stable_selected_export_without_verifying_raw_database_bytes() {
+    let directory = TestDirectory::new("database-export-review");
+    let project = directory.path.join("owner-project");
+    let bundle = directory.path.join("project-capsule.iniza");
+    let restore = directory.path.join("restored-project");
+    fs::create_dir_all(project.join("exports")).expect("Project directories should be created");
+    git(&project, &["init", "-q", "--initial-branch=main"]);
+    fs::write(project.join(".gitignore"), "local.sqlite3\n")
+        .expect("database ignore rule should be written");
+    fs::write(project.join("README.md"), "synthetic database Project\n")
+        .expect("tracked fixture should be written");
+    fs::write(
+        project.join("exports/local.sql"),
+        "-- stable synthetic export\nCREATE TABLE example(id INTEGER);\n",
+    )
+    .expect("selected database export should be written");
+    git(
+        &project,
+        &["add", ".gitignore", "README.md", "exports/local.sql"],
+    );
+    commit(
+        &project,
+        "Add stable synthetic database export",
+        "2026-01-01T00:00:00Z",
+    );
+    fs::write(
+        project.join("local.sqlite3"),
+        b"synthetic live database bytes that must not be verified",
+    )
+    .expect("live database fixture should be written");
+    let mut plan = PlanEngine::local()
+        .scan(ScanRequest::for_directory(&project))
+        .expect("database Project Plan should scan");
+    let plan_hash = plan.approval_hash().expect("Project Plan should hash");
+    plan.approve(&plan_hash).expect("exact Plan should approve");
+    let audit = ProjectAuditEngine::local()
+        .audit(ProjectAuditRequest::from_plan(&plan))
+        .expect("database Project should audit");
+    let project_audit = audit.projects().first().expect("Project should be present");
+    let database_candidate = project_audit
+        .ignored_candidates()
+        .iter()
+        .find(|candidate| candidate.relative_path() == Path::new("local.sqlite3"))
+        .expect("live database should require review");
+    let export_item = plan
+        .items()
+        .iter()
+        .find(|item| item.relative_path == Path::new("exports/local.sql"))
+        .expect("selected export should be an included Migration Item");
+    let engine = ProjectCapsuleEngine::local();
+    let initial = engine
+        .review(ProjectCapsuleReviewRequest::new(&plan, project_audit))
+        .expect("live database should remain a visible blocking review decision");
+    let export_review = engine
+        .review_database_export(ProjectDatabaseExportReviewRequest::new(
+            &plan,
+            project_audit,
+            &initial,
+            initial.review_hash(),
+            database_candidate.id(),
+            &export_item.id,
+            "stable export bytes selected; application-level consistency remains owner review",
+        ))
+        .expect("two matching observations should bind the selected export");
+    let review = engine
+        .review(
+            ProjectCapsuleReviewRequest::new(&plan, project_audit).with_decision(
+                ProjectCapsuleReviewDecision::replace_live_database_with_export(export_review),
+            ),
+        )
+        .expect("reviewed database export should complete the database decision");
+    assert!(review.is_complete());
+    assert_eq!(
+        review
+            .ignored_candidate(database_candidate.id())
+            .expect("database decision should remain visible")
+            .decision(),
+        Some(ProjectCapsuleReviewDecisionKind::ReplaceLiveDatabaseWithExport)
+    );
+    let review_hash = review.review_hash().to_owned();
+    let capture = engine
+        .capture(ProjectCapsuleCaptureRequest::new(
+            &plan,
+            project_audit,
+            &review,
+            review_hash,
+            &bundle,
+        ))
+        .expect("reviewed database export should capture");
+    let expectation = capture
+        .expectation()
+        .expect("verified capture should produce an expectation")
+        .clone();
+    fs::remove_dir_all(&project).expect("source Project should be made unavailable");
+    let receipt = engine
+        .rehearse(ProjectCapsuleRehearsalRequest::new(
+            &bundle,
+            &expectation,
+            capture.offline_recovery_key(),
+            &restore,
+        ))
+        .expect("selected database export should rehearse without the source");
+
+    assert!(receipt.is_restorable(), "{receipt:#?}");
+    assert!(!restore.join("local.sqlite3").exists());
+    assert_eq!(
+        fs::read(restore.join("exports/local.sql")).expect("selected export should restore"),
+        b"-- stable synthetic export\nCREATE TABLE example(id INTEGER);\n"
+    );
+    assert_eq!(receipt.database_export_evidence(), 1);
+    assert!(!receipt.database_consistency_was_automatically_verified());
+}
+
+#[test]
+fn changed_database_export_is_rejected_before_project_capsule_bundle_creation() {
+    let directory = TestDirectory::new("changed-database-export");
+    let project = directory.path.join("owner-project");
+    let bundle = directory.path.join("project-capsule.iniza");
+    fs::create_dir_all(project.join("exports")).expect("Project should be created");
+    git(&project, &["init", "-q", "--initial-branch=main"]);
+    fs::write(project.join(".gitignore"), "local.sqlite3\n")
+        .expect("database ignore should be written");
+    fs::write(project.join("README.md"), "synthetic Project\n")
+        .expect("tracked fixture should be written");
+    fs::write(
+        project.join("exports/local.sql"),
+        "-- reviewed synthetic export\nCREATE TABLE example(id INTEGER);\n",
+    )
+    .expect("selected database export should be written");
+    git(
+        &project,
+        &["add", ".gitignore", "README.md", "exports/local.sql"],
+    );
+    commit(
+        &project,
+        "Add reviewed synthetic database export",
+        "2026-01-01T00:00:00Z",
+    );
+    fs::write(project.join("local.sqlite3"), b"synthetic live bytes")
+        .expect("live database fixture should be written");
+    let mut plan = PlanEngine::local()
+        .scan(ScanRequest::for_directory(&project))
+        .expect("database Project Plan should scan");
+    let plan_hash = plan.approval_hash().expect("Project Plan should hash");
+    plan.approve(&plan_hash).expect("exact Plan should approve");
+    let audit = ProjectAuditEngine::local()
+        .audit(ProjectAuditRequest::from_plan(&plan))
+        .expect("database Project should audit");
+    let project_audit = audit.projects().first().expect("Project should be present");
+    let database_candidate = project_audit
+        .ignored_candidates()
+        .iter()
+        .find(|candidate| candidate.relative_path() == Path::new("local.sqlite3"))
+        .expect("live database should require review");
+    let export_item = plan
+        .items()
+        .iter()
+        .find(|item| item.relative_path == Path::new("exports/local.sql"))
+        .expect("selected export should be an included Migration Item");
+    let engine = ProjectCapsuleEngine::local();
+    let initial = engine
+        .review(ProjectCapsuleReviewRequest::new(&plan, project_audit))
+        .expect("initial review should succeed");
+    let export_review = engine
+        .review_database_export(ProjectDatabaseExportReviewRequest::new(
+            &plan,
+            project_audit,
+            &initial,
+            initial.review_hash(),
+            database_candidate.id(),
+            &export_item.id,
+            "stable export bytes selected; application-level consistency remains owner review",
+        ))
+        .expect("stable export should produce review evidence");
+    let review = engine
+        .review(
+            ProjectCapsuleReviewRequest::new(&plan, project_audit).with_decision(
+                ProjectCapsuleReviewDecision::replace_live_database_with_export(export_review),
+            ),
+        )
+        .expect("database decision should complete review");
+    fs::write(
+        project.join("exports/local.sql"),
+        "-- changed after review\nCREATE TABLE example(id INTEGER, secret TEXT);\n",
+    )
+    .expect("selected export should change after review");
+
+    let error = engine
+        .capture(ProjectCapsuleCaptureRequest::new(
+            &plan,
+            project_audit,
+            &review,
+            review.review_hash(),
+            &bundle,
+        ))
+        .expect_err("changed export must stop capture");
+
+    assert!(format!("{error}").contains("database export changed after"));
+    assert!(
+        !bundle.exists(),
+        "rejected capture must not create a Bundle"
     );
 }
 
