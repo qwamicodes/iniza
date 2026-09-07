@@ -12,17 +12,19 @@ use std::os::unix::fs::{PermissionsExt, symlink};
 use iniza::{
     BitwardenCommandLine, BitwardenInstallationObservation, BitwardenRecoveryNote,
     BitwardenRetrievedRecoveryNote, BitwardenVaultObservation, BundleEngine, CoreError,
-    OfflineRecoveryEngine, OfflineRecoveryPersistenceTransition, OfflineRecoveryRehearsalRequest,
-    OfflineRecoveryStorage, OfflineRecoveryWriteRequest, OwnerAttestationClaimKind,
-    OwnerAttestationConfirmationRequest, OwnerAttestationPreparationRequest,
-    OwnerAttestationWithdrawalRequest, PackRecoveryContext, PackRequest, PlanEngine,
-    ProjectAuditEngine, ProjectAuditRequest, ProjectCapsuleCaptureRequest, ProjectCapsuleEngine,
-    ProjectCapsuleRehearsalRequest, ProjectCapsuleReviewRequest, ReadinessEvidenceConclusion,
-    ReadinessEvidenceEngine, ReadinessEvidenceInitializationRequest, ReadinessEvidenceState,
-    ReadinessEvidenceStatusRequest, ReadinessReceiptRecordRequest, RecoveryMethod, RecoverySecret,
-    RestoreEngine, RestoreRequest, ScanRequest, VaultwardenInstallationRequest,
-    VaultwardenItemIdentifier, VaultwardenLoadRequest, VaultwardenPreflightRequest,
-    VaultwardenRecoveryEngine, VaultwardenStoreRequest, VerifiedCopyRequest, VerifyRequest,
+    GitPublicationOperation, GitPublicationOutput, GitPublicationProcess, OfflineRecoveryEngine,
+    OfflineRecoveryPersistenceTransition, OfflineRecoveryRehearsalRequest, OfflineRecoveryStorage,
+    OfflineRecoveryWriteRequest, OwnerAttestationClaimKind, OwnerAttestationConfirmationRequest,
+    OwnerAttestationPreparationRequest, OwnerAttestationWithdrawalRequest, PackRecoveryContext,
+    PackRequest, PlanEngine, ProjectAuditEngine, ProjectAuditRequest, ProjectCapsuleCaptureRequest,
+    ProjectCapsuleEngine, ProjectCapsuleRehearsalRequest, ProjectCapsuleReviewRequest,
+    PushPlanApprovalRequest, PushPlanDraftRequest, PushPlanEngine, PushPlanExecutionRequest,
+    ReadinessEvidenceConclusion, ReadinessEvidenceEngine, ReadinessEvidenceInitializationRequest,
+    ReadinessEvidenceState, ReadinessEvidenceStatusRequest, ReadinessReceiptRecordRequest,
+    RecoveryMethod, RecoverySecret, RestoreEngine, RestoreRequest, ScanRequest,
+    VaultwardenInstallationRequest, VaultwardenItemIdentifier, VaultwardenLoadRequest,
+    VaultwardenPreflightRequest, VaultwardenRecoveryEngine, VaultwardenStoreRequest,
+    VerifiedCopyRequest, VerifyRequest,
 };
 use zeroize::Zeroizing;
 
@@ -1090,6 +1092,205 @@ fn every_selected_verified_copy_must_revalidate_independently() {
             .verified_copy(),
         ReadinessEvidenceConclusion::Invalidated
     );
+}
+
+#[test]
+fn complete_push_plan_execution_makes_only_the_project_synchronized() {
+    let directory = TestDirectory::new();
+    let project = directory.path().join("synthetic-project");
+    let remote = directory.path().join("synthetic-remote.git");
+    fs::create_dir(&project).expect("synthetic Project should be created");
+    run_git(&project, &["init", "-q", "--initial-branch=main"]);
+    run_git(
+        directory.path(),
+        &[
+            "init",
+            "-q",
+            "--bare",
+            remote.to_str().expect("fixture path should be Unicode"),
+        ],
+    );
+    fs::write(project.join("tracked.txt"), "published base\n")
+        .expect("base fixture should be written");
+    run_git(&project, &["add", "tracked.txt"]);
+    run_git_with_identity(&project, &["commit", "-q", "-m", "Published base"]);
+    run_git(
+        &project,
+        &[
+            "remote",
+            "add",
+            "origin",
+            remote.to_str().expect("fixture path should be Unicode"),
+        ],
+    );
+    run_git(&project, &["push", "-q", "-u", "origin", "main"]);
+    fs::write(project.join("tracked.txt"), "approved ahead commit\n")
+        .expect("ahead fixture should be written");
+    run_git(&project, &["add", "tracked.txt"]);
+    run_git_with_identity(&project, &["commit", "-q", "-m", "Approved ahead commit"]);
+
+    let mut plan = PlanEngine::local()
+        .scan(ScanRequest::for_directory(&project))
+        .expect("Project should scan");
+    let plan_hash = plan.approval_hash().expect("Plan should have a hash");
+    plan.approve(&plan_hash)
+        .expect("exact reviewed hash should approve the Plan");
+    let audit = ProjectAuditEngine::local()
+        .audit(ProjectAuditRequest::from_plan(&plan))
+        .expect("approved Project should audit");
+    let project_audit = audit
+        .projects()
+        .first()
+        .expect("Project should be discovered");
+
+    let push_plan = directory.path().join("publication.push-plan");
+    let approval = directory.path().join("publication.push-approval");
+    let result = directory.path().join("publication.push-result");
+    let publication = PushPlanEngine::with_git_publication_process(LocalGitPublication);
+    let draft = publication
+        .draft(PushPlanDraftRequest::new(
+            &plan,
+            project_audit,
+            "origin",
+            &push_plan,
+        ))
+        .expect("ahead Project should produce a Push Plan");
+    publication
+        .approve(
+            PushPlanApprovalRequest::new(&push_plan, draft.approval_hash(), &approval)
+                .acknowledge_remote_side_effects(),
+        )
+        .expect("exact synthetic Push Plan should approve");
+    let execution = publication
+        .execute(PushPlanExecutionRequest::new(
+            &plan,
+            project_audit,
+            &push_plan,
+            &approval,
+            &result,
+        ))
+        .expect("exact synthetic publication should complete");
+
+    let evidence_directory = directory.path().join("readiness-evidence");
+    let engine = ReadinessEvidenceEngine::with_git_publication_process(LocalGitPublication);
+    engine
+        .initialize(ReadinessEvidenceInitializationRequest::new(
+            &plan,
+            &evidence_directory,
+        ))
+        .expect("approved Plan should initialize a private evidence store");
+    engine
+        .record_receipt(ReadinessReceiptRecordRequest::push_execution(
+            &evidence_directory,
+            &plan,
+            &execution,
+        ))
+        .expect("typed Push Plan execution should append");
+
+    let status = engine
+        .status(
+            ReadinessEvidenceStatusRequest::new(&evidence_directory, &plan)
+                .with_project_publication(project_audit),
+        )
+        .expect("explicit remote Project revalidation should produce status");
+    assert_eq!(status.projects().len(), 1);
+    assert_eq!(status.projects()[0].project_identity(), project_audit.id());
+    assert_eq!(
+        status.projects()[0].restorable(),
+        ReadinessEvidenceConclusion::Missing
+    );
+    assert_eq!(
+        status.projects()[0].synchronized(),
+        ReadinessEvidenceConclusion::Current
+    );
+}
+
+struct LocalGitPublication;
+
+impl GitPublicationProcess for LocalGitPublication {
+    fn run(
+        &self,
+        repository: &Path,
+        operation: GitPublicationOperation<'_>,
+    ) -> std::io::Result<GitPublicationOutput> {
+        let mut command = Command::new("git");
+        command
+            .arg("-c")
+            .arg("protocol.file.allow=always")
+            .arg("-c")
+            .arg("core.hooksPath=/dev/null")
+            .arg("-c")
+            .arg("credential.helper=")
+            .arg("-C")
+            .arg(repository)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GCM_INTERACTIVE", "Never");
+        match operation {
+            GitPublicationOperation::ReadWorkingTreeStatus => {
+                command.args([
+                    "status",
+                    "--porcelain=v1",
+                    "-z",
+                    "--untracked-files=all",
+                    "--ignore-submodules=all",
+                ]);
+            }
+            GitPublicationOperation::ListLocalReferences => {
+                command.args([
+                    "for-each-ref",
+                    "--format=%(objectname)%00%(refname)",
+                    "refs/heads",
+                    "refs/tags",
+                    "refs/stash",
+                ]);
+            }
+            GitPublicationOperation::ReadLocalReference { reference } => {
+                command.args(["rev-parse", "--verify", reference.as_str()]);
+            }
+            GitPublicationOperation::ReadRemoteReference { remote, reference } => {
+                command.args([
+                    "ls-remote",
+                    "--exit-code",
+                    "--refs",
+                    "--",
+                    remote.as_str(),
+                    reference.as_str(),
+                ]);
+            }
+            GitPublicationOperation::CheckAncestor {
+                ancestor,
+                descendant,
+            } => {
+                command.args([
+                    "merge-base",
+                    "--is-ancestor",
+                    ancestor.as_str(),
+                    descendant.as_str(),
+                ]);
+            }
+            GitPublicationOperation::PushReference {
+                remote,
+                local_reference,
+                remote_reference,
+            } => {
+                command.args([
+                    "push",
+                    "--porcelain",
+                    "--no-verify",
+                    "--no-follow-tags",
+                    "--",
+                    remote.as_str(),
+                    &format!("{}:{}", local_reference.as_str(), remote_reference.as_str()),
+                ]);
+            }
+        }
+        let output = command.output()?;
+        Ok(GitPublicationOutput {
+            status_code: output.status.code(),
+            stdout: output.stdout,
+            stderr: output.stderr,
+        })
+    }
 }
 
 fn run_git(project: &Path, arguments: &[&str]) {

@@ -10,14 +10,17 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use serde::{Deserialize, Serialize};
 
 use crate::bundle::verified_copy_destination_evidence_identity;
+use crate::push_plan::{PushPublicationProof, revalidate_synchronized_project};
 use crate::restore::current_restore_destination_evidence_identity;
 
 use crate::{
-    BundleEngine, BundleVerification, CoreError, LoadedVaultwardenRecoverySecret,
-    OfflineRecoveryEngine, OfflineRecoveryRehearsalReceipt, OfflineRecoveryRehearsalRequest, Plan,
-    PlanApprovalState, ProjectCapsuleCaptureReport, ProjectCapsuleExpectation,
-    ProjectCapsuleRehearsalReceipt, RecoveryMethod, RecoverySecret, RestoreReport, RestoreState,
-    VaultwardenRecoveryReceipt, VerifiedCopyDurability, VerifiedCopyReceipt, VerifyRequest,
+    BundleEngine, BundleVerification, CoreError, GitPublicationProcess, InstalledGitPublication,
+    LoadedVaultwardenRecoverySecret, OfflineRecoveryEngine, OfflineRecoveryRehearsalReceipt,
+    OfflineRecoveryRehearsalRequest, Plan, PlanApprovalState, ProjectAudit,
+    ProjectCapsuleCaptureReport, ProjectCapsuleExpectation, ProjectCapsuleRehearsalReceipt,
+    PushExecutionReport, PushExecutionState, RecoveryMethod, RecoverySecret, RestoreReport,
+    RestoreState, VaultwardenRecoveryReceipt, VerifiedCopyDurability, VerifiedCopyReceipt,
+    VerifyRequest,
 };
 
 const RECORD_SCHEMA_VERSION: u32 = 1;
@@ -81,6 +84,7 @@ enum ReadinessReceiptInput<'a> {
     ProjectCapsuleCapture(&'a ProjectCapsuleCaptureReport),
     ProjectCapsuleRehearsal(&'a ProjectCapsuleRehearsalReceipt),
     RestoreRehearsal(&'a RestoreReport),
+    PushExecution(&'a PushExecutionReport),
 }
 
 impl<'a> ReadinessReceiptRecordRequest<'a> {
@@ -179,6 +183,18 @@ impl<'a> ReadinessReceiptRecordRequest<'a> {
             input: ReadinessReceiptInput::RestoreRehearsal(report),
         }
     }
+
+    pub fn push_execution(
+        directory: impl Into<PathBuf>,
+        plan: &'a Plan,
+        report: &'a PushExecutionReport,
+    ) -> Self {
+        Self {
+            directory: directory.into(),
+            plan,
+            input: ReadinessReceiptInput::PushExecution(report),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -207,6 +223,7 @@ pub struct ReadinessEvidenceStatusRequest<'a> {
     verified_copies: Vec<PathBuf>,
     project_capsules: Vec<ProjectCapsuleStatusInput<'a>>,
     restore_rehearsal_destination: Option<PathBuf>,
+    project_publications: Vec<&'a ProjectAudit>,
 }
 
 #[derive(Debug)]
@@ -233,6 +250,7 @@ impl<'a> ReadinessEvidenceStatusRequest<'a> {
             verified_copies: Vec::new(),
             project_capsules: Vec::new(),
             restore_rehearsal_destination: None,
+            project_publications: Vec::new(),
         }
     }
 
@@ -282,6 +300,11 @@ impl<'a> ReadinessEvidenceStatusRequest<'a> {
 
     pub fn with_restore_rehearsal(mut self, destination: impl Into<PathBuf>) -> Self {
         self.restore_rehearsal_destination = Some(destination.into());
+        self
+    }
+
+    pub fn with_project_publication(mut self, project: &'a ProjectAudit) -> Self {
+        self.project_publications.push(project);
         self
     }
 }
@@ -770,14 +793,26 @@ impl OwnerAttestationWithdrawalRecord {
     }
 }
 
-#[derive(Debug, Default)]
-pub struct ReadinessEvidenceEngine;
+#[derive(Debug)]
+pub struct ReadinessEvidenceEngine<G = InstalledGitPublication> {
+    git: G,
+}
 
-impl ReadinessEvidenceEngine {
+impl ReadinessEvidenceEngine<InstalledGitPublication> {
     pub fn local() -> Self {
-        Self
+        Self {
+            git: InstalledGitPublication::default(),
+        }
     }
+}
 
+impl<G> ReadinessEvidenceEngine<G> {
+    pub fn with_git_publication_process(git: G) -> Self {
+        Self { git }
+    }
+}
+
+impl<G: GitPublicationProcess> ReadinessEvidenceEngine<G> {
     pub fn initialize(
         &self,
         request: ReadinessEvidenceInitializationRequest<'_>,
@@ -954,6 +989,29 @@ impl ReadinessEvidenceEngine {
                     },
                 )
             }
+            ReadinessReceiptInput::PushExecution(report) => {
+                if report.plan_hash() != plan_hash {
+                    return Err(readiness_error(
+                        "Push Plan execution is bound to a different Plan",
+                    ));
+                }
+                (
+                    "push-plan-execution",
+                    StoredEvidence::PushExecution {
+                        plan_hash,
+                        project_identity: report.project_identity().to_owned(),
+                        push_plan_hash: report.push_plan_hash().to_owned(),
+                        state: push_execution_state_name(report.state()).to_owned(),
+                        remote: report.remote().to_owned(),
+                        publication_proofs: report
+                            .publication_proofs()
+                            .iter()
+                            .map(StoredPublicationProof::from)
+                            .collect(),
+                        executed_at_unix_seconds: report.occurred_at_unix_seconds(),
+                    },
+                )
+            }
         };
 
         let previous = records
@@ -1040,6 +1098,7 @@ impl ReadinessEvidenceEngine {
                     | StoredEvidence::ProjectCapsuleCapture { .. }
                     | StoredEvidence::ProjectCapsuleRehearsal { .. }
                     | StoredEvidence::RestoreRehearsal { .. }
+                    | StoredEvidence::PushExecution { .. }
                     | StoredEvidence::OwnerAttestation { .. }
                     | StoredEvidence::OwnerAttestationWithdrawn { .. } => None,
                 });
@@ -1299,7 +1358,7 @@ impl ReadinessEvidenceEngine {
             }
         };
 
-        let mut projects = request
+        let mut projects_by_identity = request
             .project_capsules
             .iter()
             .map(|input| {
@@ -1370,14 +1429,62 @@ impl ReadinessEvidenceEngine {
                         },
                     }
                 };
-                ReadinessProjectEvidence {
-                    project_identity: project_identity.to_owned(),
-                    restorable,
-                    synchronized: ReadinessEvidenceConclusion::Missing,
-                }
+                (
+                    project_identity.to_owned(),
+                    ReadinessProjectEvidence {
+                        project_identity: project_identity.to_owned(),
+                        restorable,
+                        synchronized: ReadinessEvidenceConclusion::Missing,
+                    },
+                )
             })
-            .collect::<Vec<_>>();
-        projects.sort_by(|left, right| left.project_identity.cmp(&right.project_identity));
+            .collect::<BTreeMap<_, _>>();
+        for project in &request.project_publications {
+            let latest_execution =
+                records
+                    .iter()
+                    .rev()
+                    .find_map(|record| match &record.content.evidence {
+                        StoredEvidence::PushExecution {
+                            plan_hash,
+                            project_identity,
+                            state,
+                            remote,
+                            publication_proofs,
+                            ..
+                        } if project_identity == project.id() => {
+                            Some((plan_hash, state, remote, publication_proofs))
+                        }
+                        _ => None,
+                    });
+            let synchronized = match latest_execution {
+                None => ReadinessEvidenceConclusion::Missing,
+                Some((record_plan, state, remote, stored_proofs))
+                    if plan_is_current
+                        && record_plan == &current_plan_hash
+                        && state == "complete" =>
+                {
+                    let proofs = stored_proofs
+                        .iter()
+                        .map(PushPublicationProof::from)
+                        .collect::<Vec<_>>();
+                    match revalidate_synchronized_project(&self.git, project, remote, &proofs) {
+                        Ok(()) => ReadinessEvidenceConclusion::Current,
+                        Err(_) => ReadinessEvidenceConclusion::Invalidated,
+                    }
+                }
+                Some(_) => ReadinessEvidenceConclusion::Invalidated,
+            };
+            projects_by_identity
+                .entry(project.id().to_owned())
+                .and_modify(|evidence| evidence.synchronized = synchronized)
+                .or_insert_with(|| ReadinessProjectEvidence {
+                    project_identity: project.id().to_owned(),
+                    restorable: ReadinessEvidenceConclusion::Missing,
+                    synchronized,
+                });
+        }
+        let projects = projects_by_identity.into_values().collect::<Vec<_>>();
 
         let (active_owner_attestations, withdrawn_owner_attestation_identifiers) =
             active_attestation_status(&records)?;
@@ -1601,6 +1708,7 @@ impl StoredRecordContent {
             | StoredEvidence::ProjectCapsuleCapture { plan_hash, .. }
             | StoredEvidence::ProjectCapsuleRehearsal { plan_hash, .. }
             | StoredEvidence::RestoreRehearsal { plan_hash, .. }
+            | StoredEvidence::PushExecution { plan_hash, .. }
             | StoredEvidence::OwnerAttestation { plan_hash, .. }
             | StoredEvidence::OwnerAttestationWithdrawn { plan_hash, .. } => Some(plan_hash),
         }
@@ -1665,6 +1773,15 @@ enum StoredEvidence {
         recovery_method: String,
         restored_at_unix_seconds: u64,
     },
+    PushExecution {
+        plan_hash: String,
+        project_identity: String,
+        push_plan_hash: String,
+        state: String,
+        remote: String,
+        publication_proofs: Vec<StoredPublicationProof>,
+        executed_at_unix_seconds: u64,
+    },
     OwnerAttestation {
         plan_hash: String,
         attestation_identifier: String,
@@ -1678,6 +1795,34 @@ enum StoredEvidence {
         plan_hash: String,
         attestation_identifier: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredPublicationProof {
+    local_reference: String,
+    remote_reference: String,
+    proposed_new_remote_object: String,
+}
+
+impl From<&PushPublicationProof> for StoredPublicationProof {
+    fn from(proof: &PushPublicationProof) -> Self {
+        Self {
+            local_reference: proof.local_reference.clone(),
+            remote_reference: proof.remote_reference.clone(),
+            proposed_new_remote_object: proof.proposed_new_remote_object.clone(),
+        }
+    }
+}
+
+impl From<&StoredPublicationProof> for PushPublicationProof {
+    fn from(proof: &StoredPublicationProof) -> Self {
+        Self {
+            local_reference: proof.local_reference.clone(),
+            remote_reference: proof.remote_reference.clone(),
+            proposed_new_remote_object: proof.proposed_new_remote_object.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1759,7 +1904,8 @@ fn active_attestation_status(
             | StoredEvidence::NotProtectedReport { .. }
             | StoredEvidence::ProjectCapsuleCapture { .. }
             | StoredEvidence::ProjectCapsuleRehearsal { .. }
-            | StoredEvidence::RestoreRehearsal { .. } => {}
+            | StoredEvidence::RestoreRehearsal { .. }
+            | StoredEvidence::PushExecution { .. } => {}
         }
     }
     Ok((active.into_values().collect(), withdrawn))
@@ -1785,6 +1931,13 @@ fn verified_copy_durability_name(durability: VerifiedCopyDurability) -> &'static
     match durability {
         VerifiedCopyDurability::Durable => "durable",
         VerifiedCopyDurability::Weaker => "weaker",
+    }
+}
+
+fn push_execution_state_name(state: PushExecutionState) -> &'static str {
+    match state {
+        PushExecutionState::Complete => "complete",
+        PushExecutionState::Partial => "partial",
     }
 }
 

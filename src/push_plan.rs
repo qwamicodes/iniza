@@ -479,8 +479,21 @@ pub struct PushExecutionReport {
     succeeded_actions: usize,
     failed_actions: usize,
     pending_actions: usize,
+    plan_hash: String,
+    project_identity: String,
+    push_plan_hash: String,
+    remote: String,
+    publication_proofs: Vec<PushPublicationProof>,
+    occurred_at_unix_seconds: u64,
     human_result: String,
     machine_json_result: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PushPublicationProof {
+    pub(crate) local_reference: String,
+    pub(crate) remote_reference: String,
+    pub(crate) proposed_new_remote_object: String,
 }
 
 impl PushExecutionReport {
@@ -498,6 +511,30 @@ impl PushExecutionReport {
 
     pub fn pending_actions(&self) -> usize {
         self.pending_actions
+    }
+
+    pub fn plan_hash(&self) -> &str {
+        &self.plan_hash
+    }
+
+    pub fn project_identity(&self) -> &str {
+        &self.project_identity
+    }
+
+    pub fn push_plan_hash(&self) -> &str {
+        &self.push_plan_hash
+    }
+
+    pub fn occurred_at_unix_seconds(&self) -> u64 {
+        self.occurred_at_unix_seconds
+    }
+
+    pub(crate) fn remote(&self) -> &str {
+        &self.remote
+    }
+
+    pub(crate) fn publication_proofs(&self) -> &[PushPublicationProof] {
+        &self.publication_proofs
     }
 
     pub fn human_result(&self) -> &str {
@@ -774,8 +811,24 @@ impl<G: GitPublicationProcess> PushPlanEngine<G> {
             .iter()
             .map(|action| action.action_id.as_str())
             .collect::<Vec<_>>();
-        let mut result_log =
-            PushResultLog::create(&request.result, &current_hash, &planned_action_ids)?;
+        let publication_proofs = document
+            .actions
+            .iter()
+            .map(|action| PushPublicationProof {
+                local_reference: action.local_reference.clone(),
+                remote_reference: action.remote_reference.clone(),
+                proposed_new_remote_object: action.proposed_new_remote_object.clone(),
+            })
+            .collect();
+        let mut result_log = PushResultLog::create(
+            &request.result,
+            &current_hash,
+            &request.plan.approval_hash()?,
+            request.project.id(),
+            &document.remote,
+            publication_proofs,
+            &planned_action_ids,
+        )?;
         if unix_time_now()? > document.expires_unix_seconds {
             return result_log.finish(PushExecutionState::Partial, 0, 1, "push-plan-expired", None);
         }
@@ -934,6 +987,10 @@ struct PushResultLog {
     file: File,
     path: PathBuf,
     push_plan_hash: String,
+    plan_hash: String,
+    project_identity: String,
+    remote: String,
+    publication_proofs: Vec<PushPublicationProof>,
     total_actions: usize,
 }
 
@@ -941,6 +998,10 @@ impl PushResultLog {
     fn create(
         path: &Path,
         push_plan_hash: &str,
+        plan_hash: &str,
+        project_identity: &str,
+        remote: &str,
+        publication_proofs: Vec<PushPublicationProof>,
         planned_action_ids: &[&str],
     ) -> Result<Self, CoreError> {
         let mut options = OpenOptions::new();
@@ -967,6 +1028,10 @@ impl PushResultLog {
             file,
             path: path.to_path_buf(),
             push_plan_hash: push_plan_hash.to_owned(),
+            plan_hash: plan_hash.to_owned(),
+            project_identity: project_identity.to_owned(),
+            remote: remote.to_owned(),
+            publication_proofs,
             total_actions: planned_action_ids.len(),
         };
         log.append_json(&serde_json::json!({
@@ -1021,7 +1086,13 @@ impl PushResultLog {
             "outcome_code": outcome_code,
         }))?;
         build_execution_report(
-            &self.push_plan_hash,
+            PushExecutionBinding {
+                push_plan_hash: &self.push_plan_hash,
+                plan_hash: &self.plan_hash,
+                project_identity: &self.project_identity,
+                remote: &self.remote,
+                publication_proofs: &self.publication_proofs[..succeeded_actions],
+            },
             state,
             succeeded_actions,
             failed_actions,
@@ -1047,14 +1118,29 @@ impl PushResultLog {
     }
 }
 
+struct PushExecutionBinding<'a> {
+    push_plan_hash: &'a str,
+    plan_hash: &'a str,
+    project_identity: &'a str,
+    remote: &'a str,
+    publication_proofs: &'a [PushPublicationProof],
+}
+
 fn build_execution_report(
-    push_plan_hash: &str,
+    binding: PushExecutionBinding<'_>,
     state: PushExecutionState,
     succeeded_actions: usize,
     failed_actions: usize,
     pending_actions: usize,
     outcome_code: &str,
 ) -> Result<PushExecutionReport, CoreError> {
+    let PushExecutionBinding {
+        push_plan_hash,
+        plan_hash,
+        project_identity,
+        remote,
+        publication_proofs,
+    } = binding;
     let human_result = match state {
         PushExecutionState::Complete => format!(
             "Push Plan complete: {succeeded_actions} approved publication action(s) proven."
@@ -1086,6 +1172,12 @@ fn build_execution_report(
         succeeded_actions,
         failed_actions,
         pending_actions,
+        plan_hash: plan_hash.to_owned(),
+        project_identity: project_identity.to_owned(),
+        push_plan_hash: push_plan_hash.to_owned(),
+        remote: remote.to_owned(),
+        publication_proofs: publication_proofs.to_vec(),
+        occurred_at_unix_seconds: unix_time_now()?,
         human_result,
         machine_json_result,
     })
@@ -1150,6 +1242,29 @@ fn ensure_project_observation_current(
     hasher.update(&references);
     if hasher.finalize().to_hex().as_str() != expected {
         return invalid("Project changed after its verified local audit");
+    }
+    Ok(())
+}
+
+pub(crate) fn revalidate_synchronized_project(
+    git: &impl GitPublicationProcess,
+    project: &ProjectAudit,
+    remote: &str,
+    proofs: &[PushPublicationProof],
+) -> Result<(), CoreError> {
+    if proofs.is_empty() {
+        return invalid("Push Plan execution has no proven publication actions");
+    }
+    ensure_project_observation_current(git, project)?;
+    for proof in proofs {
+        let local = read_local_object(git, project.root(), &proof.local_reference)?;
+        let remote_object =
+            read_remote_object(git, project.root(), remote, &proof.remote_reference)?;
+        if local != proof.proposed_new_remote_object
+            || remote_object != proof.proposed_new_remote_object
+        {
+            return invalid("published Git reference is no longer synchronized");
+        }
     }
     Ok(())
 }
