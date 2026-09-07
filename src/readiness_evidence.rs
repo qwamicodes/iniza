@@ -9,6 +9,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use serde::{Deserialize, Serialize};
 
+use crate::bundle::verified_copy_destination_evidence_identity;
 use crate::restore::current_restore_destination_evidence_identity;
 
 use crate::{
@@ -16,7 +17,7 @@ use crate::{
     OfflineRecoveryEngine, OfflineRecoveryRehearsalReceipt, OfflineRecoveryRehearsalRequest, Plan,
     PlanApprovalState, ProjectCapsuleCaptureReport, ProjectCapsuleExpectation,
     ProjectCapsuleRehearsalReceipt, RecoveryMethod, RecoverySecret, RestoreReport, RestoreState,
-    VaultwardenRecoveryReceipt, VerifiedCopyReceipt, VerifyRequest,
+    VaultwardenRecoveryReceipt, VerifiedCopyDurability, VerifiedCopyReceipt, VerifyRequest,
 };
 
 const RECORD_SCHEMA_VERSION: u32 = 1;
@@ -203,7 +204,7 @@ pub struct ReadinessEvidenceStatusRequest<'a> {
     bundle: Option<BundleStatusInput<'a>>,
     offline_recovery_document: Option<PathBuf>,
     vaultwarden_recovery: Option<&'a LoadedVaultwardenRecoverySecret>,
-    verified_copy: Option<PathBuf>,
+    verified_copies: Vec<PathBuf>,
     project_capsules: Vec<ProjectCapsuleStatusInput<'a>>,
     restore_rehearsal_destination: Option<PathBuf>,
 }
@@ -229,7 +230,7 @@ impl<'a> ReadinessEvidenceStatusRequest<'a> {
             bundle: None,
             offline_recovery_document: None,
             vaultwarden_recovery: None,
-            verified_copy: None,
+            verified_copies: Vec::new(),
             project_capsules: Vec::new(),
             restore_rehearsal_destination: None,
         }
@@ -253,7 +254,7 @@ impl<'a> ReadinessEvidenceStatusRequest<'a> {
     }
 
     pub fn with_verified_copy(mut self, bundle: impl Into<PathBuf>) -> Self {
-        self.verified_copy = Some(bundle.into());
+        self.verified_copies.push(bundle.into());
         self
     }
 
@@ -877,6 +878,10 @@ impl ReadinessEvidenceEngine {
                     source_bundle_identity: receipt.source_bundle_identity().to_owned(),
                     destination_bundle_identity: receipt.destination_bundle_identity().to_owned(),
                     whole_file_digest: receipt.whole_file_digest().to_owned(),
+                    destination_evidence_identity: receipt
+                        .destination_evidence_identity()
+                        .to_owned(),
+                    durability: verified_copy_durability_name(receipt.durability()).to_owned(),
                     verified_at_unix_seconds: receipt.verified_at_unix_seconds(),
                 },
             ),
@@ -1103,59 +1108,87 @@ impl ReadinessEvidenceEngine {
             },
         };
 
-        let latest_copy = records
+        let copy_records = records
             .iter()
-            .rev()
-            .find_map(|record| match &record.content.evidence {
+            .filter_map(|record| match &record.content.evidence {
                 StoredEvidence::VerifiedCopy {
                     plan_hash,
                     source_bundle_identity,
                     destination_bundle_identity,
                     whole_file_digest,
+                    destination_evidence_identity,
+                    durability,
                     ..
                 } => Some((
                     plan_hash,
                     source_bundle_identity,
                     destination_bundle_identity,
                     whole_file_digest,
+                    destination_evidence_identity,
+                    durability,
                 )),
                 _ => None,
-            });
-        let verified_copy = match (
-            plan_is_current,
-            latest_copy,
-            request.bundle.as_ref(),
-            request.verified_copy.as_ref(),
-        ) {
-            (false, Some(_), _, _) => ReadinessEvidenceConclusion::Invalidated,
-            (_, None, _, _) | (_, Some(_), None, _) | (_, Some(_), _, None) => {
-                ReadinessEvidenceConclusion::Missing
-            }
-            (
-                true,
-                Some((record_plan, source_identity, destination_identity, record_digest)),
-                Some(bundle_input),
-                Some(copy),
-            ) => {
-                let source = BundleEngine::local().verify(VerifyRequest::new(
-                    &bundle_input.bundle,
-                    bundle_input.recovery_secret,
-                ));
-                let destination = BundleEngine::local()
-                    .verify(VerifyRequest::new(copy, bundle_input.recovery_secret));
-                let copy_digest = whole_file_digest(copy);
-                match (source, destination, copy_digest) {
-                    (Ok(source), Ok(destination), Ok(copy_digest))
-                        if record_plan == &current_plan_hash
-                            && source_identity == source.bundle_identity()
-                            && destination_identity == destination.bundle_identity()
-                            && record_digest == &copy_digest =>
-                    {
-                        ReadinessEvidenceConclusion::Current
+            })
+            .collect::<Vec<_>>();
+        let verified_copy = if copy_records.is_empty() || request.verified_copies.is_empty() {
+            ReadinessEvidenceConclusion::Missing
+        } else if !plan_is_current {
+            ReadinessEvidenceConclusion::Invalidated
+        } else if let Some(bundle_input) = request.bundle.as_ref() {
+            let source = BundleEngine::local().verify(VerifyRequest::new(
+                &bundle_input.bundle,
+                bundle_input.recovery_secret,
+            ));
+            let conclusions = request
+                .verified_copies
+                .iter()
+                .map(|copy| {
+                    let current_destination_identity =
+                        match verified_copy_destination_evidence_identity(copy) {
+                            Ok(identity) => identity,
+                            Err(_) => return ReadinessEvidenceConclusion::Invalidated,
+                        };
+                    let record = copy_records
+                        .iter()
+                        .rev()
+                        .find(|record| record.4.as_str() == current_destination_identity.as_str());
+                    let Some((
+                        record_plan,
+                        source_identity,
+                        destination_identity,
+                        record_digest,
+                        _,
+                        durability,
+                    )) = record
+                    else {
+                        return ReadinessEvidenceConclusion::Missing;
+                    };
+                    let destination = BundleEngine::local()
+                        .verify(VerifyRequest::new(copy, bundle_input.recovery_secret));
+                    let copy_digest = whole_file_digest(copy);
+                    match (&source, destination, copy_digest) {
+                        (Ok(source), Ok(destination), Ok(copy_digest))
+                            if *record_plan == &current_plan_hash
+                                && *source_identity == source.bundle_identity()
+                                && *destination_identity == destination.bundle_identity()
+                                && *record_digest == &copy_digest
+                                && durability.as_str() == "durable" =>
+                        {
+                            ReadinessEvidenceConclusion::Current
+                        }
+                        _ => ReadinessEvidenceConclusion::Invalidated,
                     }
-                    _ => ReadinessEvidenceConclusion::Invalidated,
-                }
+                })
+                .collect::<Vec<_>>();
+            if conclusions.contains(&ReadinessEvidenceConclusion::Invalidated) {
+                ReadinessEvidenceConclusion::Invalidated
+            } else if conclusions.contains(&ReadinessEvidenceConclusion::Missing) {
+                ReadinessEvidenceConclusion::Missing
+            } else {
+                ReadinessEvidenceConclusion::Current
             }
+        } else {
+            ReadinessEvidenceConclusion::Missing
         };
         let latest_vaultwarden =
             records
@@ -1604,6 +1637,8 @@ enum StoredEvidence {
         source_bundle_identity: String,
         destination_bundle_identity: String,
         whole_file_digest: String,
+        destination_evidence_identity: String,
+        durability: String,
         verified_at_unix_seconds: u64,
     },
     NotProtectedReport {
@@ -1743,6 +1778,13 @@ fn recovery_method_name(method: RecoveryMethod) -> &'static str {
     match method {
         RecoveryMethod::Vaultwarden => "vaultwarden",
         RecoveryMethod::Offline => "offline",
+    }
+}
+
+fn verified_copy_durability_name(durability: VerifiedCopyDurability) -> &'static str {
+    match durability {
+        VerifiedCopyDurability::Durable => "durable",
+        VerifiedCopyDurability::Weaker => "weaker",
     }
 }
 

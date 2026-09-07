@@ -572,6 +572,8 @@ pub struct VerifiedCopyReceipt {
     source_bundle_identity: String,
     destination_bundle_identity: String,
     whole_file_digest: String,
+    destination_evidence_identity: String,
+    durability: VerifiedCopyDurability,
     verified_at_unix_seconds: u64,
 }
 
@@ -600,6 +602,14 @@ impl VerifiedCopyReceipt {
         &self.whole_file_digest
     }
 
+    pub fn destination_evidence_identity(&self) -> &str {
+        &self.destination_evidence_identity
+    }
+
+    pub fn durability(&self) -> VerifiedCopyDurability {
+        self.durability
+    }
+
     pub fn verified_at_unix_seconds(&self) -> u64 {
         self.verified_at_unix_seconds
     }
@@ -612,6 +622,8 @@ impl VerifiedCopyReceipt {
             "source_bundle_identity": self.source_bundle_identity,
             "destination_bundle_identity": self.destination_bundle_identity,
             "whole_file_digest": self.whole_file_digest,
+            "destination_evidence_identity": self.destination_evidence_identity,
+            "durability": verified_copy_durability_name(self.durability),
             "verified_at_unix_seconds": self.verified_at_unix_seconds,
         })
         .to_string()
@@ -1359,16 +1371,20 @@ impl<S: BundleSource, C: DestinationCapacity> BundleEngine<S, C> {
         let destination_digest = bundle_hash_hex(&destination.bundle_hash);
         let source_bundle_identity = bundle_identity_hex(&source.bundle_identifier);
         let destination_bundle_identity = bundle_identity_hex(&destination.bundle_identifier);
+        let durability = request.persistence.durability();
         let receipt = VerifiedCopyReceipt {
             source_bundle_identity: source_bundle_identity.clone(),
             destination_bundle_identity: destination_bundle_identity.clone(),
             whole_file_digest: destination_digest.clone(),
+            destination_evidence_identity: verified_copy_destination_evidence_identity(
+                &request.destination,
+            )?,
+            durability,
             verified_at_unix_seconds: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_err(|_| invalid_bundle("system clock is before the Unix epoch"))?
                 .as_secs(),
         };
-        let durability = request.persistence.durability();
         let warnings = match durability {
             VerifiedCopyDurability::Durable => Vec::new(),
             VerifiedCopyDurability::Weaker => vec![
@@ -4548,6 +4564,48 @@ fn decode_manifest(bytes: &[u8]) -> Result<Manifest, CoreError> {
     }
     serde_json::from_slice(bytes)
         .map_err(|_| invalid_bundle("Bundle manifest is not canonical supported JSON"))
+}
+
+fn verified_copy_durability_name(durability: VerifiedCopyDurability) -> &'static str {
+    match durability {
+        VerifiedCopyDurability::Durable => "durable",
+        VerifiedCopyDurability::Weaker => "weaker",
+    }
+}
+
+pub(crate) fn verified_copy_destination_evidence_identity(
+    destination: &Path,
+) -> Result<String, CoreError> {
+    let metadata = fs::symlink_metadata(destination).map_err(|source| CoreError::Io {
+        action: "inspect Verified Copy destination identity",
+        path: destination.to_path_buf(),
+        source,
+    })?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(invalid_bundle(
+            "Verified Copy destination identity is not a regular file",
+        ));
+    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"iniza verified copy destination evidence v1\0");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        hasher.update(&metadata.dev().to_be_bytes());
+        hasher.update(&metadata.ino().to_be_bytes());
+    }
+    #[cfg(not(unix))]
+    hasher.update(
+        fs::canonicalize(destination)
+            .map_err(|source| CoreError::Io {
+                action: "resolve Verified Copy destination identity",
+                path: destination.to_path_buf(),
+                source,
+            })?
+            .to_string_lossy()
+            .as_bytes(),
+    );
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
 fn partial_path(destination: &Path) -> PathBuf {

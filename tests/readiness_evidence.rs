@@ -1,5 +1,5 @@
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
@@ -1006,6 +1006,89 @@ fn completed_restore_rehearsal_is_current_only_for_its_bundle_and_destination() 
     assert_eq!(
         status.restore_rehearsal(),
         ReadinessEvidenceConclusion::Current
+    );
+}
+
+#[test]
+fn every_selected_verified_copy_must_revalidate_independently() {
+    let directory = TestDirectory::new();
+    let source = directory.path().join("synthetic-state");
+    fs::create_dir(&source).expect("synthetic source should be created");
+    fs::write(source.join("settings.txt"), b"synthetic settings\n")
+        .expect("synthetic source should be written");
+    let mut plan = PlanEngine::local()
+        .scan(ScanRequest::for_directory(&source))
+        .expect("synthetic source should scan");
+    let plan_hash = plan.approval_hash().expect("Plan should have a hash");
+    plan.approve(&plan_hash)
+        .expect("exact reviewed hash should approve the Plan");
+
+    let bundle = directory.path().join("migration.iniza");
+    let bundle_engine = BundleEngine::local();
+    let packed = bundle_engine
+        .pack(PackRequest::new(&plan, &bundle))
+        .expect("approved Plan should produce a completed Bundle");
+    let first_copy = directory.path().join("first-copy.iniza");
+    let second_copy = directory.path().join("second-copy.iniza");
+    let first = bundle_engine
+        .copy_verified(VerifiedCopyRequest::new(
+            &bundle,
+            &first_copy,
+            packed.offline_recovery_key(),
+        ))
+        .expect("first Verified Copy should complete");
+    let second = bundle_engine
+        .copy_verified(VerifiedCopyRequest::new(
+            &bundle,
+            &second_copy,
+            packed.offline_recovery_key(),
+        ))
+        .expect("second Verified Copy should complete");
+
+    let evidence_directory = directory.path().join("readiness-evidence");
+    let engine = ReadinessEvidenceEngine::local();
+    engine
+        .initialize(ReadinessEvidenceInitializationRequest::new(
+            &plan,
+            &evidence_directory,
+        ))
+        .expect("approved Plan should initialize a private evidence store");
+    for receipt in [first.receipt(), second.receipt()] {
+        engine
+            .record_receipt(ReadinessReceiptRecordRequest::verified_copy(
+                &evidence_directory,
+                &plan,
+                receipt,
+            ))
+            .expect("each typed Verified Copy Receipt should append");
+    }
+
+    let status_request = || {
+        ReadinessEvidenceStatusRequest::new(&evidence_directory, &plan)
+            .with_bundle(&bundle, packed.offline_recovery_key())
+            .with_verified_copy(&first_copy)
+            .with_verified_copy(&second_copy)
+    };
+    assert_eq!(
+        engine
+            .status(status_request())
+            .expect("both Verified Copies should revalidate")
+            .verified_copy(),
+        ReadinessEvidenceConclusion::Current
+    );
+
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&first_copy)
+        .expect("first Verified Copy should reopen")
+        .write_all(b"modified")
+        .expect("first Verified Copy should be modified");
+    assert_eq!(
+        engine
+            .status(status_request())
+            .expect("modified Verified Copy should produce status")
+            .verified_copy(),
+        ReadinessEvidenceConclusion::Invalidated
     );
 }
 
