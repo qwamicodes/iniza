@@ -44,3 +44,4 @@ This artifact supports dependency review and later release-gate work. It does no
 ## Verification snapshots
 
 - [2026-09-07 automated verification](verification-2026-09-07.md) records the exact commit and lockfile used for the full behavior suite, strict static checks, and narrow tracked-repository secret-pattern check.
+- [2026-09-07 dependency policy audit](dependency-policy-audit-2026-09-07.md) records clean advisory and source checks plus the unresolved root-license and duplicate-version policy findings. It deliberately adds no blanket allowance.

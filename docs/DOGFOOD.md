@@ -79,6 +79,8 @@ The same exact lockfile now has a deterministic, path-redacted [CycloneDX 1.5 so
 
 The [2026-09-07 automated verification snapshot](security/verification-2026-09-07.md) records 284 passing tests with zero failures and zero ignored tests, strict Clippy and formatting success, and the bounded tracked-repository secret-pattern check. It lists the remaining gates explicitly rather than treating green automation as Owner Dogfood approval.
 
+The [dependency policy audit](security/dependency-policy-audit-2026-09-07.md) reports zero advisory and source-origin findings, while retaining the unresolved Iniza license decision and eleven duplicate-version families for explicit review. No allow-list or duplicate suppression has been inferred.
+
 This automated result does not replace the independent cryptographic, parser, and key-lifecycle review required by ADR 0005. Real sole-copy owner data remains outside the currently accepted format scope.
 
 ## Command-line orchestration evidence
