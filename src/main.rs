@@ -129,66 +129,10 @@ fn run(
             }
             Ok(ExitCode::SUCCESS)
         }
-        [
-            namespace,
-            command,
-            action,
-            plan_flag,
-            push_plan,
-            hash_flag,
-            reviewed_hash,
-            output_flag,
-            approval,
-            acknowledgement,
-        ] if namespace == "projects"
-            && command == "push-plan"
-            && action == "approve"
-            && plan_flag == "--plan"
-            && hash_flag == "--reviewed-hash"
-            && output_flag == "--output"
-            && acknowledgement == "--acknowledge-remote-side-effects" =>
+        [namespace, command, action, approval_arguments @ ..]
+            if namespace == "projects" && command == "push-plan" && action == "approve" =>
         {
-            let receipt = PushPlanEngine::local()
-                .approve(
-                    PushPlanApprovalRequest::new(push_plan, reviewed_hash, approval)
-                        .acknowledge_remote_side_effects(),
-                )
-                .map_err(|error| CliError::Approval(error.to_string()))?;
-            if machine_output {
-                print_machine_value(
-                    "projects push-plan approve",
-                    serde_json::json!({"push_plan_hash": receipt.push_plan_hash()}),
-                );
-            } else {
-                println!("Push Plan approved: {}", receipt.push_plan_hash());
-            }
-            Ok(ExitCode::SUCCESS)
-        }
-        [
-            namespace,
-            command,
-            action,
-            plan_flag,
-            push_plan,
-            hash_flag,
-            reviewed_hash,
-            output_flag,
-            approval,
-        ] if namespace == "projects"
-            && command == "push-plan"
-            && action == "approve"
-            && plan_flag == "--plan"
-            && hash_flag == "--reviewed-hash"
-            && output_flag == "--output" =>
-        {
-            PushPlanEngine::local()
-                .approve(PushPlanApprovalRequest::new(
-                    push_plan,
-                    reviewed_hash,
-                    approval,
-                ))
-                .map_err(|error| CliError::Approval(error.to_string()))?;
-            unreachable!("Push Plan approval without acknowledgement cannot succeed")
+            run_push_plan_approval(approval_arguments, machine_output)
         }
         [namespace, method, command, bundle_flag, bundle, document_flag, document]
             if namespace == "recovery"
@@ -453,6 +397,89 @@ fn run(
                 .to_owned(),
         )),
     }
+}
+
+fn run_push_plan_approval(
+    arguments: &[String],
+    machine_output: bool,
+) -> Result<ExitCode, CliError> {
+    let mut push_plan = None;
+    let mut reviewed_hash = None;
+    let mut approval = None;
+    let mut acknowledged_remote_side_effects = false;
+    let mut approved_action_ids = Vec::new();
+    let mut index = 0;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "--plan" if push_plan.is_none() => {
+                push_plan = Some(
+                    arguments
+                        .get(index + 1)
+                        .ok_or_else(push_plan_approval_usage)?,
+                );
+                index += 2;
+            }
+            "--reviewed-hash" if reviewed_hash.is_none() => {
+                reviewed_hash = Some(
+                    arguments
+                        .get(index + 1)
+                        .ok_or_else(push_plan_approval_usage)?,
+                );
+                index += 2;
+            }
+            "--output" if approval.is_none() => {
+                approval = Some(
+                    arguments
+                        .get(index + 1)
+                        .ok_or_else(push_plan_approval_usage)?,
+                );
+                index += 2;
+            }
+            "--acknowledge-remote-side-effects" if !acknowledged_remote_side_effects => {
+                acknowledged_remote_side_effects = true;
+                index += 1;
+            }
+            "--approve-action" => {
+                approved_action_ids.push(
+                    arguments
+                        .get(index + 1)
+                        .ok_or_else(push_plan_approval_usage)?,
+                );
+                index += 2;
+            }
+            _ => return Err(push_plan_approval_usage()),
+        }
+    }
+    let mut request = PushPlanApprovalRequest::new(
+        push_plan.ok_or_else(push_plan_approval_usage)?,
+        reviewed_hash.ok_or_else(push_plan_approval_usage)?,
+        approval.ok_or_else(push_plan_approval_usage)?,
+    );
+    if acknowledged_remote_side_effects {
+        request = request.acknowledge_remote_side_effects();
+    }
+    for action_id in approved_action_ids {
+        request = request.approve_action(action_id);
+    }
+    let receipt = PushPlanEngine::local()
+        .approve(request)
+        .map_err(|error| CliError::Approval(error.to_string()))?;
+    if machine_output {
+        print_machine_value(
+            "projects push-plan approve",
+            serde_json::json!({"push_plan_hash": receipt.push_plan_hash()}),
+        );
+    } else {
+        println!("Push Plan approved: {}", receipt.push_plan_hash());
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn push_plan_approval_usage() -> CliError {
+    CliError::Usage(
+        "usage: iniza projects push-plan approve --plan <PUSH_PLAN> --reviewed-hash <HASH> --output <APPROVAL_RECEIPT> --acknowledge-remote-side-effects [--approve-action <ACTION_IDENTIFIER>]..."
+            .to_owned(),
+    )
 }
 
 fn run_scan(

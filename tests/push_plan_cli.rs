@@ -214,6 +214,87 @@ fn production_draft_command_rejects_local_transport_without_creating_a_push_plan
     assert!(!visible.contains("private-disposable-project"));
 }
 
+#[test]
+fn command_line_approval_requires_the_exact_new_reference_action_identifier() {
+    let directory = TestDirectory::new();
+    let project = directory.path().join("private-disposable-project");
+    let remote = directory.path().join("disposable-remote.git");
+    let push_plan = directory.path().join("reviewed.push-plan.toml");
+    let approval = directory.path().join("reviewed.push-approval.toml");
+    create_ahead_project(&project, &remote);
+    git(&project, &["branch", "feature/local"]);
+
+    let mut plan = PlanEngine::local()
+        .scan(ScanRequest::for_directory(&project))
+        .expect("disposable Project should scan");
+    let directory_plan_hash = plan.approval_hash().expect("Plan should hash");
+    plan.approve(&directory_plan_hash)
+        .expect("exact Plan hash should approve");
+    let audit = ProjectAuditEngine::local()
+        .audit(ProjectAuditRequest::from_plan(&plan))
+        .expect("disposable Project should audit");
+    let draft = PushPlanEngine::with_git_publication_process(LocalGitPublication)
+        .draft(
+            PushPlanDraftRequest::new(
+                &plan,
+                audit.projects().first().expect("Project should be present"),
+                "origin",
+                &push_plan,
+            )
+            .include_new_reference("refs/heads/feature/local"),
+        )
+        .expect("fixture should produce a new-reference action");
+    let new_reference_action = draft
+        .actions()
+        .iter()
+        .find(|action| action.requires_item_approval())
+        .expect("new branch should require item approval")
+        .action_id();
+
+    let missing = iniza(&[
+        "--json",
+        "projects",
+        "push-plan",
+        "approve",
+        "--plan",
+        push_plan.to_str().expect("Push Plan path should be text"),
+        "--reviewed-hash",
+        draft.approval_hash(),
+        "--output",
+        approval.to_str().expect("approval path should be text"),
+        "--acknowledge-remote-side-effects",
+    ]);
+    assert_eq!(missing.status.code(), Some(10));
+    assert!(!approval.exists());
+
+    let approved = iniza(&[
+        "--json",
+        "projects",
+        "push-plan",
+        "approve",
+        "--plan",
+        push_plan.to_str().expect("Push Plan path should be text"),
+        "--reviewed-hash",
+        draft.approval_hash(),
+        "--output",
+        approval.to_str().expect("approval path should be text"),
+        "--acknowledge-remote-side-effects",
+        "--approve-action",
+        new_reference_action,
+    ]);
+    assert!(
+        approved.status.success(),
+        "exact action approval should succeed: {}{}",
+        String::from_utf8_lossy(&approved.stdout),
+        String::from_utf8_lossy(&approved.stderr)
+    );
+    assert!(approval.is_file());
+    let result: serde_json::Value = serde_json::from_slice(&approved.stdout)
+        .expect("machine result should be valid JavaScript Object Notation");
+    assert_eq!(result["command"], "projects push-plan approve");
+    assert_eq!(result["status"], "success");
+}
+
 fn iniza(arguments: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_iniza"))
         .args(arguments)
