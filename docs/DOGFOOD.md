@@ -81,6 +81,8 @@ The [2026-09-07 automated verification snapshot](security/verification-2026-09-0
 
 The [dependency policy audit](security/dependency-policy-audit-2026-09-07.md) reports zero advisory and source-origin findings, while retaining the unresolved Iniza license decision and eleven duplicate-version families for explicit review. No allow-list or duplicate suppression has been inferred.
 
+The bounded [independent security review package](security/independent-review-package.md) now identifies the exact security-sensitive source, decisions, tests, reproduction commands, unresolved gaps, and reviewer deliverable. Its SHA-256 manifest permits a reviewer to detect drift. Preparing the package is not independent acceptance, so the format restriction remains unchanged.
+
 This automated result does not replace the independent cryptographic, parser, and key-lifecycle review required by ADR 0005. Real sole-copy owner data remains outside the currently accepted format scope.
 
 ## Command-line orchestration evidence

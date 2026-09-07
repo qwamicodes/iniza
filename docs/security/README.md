@@ -45,3 +45,8 @@ This artifact supports dependency review and later release-gate work. It does no
 
 - [2026-09-07 automated verification](verification-2026-09-07.md) records the exact commit and lockfile used for the full behavior suite, strict static checks, and narrow tracked-repository secret-pattern check.
 - [2026-09-07 dependency policy audit](dependency-policy-audit-2026-09-07.md) records clean advisory and source checks plus the unresolved root-license and duplicate-version policy findings. It deliberately adds no blanket allowance.
+
+## Independent review
+
+- [Independent security review package](independent-review-package.md) defines the bounded reading order, reviewer questions, reproduction commands, unresolved gaps, and required deliverable.
+- `review-manifest.sha256` binds the package's security-sensitive source, decisions, tests, threat model, lockfile, and software bill of materials by exact SHA-256 digest.
