@@ -40,3 +40,7 @@ Validation requires all of the following:
 6. Recompute and update the recorded SHA-256 after any dependency or generator change.
 
 This artifact supports dependency review and later release-gate work. It does not satisfy the independent cryptographic, parser, or key-lifecycle review, and it does not authorize real sole-copy owner data.
+
+## Verification snapshots
+
+- [2026-09-07 automated verification](verification-2026-09-07.md) records the exact commit and lockfile used for the full behavior suite, strict static checks, and narrow tracked-repository secret-pattern check.
