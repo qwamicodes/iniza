@@ -3563,6 +3563,7 @@ struct OpenedBundle {
 pub(crate) struct AuthenticatedRestorePlan {
     pub(crate) items: Vec<AuthenticatedRestoreItem>,
     pub(crate) bundle_hash: [u8; 32],
+    pub(crate) bundle_identity: String,
 }
 
 #[derive(Debug)]
@@ -3644,10 +3645,7 @@ impl RestoreBundleReader {
             &mut content_sink,
             false,
         )?;
-        Ok(AuthenticatedRestorePlan {
-            items: opened.restore_plan.items,
-            bundle_hash: opened.bundle_hash,
-        })
+        Ok(opened.restore_plan)
     }
 
     pub(crate) fn stream_authenticated_content(
@@ -3952,6 +3950,7 @@ fn open_bundle_from(
             })
             .collect::<Result<Vec<_>, CoreError>>()?,
         bundle_hash: *bundle_hasher.finalize().as_bytes(),
+        bundle_identity: bundle_identity_hex(&opened_header.bundle_identifier),
     };
     Ok(OpenedBundle {
         summary: AuthenticatedBundleSummary {

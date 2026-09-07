@@ -9,10 +9,14 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use serde::{Deserialize, Serialize};
 
+use crate::restore::current_restore_destination_evidence_identity;
+
 use crate::{
-    BundleEngine, BundleVerification, CoreError, OfflineRecoveryEngine,
-    OfflineRecoveryRehearsalReceipt, OfflineRecoveryRehearsalRequest, Plan, PlanApprovalState,
-    RecoverySecret, VerifiedCopyReceipt, VerifyRequest,
+    BundleEngine, BundleVerification, CoreError, LoadedVaultwardenRecoverySecret,
+    OfflineRecoveryEngine, OfflineRecoveryRehearsalReceipt, OfflineRecoveryRehearsalRequest, Plan,
+    PlanApprovalState, ProjectCapsuleCaptureReport, ProjectCapsuleExpectation,
+    ProjectCapsuleRehearsalReceipt, RecoveryMethod, RecoverySecret, RestoreReport, RestoreState,
+    VaultwardenRecoveryReceipt, VerifiedCopyReceipt, VerifyRequest,
 };
 
 const RECORD_SCHEMA_VERSION: u32 = 1;
@@ -70,7 +74,12 @@ enum ReadinessReceiptInput<'a> {
         verification: &'a BundleVerification,
     },
     OfflineRecovery(&'a OfflineRecoveryRehearsalReceipt),
+    VaultwardenRecovery(&'a VaultwardenRecoveryReceipt),
     VerifiedCopy(&'a VerifiedCopyReceipt),
+    NotProtectedReport,
+    ProjectCapsuleCapture(&'a ProjectCapsuleCaptureReport),
+    ProjectCapsuleRehearsal(&'a ProjectCapsuleRehearsalReceipt),
+    RestoreRehearsal(&'a RestoreReport),
 }
 
 impl<'a> ReadinessReceiptRecordRequest<'a> {
@@ -113,6 +122,62 @@ impl<'a> ReadinessReceiptRecordRequest<'a> {
             input: ReadinessReceiptInput::VerifiedCopy(receipt),
         }
     }
+
+    pub fn vaultwarden_recovery(
+        directory: impl Into<PathBuf>,
+        plan: &'a Plan,
+        receipt: &'a VaultwardenRecoveryReceipt,
+    ) -> Self {
+        Self {
+            directory: directory.into(),
+            plan,
+            input: ReadinessReceiptInput::VaultwardenRecovery(receipt),
+        }
+    }
+
+    pub fn not_protected_report(directory: impl Into<PathBuf>, plan: &'a Plan) -> Self {
+        Self {
+            directory: directory.into(),
+            plan,
+            input: ReadinessReceiptInput::NotProtectedReport,
+        }
+    }
+
+    pub fn project_capsule_capture(
+        directory: impl Into<PathBuf>,
+        plan: &'a Plan,
+        report: &'a ProjectCapsuleCaptureReport,
+    ) -> Self {
+        Self {
+            directory: directory.into(),
+            plan,
+            input: ReadinessReceiptInput::ProjectCapsuleCapture(report),
+        }
+    }
+
+    pub fn project_capsule_rehearsal(
+        directory: impl Into<PathBuf>,
+        plan: &'a Plan,
+        receipt: &'a ProjectCapsuleRehearsalReceipt,
+    ) -> Self {
+        Self {
+            directory: directory.into(),
+            plan,
+            input: ReadinessReceiptInput::ProjectCapsuleRehearsal(receipt),
+        }
+    }
+
+    pub fn restore_rehearsal(
+        directory: impl Into<PathBuf>,
+        plan: &'a Plan,
+        report: &'a RestoreReport,
+    ) -> Self {
+        Self {
+            directory: directory.into(),
+            plan,
+            input: ReadinessReceiptInput::RestoreRehearsal(report),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,12 +202,22 @@ pub struct ReadinessEvidenceStatusRequest<'a> {
     plan: &'a Plan,
     bundle: Option<BundleStatusInput<'a>>,
     offline_recovery_document: Option<PathBuf>,
+    vaultwarden_recovery: Option<&'a LoadedVaultwardenRecoverySecret>,
     verified_copy: Option<PathBuf>,
+    project_capsules: Vec<ProjectCapsuleStatusInput<'a>>,
+    restore_rehearsal_destination: Option<PathBuf>,
 }
 
 #[derive(Debug)]
 struct BundleStatusInput<'a> {
     bundle: PathBuf,
+    recovery_secret: &'a RecoverySecret,
+}
+
+#[derive(Debug)]
+struct ProjectCapsuleStatusInput<'a> {
+    bundle: PathBuf,
+    expectation: &'a ProjectCapsuleExpectation,
     recovery_secret: &'a RecoverySecret,
 }
 
@@ -153,7 +228,10 @@ impl<'a> ReadinessEvidenceStatusRequest<'a> {
             plan,
             bundle: None,
             offline_recovery_document: None,
+            vaultwarden_recovery: None,
             verified_copy: None,
+            project_capsules: Vec::new(),
+            restore_rehearsal_destination: None,
         }
     }
 
@@ -178,13 +256,42 @@ impl<'a> ReadinessEvidenceStatusRequest<'a> {
         self.verified_copy = Some(bundle.into());
         self
     }
+
+    pub fn with_vaultwarden_recovery(
+        mut self,
+        loaded: &'a LoadedVaultwardenRecoverySecret,
+    ) -> Self {
+        self.vaultwarden_recovery = Some(loaded);
+        self
+    }
+
+    pub fn with_project_capsule(
+        mut self,
+        bundle: impl Into<PathBuf>,
+        expectation: &'a ProjectCapsuleExpectation,
+        recovery_secret: &'a RecoverySecret,
+    ) -> Self {
+        self.project_capsules.push(ProjectCapsuleStatusInput {
+            bundle: bundle.into(),
+            expectation,
+            recovery_secret,
+        });
+        self
+    }
+
+    pub fn with_restore_rehearsal(mut self, destination: impl Into<PathBuf>) -> Self {
+        self.restore_rehearsal_destination = Some(destination.into());
+        self
+    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum ReadinessEvidenceConclusion {
     Current,
     Missing,
     Invalidated,
+    Blocking,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -196,18 +303,48 @@ pub enum ReadinessEvidenceState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadinessEvidenceStatusReport {
     state: ReadinessEvidenceState,
+    plan_coverage: ReadinessEvidenceConclusion,
     bundle_verification: ReadinessEvidenceConclusion,
     offline_recovery_method: ReadinessEvidenceConclusion,
     vaultwarden_recovery_method: ReadinessEvidenceConclusion,
     verified_copy: ReadinessEvidenceConclusion,
+    not_protected_report: ReadinessEvidenceConclusion,
+    restore_rehearsal: ReadinessEvidenceConclusion,
+    blocking_gaps: Vec<ReadinessEvidenceGap>,
     active_owner_attestations: Vec<OwnerAttestationStatus>,
     withdrawn_owner_attestation_identifiers: Vec<String>,
+    projects: Vec<ReadinessProjectEvidence>,
     events: Vec<ReadinessEvidenceEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ReadinessProjectEvidence {
+    project_identity: String,
+    restorable: ReadinessEvidenceConclusion,
+    synchronized: ReadinessEvidenceConclusion,
+}
+
+impl ReadinessProjectEvidence {
+    pub fn project_identity(&self) -> &str {
+        &self.project_identity
+    }
+
+    pub fn restorable(&self) -> ReadinessEvidenceConclusion {
+        self.restorable
+    }
+
+    pub fn synchronized(&self) -> ReadinessEvidenceConclusion {
+        self.synchronized
+    }
 }
 
 impl ReadinessEvidenceStatusReport {
     pub fn state(&self) -> ReadinessEvidenceState {
         self.state
+    }
+
+    pub fn plan_coverage(&self) -> ReadinessEvidenceConclusion {
+        self.plan_coverage
     }
 
     pub fn bundle_verification(&self) -> ReadinessEvidenceConclusion {
@@ -226,12 +363,28 @@ impl ReadinessEvidenceStatusReport {
         self.verified_copy
     }
 
+    pub fn not_protected_report(&self) -> ReadinessEvidenceConclusion {
+        self.not_protected_report
+    }
+
+    pub fn restore_rehearsal(&self) -> ReadinessEvidenceConclusion {
+        self.restore_rehearsal
+    }
+
+    pub fn blocking_gaps(&self) -> &[ReadinessEvidenceGap] {
+        &self.blocking_gaps
+    }
+
     pub fn active_owner_attestations(&self) -> &[OwnerAttestationStatus] {
         &self.active_owner_attestations
     }
 
     pub fn withdrawn_owner_attestation_identifiers(&self) -> &[String] {
         &self.withdrawn_owner_attestation_identifiers
+    }
+
+    pub fn projects(&self) -> &[ReadinessProjectEvidence] {
+        &self.projects
     }
 
     pub fn exit_code(&self) -> u8 {
@@ -256,11 +409,16 @@ impl ReadinessEvidenceStatusReport {
             "status": self.state.machine_label(),
             "data": {
                 "bundle_verification": self.bundle_verification.machine_label(),
+                "plan_coverage": self.plan_coverage.machine_label(),
                 "offline_recovery_method": self.offline_recovery_method.machine_label(),
                 "vaultwarden_recovery_method": self.vaultwarden_recovery_method.machine_label(),
                 "verified_copy": self.verified_copy.machine_label(),
+                "not_protected_report": self.not_protected_report.machine_label(),
+                "restore_rehearsal": self.restore_rehearsal.machine_label(),
+                "blocking_gaps": self.blocking_gaps,
                 "active_owner_attestations": self.active_owner_attestations,
                 "withdrawn_owner_attestation_identifiers": self.withdrawn_owner_attestation_identifiers,
+                "projects": self.projects,
             },
             "warnings": ["This is not permission to erase a machine."],
             "errors": [],
@@ -295,6 +453,7 @@ impl ReadinessEvidenceConclusion {
             Self::Current => "Current",
             Self::Missing => "Missing",
             Self::Invalidated => "Invalidated",
+            Self::Blocking => "Blocking",
         }
     }
 
@@ -303,7 +462,24 @@ impl ReadinessEvidenceConclusion {
             Self::Current => "current",
             Self::Missing => "missing",
             Self::Invalidated => "invalidated",
+            Self::Blocking => "blocking",
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ReadinessEvidenceGap {
+    code: &'static str,
+    count: u64,
+}
+
+impl ReadinessEvidenceGap {
+    pub fn code(&self) -> &'static str {
+        self.code
+    }
+
+    pub fn count(&self) -> u64 {
+        self.count
     }
 }
 
@@ -683,6 +859,17 @@ impl ReadinessEvidenceEngine {
                     verified_at_unix_seconds: receipt.verified_at_unix_seconds(),
                 },
             ),
+            ReadinessReceiptInput::VaultwardenRecovery(receipt) => (
+                "vaultwarden-recovery-rehearsal",
+                StoredEvidence::VaultwardenRecoveryRehearsal {
+                    plan_hash,
+                    bundle_identity: receipt.bundle_identity().to_owned(),
+                    recovery_method_identity: receipt.recovery_method_identity().to_owned(),
+                    item_identifier: receipt.item_identifier().as_str().to_owned(),
+                    server_identity_hash: receipt.server_identity_hash().to_owned(),
+                    verified_at_unix_seconds: receipt.verified_at_unix_seconds(),
+                },
+            ),
             ReadinessReceiptInput::VerifiedCopy(receipt) => (
                 "verified-copy",
                 StoredEvidence::VerifiedCopy {
@@ -693,6 +880,75 @@ impl ReadinessEvidenceEngine {
                     verified_at_unix_seconds: receipt.verified_at_unix_seconds(),
                 },
             ),
+            ReadinessReceiptInput::NotProtectedReport => (
+                "not-protected-report",
+                StoredEvidence::NotProtectedReport {
+                    plan_hash,
+                    coverage: CoverageEvidence::from_plan(request.plan),
+                },
+            ),
+            ReadinessReceiptInput::ProjectCapsuleCapture(report) => {
+                if !report.is_verified() {
+                    return Err(readiness_error(
+                        "only a verified Project Capsule capture can become Readiness Evidence",
+                    ));
+                }
+                let expectation = report.expectation().ok_or_else(|| {
+                    readiness_error(
+                        "verified Project Capsule capture is missing its bound expectation",
+                    )
+                })?;
+                if expectation.plan_hash() != plan_hash {
+                    return Err(readiness_error(
+                        "Project Capsule capture is bound to a different Plan",
+                    ));
+                }
+                (
+                    "project-capsule-capture",
+                    StoredEvidence::ProjectCapsuleCapture {
+                        plan_hash,
+                        project_identity: expectation.project_id().to_owned(),
+                        review_hash: expectation.review_hash().to_owned(),
+                        bundle_identity: expectation.bundle_identity().to_owned(),
+                        captured_at_unix_seconds: expectation.captured_unix_seconds(),
+                    },
+                )
+            }
+            ReadinessReceiptInput::ProjectCapsuleRehearsal(receipt) => {
+                if !receipt.is_restorable() {
+                    return Err(readiness_error(
+                        "only a Restorable Project Capsule rehearsal can become Readiness Evidence",
+                    ));
+                }
+                (
+                    "project-capsule-rehearsal",
+                    StoredEvidence::ProjectCapsuleRehearsal {
+                        plan_hash,
+                        project_identity: receipt.project_id().to_owned(),
+                        bundle_identity: receipt.bundle_identity().to_owned(),
+                        recovery_method: recovery_method_name(receipt.recovery_method()).to_owned(),
+                    },
+                )
+            }
+            ReadinessReceiptInput::RestoreRehearsal(report) => {
+                if report.state() != RestoreState::Complete {
+                    return Err(readiness_error(
+                        "only a completed Restore Rehearsal can become Readiness Evidence",
+                    ));
+                }
+                (
+                    "restore-rehearsal",
+                    StoredEvidence::RestoreRehearsal {
+                        plan_hash,
+                        bundle_identity: report.bundle_identity().to_owned(),
+                        destination_evidence_identity: report
+                            .destination_evidence_identity()
+                            .to_owned(),
+                        recovery_method: recovery_method_name(report.recovery_method()).to_owned(),
+                        restored_at_unix_seconds: report.occurred_at_unix_seconds(),
+                    },
+                )
+            }
         };
 
         let previous = records
@@ -731,6 +987,36 @@ impl ReadinessEvidenceEngine {
         let current_plan_hash = request.plan.approval_hash()?;
         let plan_is_current = request.plan.approval_state()? == PlanApprovalState::Approved
             && header.content.plan_hash() == Some(current_plan_hash.as_str());
+        let current_coverage = CoverageEvidence::from_plan(request.plan);
+        let plan_coverage = if !plan_is_current {
+            ReadinessEvidenceConclusion::Invalidated
+        } else if current_coverage.must_protect_blocking > 0 {
+            ReadinessEvidenceConclusion::Blocking
+        } else {
+            ReadinessEvidenceConclusion::Current
+        };
+        let latest_not_protected =
+            records
+                .iter()
+                .rev()
+                .find_map(|record| match &record.content.evidence {
+                    StoredEvidence::NotProtectedReport {
+                        plan_hash,
+                        coverage,
+                    } => Some((plan_hash, coverage)),
+                    _ => None,
+                });
+        let not_protected_report = match latest_not_protected {
+            None => ReadinessEvidenceConclusion::Missing,
+            Some((record_plan, coverage))
+                if plan_is_current
+                    && record_plan == &current_plan_hash
+                    && coverage == &current_coverage =>
+            {
+                ReadinessEvidenceConclusion::Current
+            }
+            Some(_) => ReadinessEvidenceConclusion::Invalidated,
+        };
         let latest_bundle =
             records
                 .iter()
@@ -743,7 +1029,12 @@ impl ReadinessEvidenceEngine {
                     } => Some((plan_hash, bundle_identity, whole_file_digest)),
                     StoredEvidence::StoreInitialized { .. }
                     | StoredEvidence::OfflineRecoveryRehearsal { .. }
+                    | StoredEvidence::VaultwardenRecoveryRehearsal { .. }
                     | StoredEvidence::VerifiedCopy { .. }
+                    | StoredEvidence::NotProtectedReport { .. }
+                    | StoredEvidence::ProjectCapsuleCapture { .. }
+                    | StoredEvidence::ProjectCapsuleRehearsal { .. }
+                    | StoredEvidence::RestoreRehearsal { .. }
                     | StoredEvidence::OwnerAttestation { .. }
                     | StoredEvidence::OwnerAttestationWithdrawn { .. } => None,
                 });
@@ -866,10 +1157,205 @@ impl ReadinessEvidenceEngine {
                 }
             }
         };
-        let vaultwarden_recovery_method = ReadinessEvidenceConclusion::Missing;
+        let latest_vaultwarden =
+            records
+                .iter()
+                .rev()
+                .find_map(|record| match &record.content.evidence {
+                    StoredEvidence::VaultwardenRecoveryRehearsal {
+                        plan_hash,
+                        bundle_identity,
+                        recovery_method_identity,
+                        item_identifier,
+                        server_identity_hash,
+                        ..
+                    } => Some((
+                        plan_hash,
+                        bundle_identity,
+                        recovery_method_identity,
+                        item_identifier,
+                        server_identity_hash,
+                    )),
+                    _ => None,
+                });
+        let vaultwarden_recovery_method = match (
+            plan_is_current,
+            latest_vaultwarden,
+            request.bundle.as_ref(),
+            request.vaultwarden_recovery,
+        ) {
+            (false, Some(_), _, _) => ReadinessEvidenceConclusion::Invalidated,
+            (_, None, _, _) | (_, Some(_), None, _) | (_, Some(_), _, None) => {
+                ReadinessEvidenceConclusion::Missing
+            }
+            (
+                true,
+                Some((record_plan, bundle_identity, method_identity, item_identifier, server_hash)),
+                Some(bundle_input),
+                Some(loaded),
+            ) => match BundleEngine::local().verify(VerifyRequest::new(
+                &bundle_input.bundle,
+                loaded.recovery_secret(),
+            )) {
+                Ok(verification)
+                    if record_plan == &current_plan_hash
+                        && bundle_identity == verification.bundle_identity()
+                        && bundle_identity == loaded.bundle_identity()
+                        && method_identity == loaded.recovery_method_identity()
+                        && item_identifier == loaded.item_identifier().as_str()
+                        && server_hash == loaded.server_identity_hash() =>
+                {
+                    ReadinessEvidenceConclusion::Current
+                }
+                _ => ReadinessEvidenceConclusion::Invalidated,
+            },
+        };
+        let latest_restore =
+            records
+                .iter()
+                .rev()
+                .find_map(|record| match &record.content.evidence {
+                    StoredEvidence::RestoreRehearsal {
+                        plan_hash,
+                        bundle_identity,
+                        destination_evidence_identity,
+                        recovery_method,
+                        ..
+                    } => Some((
+                        plan_hash,
+                        bundle_identity,
+                        destination_evidence_identity,
+                        recovery_method,
+                    )),
+                    _ => None,
+                });
+        let restore_rehearsal = match (
+            plan_is_current,
+            latest_restore,
+            request.bundle.as_ref(),
+            request.restore_rehearsal_destination.as_ref(),
+        ) {
+            (false, Some(_), _, _) => ReadinessEvidenceConclusion::Invalidated,
+            (_, None, _, _) | (_, Some(_), None, _) | (_, Some(_), _, None) => {
+                ReadinessEvidenceConclusion::Missing
+            }
+            (
+                true,
+                Some((record_plan, bundle_identity, destination_identity, recovery_method)),
+                Some(bundle_input),
+                Some(destination),
+            ) => {
+                let verification = BundleEngine::local().verify(VerifyRequest::new(
+                    &bundle_input.bundle,
+                    bundle_input.recovery_secret,
+                ));
+                let current_destination =
+                    current_restore_destination_evidence_identity(destination);
+                match (verification, current_destination) {
+                    (Ok(verification), Ok(current_destination))
+                        if record_plan == &current_plan_hash
+                            && bundle_identity == verification.bundle_identity()
+                            && destination_identity == &current_destination
+                            && recovery_method
+                                == recovery_method_name(bundle_input.recovery_secret.method()) =>
+                    {
+                        ReadinessEvidenceConclusion::Current
+                    }
+                    _ => ReadinessEvidenceConclusion::Invalidated,
+                }
+            }
+        };
+
+        let mut projects = request
+            .project_capsules
+            .iter()
+            .map(|input| {
+                let project_identity = input.expectation.project_id();
+                let latest_capture =
+                    records
+                        .iter()
+                        .rev()
+                        .find_map(|record| match &record.content.evidence {
+                            StoredEvidence::ProjectCapsuleCapture {
+                                plan_hash,
+                                project_identity: record_project,
+                                review_hash,
+                                bundle_identity,
+                                captured_at_unix_seconds,
+                            } if record_project == project_identity => Some((
+                                plan_hash,
+                                review_hash,
+                                bundle_identity,
+                                captured_at_unix_seconds,
+                            )),
+                            _ => None,
+                        });
+                let latest_rehearsal =
+                    records
+                        .iter()
+                        .rev()
+                        .find_map(|record| match &record.content.evidence {
+                            StoredEvidence::ProjectCapsuleRehearsal {
+                                plan_hash,
+                                project_identity: record_project,
+                                bundle_identity,
+                                recovery_method,
+                            } if record_project == project_identity => {
+                                Some((plan_hash, bundle_identity, recovery_method))
+                            }
+                            _ => None,
+                        });
+                let restorable = if !plan_is_current
+                    || input.expectation.plan_hash() != current_plan_hash
+                {
+                    ReadinessEvidenceConclusion::Invalidated
+                } else {
+                    match (latest_capture, latest_rehearsal) {
+                        (None, _) | (_, None) => ReadinessEvidenceConclusion::Missing,
+                        (
+                            Some((capture_plan, capture_review, capture_bundle, capture_time)),
+                            Some((rehearsal_plan, rehearsal_bundle, recovery_method)),
+                        ) => match BundleEngine::local()
+                            .verify(VerifyRequest::new(&input.bundle, input.recovery_secret))
+                        {
+                            Ok(verification)
+                                if capture_plan == &current_plan_hash
+                                    && capture_review == input.expectation.review_hash()
+                                    && capture_bundle == input.expectation.bundle_identity()
+                                    && capture_time
+                                        == &input.expectation.captured_unix_seconds()
+                                    && rehearsal_plan == &current_plan_hash
+                                    && rehearsal_bundle == input.expectation.bundle_identity()
+                                    && recovery_method
+                                        == recovery_method_name(input.recovery_secret.method())
+                                    && verification.bundle_identity()
+                                        == input.expectation.bundle_identity() =>
+                            {
+                                ReadinessEvidenceConclusion::Current
+                            }
+                            _ => ReadinessEvidenceConclusion::Invalidated,
+                        },
+                    }
+                };
+                ReadinessProjectEvidence {
+                    project_identity: project_identity.to_owned(),
+                    restorable,
+                    synchronized: ReadinessEvidenceConclusion::Missing,
+                }
+            })
+            .collect::<Vec<_>>();
+        projects.sort_by(|left, right| left.project_identity.cmp(&right.project_identity));
 
         let (active_owner_attestations, withdrawn_owner_attestation_identifiers) =
             active_attestation_status(&records)?;
+
+        let mut blocking_gaps = Vec::new();
+        if current_coverage.must_protect_blocking > 0 {
+            blocking_gaps.push(ReadinessEvidenceGap {
+                code: "must-protect-coverage-unresolved",
+                count: current_coverage.must_protect_blocking,
+            });
+        }
 
         let state = ReadinessEvidenceState::BlockingGaps;
         let events = vec![ReadinessEvidenceEvent {
@@ -878,12 +1364,17 @@ impl ReadinessEvidenceEngine {
         }];
         Ok(ReadinessEvidenceStatusReport {
             state,
+            plan_coverage,
             bundle_verification,
             offline_recovery_method,
             vaultwarden_recovery_method,
             verified_copy,
+            not_protected_report,
+            restore_rehearsal,
+            blocking_gaps,
             active_owner_attestations,
             withdrawn_owner_attestation_identifiers,
+            projects,
             events,
         })
     }
@@ -1071,7 +1562,12 @@ impl StoredRecordContent {
             StoredEvidence::StoreInitialized { plan_hash }
             | StoredEvidence::BundleVerification { plan_hash, .. }
             | StoredEvidence::OfflineRecoveryRehearsal { plan_hash, .. }
+            | StoredEvidence::VaultwardenRecoveryRehearsal { plan_hash, .. }
             | StoredEvidence::VerifiedCopy { plan_hash, .. }
+            | StoredEvidence::NotProtectedReport { plan_hash, .. }
+            | StoredEvidence::ProjectCapsuleCapture { plan_hash, .. }
+            | StoredEvidence::ProjectCapsuleRehearsal { plan_hash, .. }
+            | StoredEvidence::RestoreRehearsal { plan_hash, .. }
             | StoredEvidence::OwnerAttestation { plan_hash, .. }
             | StoredEvidence::OwnerAttestationWithdrawn { plan_hash, .. } => Some(plan_hash),
         }
@@ -1095,12 +1591,44 @@ enum StoredEvidence {
         recovery_method_identity: String,
         verified_at_unix_seconds: u64,
     },
+    VaultwardenRecoveryRehearsal {
+        plan_hash: String,
+        bundle_identity: String,
+        recovery_method_identity: String,
+        item_identifier: String,
+        server_identity_hash: String,
+        verified_at_unix_seconds: u64,
+    },
     VerifiedCopy {
         plan_hash: String,
         source_bundle_identity: String,
         destination_bundle_identity: String,
         whole_file_digest: String,
         verified_at_unix_seconds: u64,
+    },
+    NotProtectedReport {
+        plan_hash: String,
+        coverage: CoverageEvidence,
+    },
+    ProjectCapsuleCapture {
+        plan_hash: String,
+        project_identity: String,
+        review_hash: String,
+        bundle_identity: String,
+        captured_at_unix_seconds: u64,
+    },
+    ProjectCapsuleRehearsal {
+        plan_hash: String,
+        project_identity: String,
+        bundle_identity: String,
+        recovery_method: String,
+    },
+    RestoreRehearsal {
+        plan_hash: String,
+        bundle_identity: String,
+        destination_evidence_identity: String,
+        recovery_method: String,
+        restored_at_unix_seconds: u64,
     },
     OwnerAttestation {
         plan_hash: String,
@@ -1115,6 +1643,33 @@ enum StoredEvidence {
         plan_hash: String,
         attestation_identifier: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CoverageEvidence {
+    included: u64,
+    excluded: u64,
+    requires_review: u64,
+    unsupported: u64,
+    unavailable: u64,
+    must_protect_blocking: u64,
+    optional_warnings: u64,
+}
+
+impl CoverageEvidence {
+    fn from_plan(plan: &Plan) -> Self {
+        let coverage = plan.coverage_summary();
+        Self {
+            included: coverage.included,
+            excluded: coverage.excluded,
+            requires_review: coverage.requires_review,
+            unsupported: coverage.unsupported,
+            unavailable: coverage.unavailable,
+            must_protect_blocking: coverage.must_protect_blocking,
+            optional_warnings: coverage.optional_warnings,
+        }
+    }
 }
 
 fn active_attestation_status(
@@ -1164,7 +1719,12 @@ fn active_attestation_status(
             StoredEvidence::StoreInitialized { .. }
             | StoredEvidence::BundleVerification { .. }
             | StoredEvidence::OfflineRecoveryRehearsal { .. }
-            | StoredEvidence::VerifiedCopy { .. } => {}
+            | StoredEvidence::VaultwardenRecoveryRehearsal { .. }
+            | StoredEvidence::VerifiedCopy { .. }
+            | StoredEvidence::NotProtectedReport { .. }
+            | StoredEvidence::ProjectCapsuleCapture { .. }
+            | StoredEvidence::ProjectCapsuleRehearsal { .. }
+            | StoredEvidence::RestoreRehearsal { .. } => {}
         }
     }
     Ok((active.into_values().collect(), withdrawn))
@@ -1177,6 +1737,13 @@ fn require_approved_plan(plan: &Plan) -> Result<(), CoreError> {
         ));
     }
     Ok(())
+}
+
+fn recovery_method_name(method: RecoveryMethod) -> &'static str {
+    match method {
+        RecoveryMethod::Vaultwarden => "vaultwarden",
+        RecoveryMethod::Offline => "offline",
+    }
 }
 
 fn validate_new_store_path(directory: &Path) -> Result<(), CoreError> {

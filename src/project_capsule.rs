@@ -618,6 +618,26 @@ impl fmt::Debug for ProjectCapsuleExpectation {
 }
 
 impl ProjectCapsuleExpectation {
+    pub fn project_id(&self) -> &str {
+        &self.project_id
+    }
+
+    pub fn plan_hash(&self) -> &str {
+        &self.plan_hash
+    }
+
+    pub fn review_hash(&self) -> &str {
+        &self.review_hash
+    }
+
+    pub fn bundle_identity(&self) -> &str {
+        &self.bundle_identity
+    }
+
+    pub fn captured_unix_seconds(&self) -> u64 {
+        self.captured_unix_seconds
+    }
+
     pub fn required_executable_mode_review_hash(&self) -> Option<&str> {
         self.required_executable_mode_review_hash.as_deref()
     }
@@ -684,6 +704,14 @@ impl ProjectCapsuleRehearsalReceipt {
 
     pub fn recovery_method(&self) -> RecoveryMethod {
         self.recovery_method
+    }
+
+    pub fn project_id(&self) -> &str {
+        &self.project_id
+    }
+
+    pub fn bundle_identity(&self) -> &str {
+        &self.bundle_identity
     }
 
     pub fn validation(&self) -> &ProjectCapsuleValidationReport {

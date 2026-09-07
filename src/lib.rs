@@ -79,9 +79,9 @@ pub use readiness_evidence::{
     OwnerAttestationPreparationRequest, OwnerAttestationRecord, OwnerAttestationReview,
     OwnerAttestationStatus, OwnerAttestationWithdrawalRecord, OwnerAttestationWithdrawalRequest,
     ReadinessEvidenceConclusion, ReadinessEvidenceEngine, ReadinessEvidenceEvent,
-    ReadinessEvidenceInitializationRequest, ReadinessEvidenceState, ReadinessEvidenceStatusReport,
-    ReadinessEvidenceStatusRequest, ReadinessEvidenceStoreReport, ReadinessReceiptRecordReport,
-    ReadinessReceiptRecordRequest,
+    ReadinessEvidenceGap, ReadinessEvidenceInitializationRequest, ReadinessEvidenceState,
+    ReadinessEvidenceStatusReport, ReadinessEvidenceStatusRequest, ReadinessEvidenceStoreReport,
+    ReadinessProjectEvidence, ReadinessReceiptRecordReport, ReadinessReceiptRecordRequest,
 };
 pub use restore::{
     RestoreCancellation, RestoreEngine, RestoreEvent, RestoreEventSink, RestoreReport,

@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
 use cap_std::fs::{MetadataExt as CapMetadataExt, PermissionsExt as CapPermissionsExt};
@@ -14,7 +15,8 @@ use crate::bundle::{
 };
 use crate::restore_fs::RestoreDirectory;
 use crate::{
-    CoreError, DestinationCapacity, ExtendedAttribute, LocalDestinationCapacity, RecoverySecret,
+    CoreError, DestinationCapacity, ExtendedAttribute, LocalDestinationCapacity, RecoveryMethod,
+    RecoverySecret,
 };
 use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
@@ -112,6 +114,10 @@ pub struct RestoreReport {
     disabled_hooks: u64,
     quarantined_executables: u64,
     unapplied_metadata: u64,
+    bundle_identity: String,
+    destination_evidence_identity: String,
+    recovery_method: RecoveryMethod,
+    occurred_at_unix_seconds: u64,
 }
 
 impl RestoreReport {
@@ -137,6 +143,22 @@ impl RestoreReport {
 
     pub fn quarantined_executables(&self) -> u64 {
         self.quarantined_executables
+    }
+
+    pub fn bundle_identity(&self) -> &str {
+        &self.bundle_identity
+    }
+
+    pub fn destination_evidence_identity(&self) -> &str {
+        &self.destination_evidence_identity
+    }
+
+    pub fn recovery_method(&self) -> RecoveryMethod {
+        self.recovery_method
+    }
+
+    pub fn occurred_at_unix_seconds(&self) -> u64 {
+        self.occurred_at_unix_seconds
     }
 
     pub fn human_result(&self) -> String {
@@ -207,6 +229,7 @@ impl<C: DestinationCapacity> RestoreEngine<C> {
             prepare_destination(&request.destination)?;
         }
         let destination_identity = destination_identity(&request.destination)?;
+        let destination_evidence_identity = destination_evidence_identity(&destination_identity);
         if let Some(sink) = request.event_sink.as_deref_mut() {
             sink.emit(RestoreEvent::DestinationIdentityRecorded);
         }
@@ -240,6 +263,7 @@ impl<C: DestinationCapacity> RestoreEngine<C> {
         };
 
         let mut preserve_recovery_state = false;
+        let recovery_method = request.recovery_secret.method();
         let result = restore_transaction(
             &mut request,
             &mut bundle,
@@ -248,6 +272,9 @@ impl<C: DestinationCapacity> RestoreEngine<C> {
                 destination_identity: &destination_identity,
                 destination_directory: &destination_directory,
                 expected_bundle_hash: &authenticated.bundle_hash,
+                bundle_identity: &authenticated.bundle_identity,
+                destination_evidence_identity: &destination_evidence_identity,
+                recovery_method,
                 resume_journal: resume_journal.as_ref(),
             },
             &mut preserve_recovery_state,
@@ -417,6 +444,32 @@ fn destination_identity(destination: &Path) -> Result<DestinationIdentity, CoreE
             })?,
         })
     }
+}
+
+fn destination_evidence_identity(identity: &DestinationIdentity) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"iniza restore destination evidence v1\0");
+    #[cfg(unix)]
+    {
+        hasher.update(&identity.device.to_be_bytes());
+        hasher.update(&identity.inode.to_be_bytes());
+    }
+    #[cfg(not(unix))]
+    hasher.update(identity.canonical_path.to_string_lossy().as_bytes());
+    hasher.finalize().to_hex().to_string()
+}
+
+pub(crate) fn current_restore_destination_evidence_identity(
+    destination: &Path,
+) -> Result<String, CoreError> {
+    destination_identity(destination).map(|identity| destination_evidence_identity(&identity))
+}
+
+fn restore_time() -> Result<u64, CoreError> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .map_err(|_| invalid_restore("system clock precedes Unix epoch"))
 }
 
 fn require_destination_identity(
@@ -1053,6 +1106,9 @@ struct RestoreTransactionContext<'a> {
     destination_identity: &'a DestinationIdentity,
     destination_directory: &'a RestoreDirectory,
     expected_bundle_hash: &'a [u8; 32],
+    bundle_identity: &'a str,
+    destination_evidence_identity: &'a str,
+    recovery_method: RecoveryMethod,
     resume_journal: Option<&'a RestoreJournal>,
 }
 
@@ -1067,6 +1123,9 @@ fn restore_transaction(
         destination_identity,
         destination_directory,
         expected_bundle_hash,
+        bundle_identity,
+        destination_evidence_identity,
+        recovery_method,
         resume_journal,
     } = context;
     let control = request.destination.join(CONTROL_DIRECTORY);
@@ -1266,6 +1325,10 @@ fn restore_transaction(
                 .filter(|item| item.executable_content)
                 .count() as u64,
             unapplied_metadata: 0,
+            bundle_identity: bundle_identity.to_owned(),
+            destination_evidence_identity: destination_evidence_identity.to_owned(),
+            recovery_method,
+            occurred_at_unix_seconds: restore_time()?,
         });
     }
     require_destination_identity(&request.destination, destination_identity)?;
@@ -1296,6 +1359,10 @@ fn restore_transaction(
                     .filter(|item| item.executable_content)
                     .count() as u64,
                 unapplied_metadata: 0,
+                bundle_identity: bundle_identity.to_owned(),
+                destination_evidence_identity: destination_evidence_identity.to_owned(),
+                recovery_method,
+                occurred_at_unix_seconds: restore_time()?,
             });
         }
         PublicationOutcome::Complete(validated_items) => validated_items,
@@ -1357,6 +1424,10 @@ fn restore_transaction(
             .filter(|item| item.executable_content)
             .count() as u64,
         unapplied_metadata,
+        bundle_identity: bundle_identity.to_owned(),
+        destination_evidence_identity: destination_evidence_identity.to_owned(),
+        recovery_method,
+        occurred_at_unix_seconds: restore_time()?,
     })
 }
 
