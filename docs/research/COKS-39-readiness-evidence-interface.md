@@ -1,6 +1,6 @@
 # COKS-39 Readiness Evidence interface comparison
 
-- Status: Proposed for owner confirmation
+- Status: All ten public seams confirmed; dependencies complete; implementation in progress
 - Date: 2026-09-07
 - Issue: COKS-39
 
@@ -169,3 +169,5 @@ No COKS-39 behavior test or implementation begins until:
 3. COKS-37 completes the exact approved synthetic publication rehearsal.
 
 Confirming this interface does not approve any Git publication, Vaultwarden write, personal-data capture, evidence deletion, or machine erasure.
+
+The owner confirmed all ten seams on 2026-09-07. COKS-36 and COKS-37 subsequently completed their required owner-service and synthetic publication rehearsals. Implementation may proceed through the confirmed public interfaces; any later change to those interfaces or security boundaries requires renewed confirmation before a behavior test depends on it.

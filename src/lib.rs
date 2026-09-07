@@ -15,6 +15,7 @@ mod project_audit;
 mod project_capsule;
 mod protection_candidates;
 mod push_plan;
+mod readiness_evidence;
 mod restore;
 mod restore_fs;
 mod vaultwarden_recovery;
@@ -72,6 +73,15 @@ pub use push_plan::{
     GitReference, GitRemoteName, InstalledGitPublication, PushAction, PushExecutionReport,
     PushExecutionState, PushPlanApprovalReceipt, PushPlanApprovalRequest, PushPlanDocumentReport,
     PushPlanDraftRequest, PushPlanEngine, PushPlanExecutionRequest,
+};
+pub use readiness_evidence::{
+    OwnerAttestationClaimKind, OwnerAttestationConfirmationRequest,
+    OwnerAttestationPreparationRequest, OwnerAttestationRecord, OwnerAttestationReview,
+    OwnerAttestationStatus, OwnerAttestationWithdrawalRecord, OwnerAttestationWithdrawalRequest,
+    ReadinessEvidenceConclusion, ReadinessEvidenceEngine, ReadinessEvidenceEvent,
+    ReadinessEvidenceInitializationRequest, ReadinessEvidenceState, ReadinessEvidenceStatusReport,
+    ReadinessEvidenceStatusRequest, ReadinessEvidenceStoreReport, ReadinessReceiptRecordReport,
+    ReadinessReceiptRecordRequest,
 };
 pub use restore::{
     RestoreCancellation, RestoreEngine, RestoreEvent, RestoreEventSink, RestoreReport,
@@ -275,6 +285,7 @@ pub enum CoreError {
     InvalidFixture(String),
     InvalidFixtureOutput(PathBuf),
     InvalidPlan(String),
+    ReadinessEvidence(String),
     SourceIsNotARegularFile(PathBuf),
     SourceHasNoFileName(PathBuf),
     TestFixtureIsNotBundle(PathBuf),
@@ -318,6 +329,7 @@ impl fmt::Display for CoreError {
             ),
             Self::InvalidFixture(message) => formatter.write_str(message),
             Self::InvalidPlan(message) => formatter.write_str(message),
+            Self::ReadinessEvidence(message) => formatter.write_str(message),
             Self::SourceIsNotARegularFile(path) => {
                 write!(
                     formatter,
