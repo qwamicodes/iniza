@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -1298,6 +1298,12 @@ impl<G: GitPublicationProcess, S: ReadinessEvidenceStorage> ReadinessEvidenceEng
         } else {
             ReadinessEvidenceConclusion::Missing
         };
+        let selected_verified_copy_identity_count = request
+            .verified_copies
+            .iter()
+            .filter_map(|copy| verified_copy_destination_evidence_identity(copy).ok())
+            .collect::<BTreeSet<_>>()
+            .len();
         let latest_vaultwarden =
             records
                 .iter()
@@ -1545,8 +1551,96 @@ impl<G: GitPublicationProcess, S: ReadinessEvidenceStorage> ReadinessEvidenceEng
                 count: current_coverage.must_protect_blocking,
             });
         }
+        push_conclusion_gap(
+            &mut blocking_gaps,
+            "plan-coverage-not-current",
+            plan_coverage,
+        );
+        push_conclusion_gap(
+            &mut blocking_gaps,
+            "bundle-verification-not-current",
+            bundle_verification,
+        );
+        push_conclusion_gap(
+            &mut blocking_gaps,
+            "offline-recovery-method-not-current",
+            offline_recovery_method,
+        );
+        push_conclusion_gap(
+            &mut blocking_gaps,
+            "vaultwarden-recovery-method-not-current",
+            vaultwarden_recovery_method,
+        );
+        push_conclusion_gap(
+            &mut blocking_gaps,
+            "verified-copies-not-current",
+            verified_copy,
+        );
+        if selected_verified_copy_identity_count < 2 {
+            blocking_gaps.push(ReadinessEvidenceGap {
+                code: "two-independent-verified-copies-required",
+                count: (2 - selected_verified_copy_identity_count) as u64,
+            });
+        }
+        push_conclusion_gap(
+            &mut blocking_gaps,
+            "restore-rehearsal-not-current",
+            restore_rehearsal,
+        );
+        push_conclusion_gap(
+            &mut blocking_gaps,
+            "not-protected-report-not-current",
+            not_protected_report,
+        );
+        let required_attestations = [
+            OwnerAttestationClaimKind::ConventionalBackupValidated,
+            OwnerAttestationClaimKind::RepresentativeRestoredProjectBuildCompleted,
+            OwnerAttestationClaimKind::SecondEnvironmentRehearsalCompleted,
+            OwnerAttestationClaimKind::NotProtectedReportReviewed,
+            OwnerAttestationClaimKind::ReviewedExternalVaultwardenServiceConfirmed,
+            OwnerAttestationClaimKind::FreshDeviceVaultwardenAccessConfirmed,
+            OwnerAttestationClaimKind::IndependentMultiFactorRecoveryPathConfirmed,
+        ];
+        let missing_attestations = required_attestations
+            .iter()
+            .filter(|required| {
+                !active_owner_attestations
+                    .iter()
+                    .any(|active| active.claim_kind == **required)
+            })
+            .count();
+        if missing_attestations > 0 {
+            blocking_gaps.push(ReadinessEvidenceGap {
+                code: "required-owner-attestations-missing",
+                count: missing_attestations as u64,
+            });
+        }
+        let projects_not_restorable = projects
+            .iter()
+            .filter(|project| project.restorable != ReadinessEvidenceConclusion::Current)
+            .count();
+        if projects_not_restorable > 0 {
+            blocking_gaps.push(ReadinessEvidenceGap {
+                code: "required-projects-not-restorable",
+                count: projects_not_restorable as u64,
+            });
+        }
+        let projects_not_synchronized = projects
+            .iter()
+            .filter(|project| project.synchronized != ReadinessEvidenceConclusion::Current)
+            .count();
+        if projects_not_synchronized > 0 {
+            blocking_gaps.push(ReadinessEvidenceGap {
+                code: "required-projects-not-synchronized",
+                count: projects_not_synchronized as u64,
+            });
+        }
 
-        let state = ReadinessEvidenceState::BlockingGaps;
+        let state = if blocking_gaps.is_empty() {
+            ReadinessEvidenceState::CompleteEvidence
+        } else {
+            ReadinessEvidenceState::BlockingGaps
+        };
         let events = vec![ReadinessEvidenceEvent {
             state,
             bundle_verification,
@@ -1995,6 +2089,16 @@ fn push_execution_state_name(state: PushExecutionState) -> &'static str {
     match state {
         PushExecutionState::Complete => "complete",
         PushExecutionState::Partial => "partial",
+    }
+}
+
+fn push_conclusion_gap(
+    gaps: &mut Vec<ReadinessEvidenceGap>,
+    code: &'static str,
+    conclusion: ReadinessEvidenceConclusion,
+) {
+    if conclusion != ReadinessEvidenceConclusion::Current {
+        gaps.push(ReadinessEvidenceGap { code, count: 1 });
     }
 }
 
