@@ -75,6 +75,8 @@ Project synchronization remains incomplete: `cashsynq` has one unpublished ahead
 
 On 2026-09-07 cargo-audit 0.22.2 checked the exact committed `Cargo.lock` against 1,240 advisories at RustSec database commit `faedffd5118c1835e13cca3babb6059afb1eb8d0`. All 98 locked dependencies passed with zero vulnerabilities and zero informational, unmaintained, unsound, notice, or yanked-package warnings while `--deny warnings` was active. The reproducible inputs and command are recorded in [the Owner Dogfood RustSec audit](research/owner-dogfood-rustsec-audit-2026-09-07.md).
 
+The same exact lockfile now has a deterministic, path-redacted [CycloneDX 1.5 software bill of materials](security/iniza.cdx.json) covering all features and target platforms. Its generation and validation evidence is recorded in the [security artifact guide](security/README.md).
+
 This automated result does not replace the independent cryptographic, parser, and key-lifecycle review required by ADR 0005. Real sole-copy owner data remains outside the currently accepted format scope.
 
 ## Command-line orchestration evidence
