@@ -4,7 +4,8 @@ use std::process::ExitCode;
 use iniza::{
     CoreError, InizaCore, OfflineRecoveryEngine, OfflineRecoveryRehearsalRequest, Plan,
     PlanApprovalState, PlanEngine, ProjectAuditEngine, ProjectAuditRequest,
-    ProtectionCandidateEngine, ProtectionCandidateRequest, PublicationPolicy, ScanRequest,
+    ProtectionCandidateEngine, ProtectionCandidateRequest, PublicationPolicy,
+    PushPlanApprovalRequest, PushPlanDraftRequest, PushPlanEngine, ScanRequest,
 };
 
 fn main() -> ExitCode {
@@ -39,6 +40,155 @@ fn run(
             if namespace == "projects" && command == "scan" =>
         {
             run_project_audit(project_arguments, machine_output, json_events)
+        }
+        [
+            namespace,
+            command,
+            action,
+            plan_flag,
+            plan_path,
+            project_flag,
+            project_identifier,
+            output_flag,
+            push_plan,
+        ] if namespace == "projects"
+            && command == "push-plan"
+            && action == "draft"
+            && plan_flag == "--plan"
+            && project_flag == "--project"
+            && output_flag == "--output" =>
+        {
+            let plan = Plan::read_from(&PathBuf::from(plan_path))
+                .map_err(|error| CliError::GitPublication(error.to_string()))?;
+            let audit = ProjectAuditEngine::local()
+                .audit(ProjectAuditRequest::from_plan(&plan))
+                .map_err(|error| CliError::GitPublication(error.to_string()))?;
+            let project = audit
+                .projects()
+                .iter()
+                .find(|project| project.id() == project_identifier)
+                .ok_or_else(|| {
+                    CliError::GitPublication(
+                        "Push Plan Project is not present in the approved Plan".to_owned(),
+                    )
+                })?;
+            let remote = project
+                .local_state()
+                .upstream()
+                .and_then(|upstream| upstream.split_once('/'))
+                .map(|(remote, _)| remote)
+                .ok_or_else(|| {
+                    CliError::GitPublication(
+                        "Push Plan requires an existing upstream branch".to_owned(),
+                    )
+                })?;
+            let draft = PushPlanEngine::local()
+                .draft(PushPlanDraftRequest::new(
+                    &plan, project, remote, push_plan,
+                ))
+                .map_err(|error| CliError::GitPublication(error.to_string()))?;
+            let actions = draft
+                .actions()
+                .iter()
+                .map(|action| {
+                    serde_json::json!({
+                        "action_id": action.action_id(),
+                        "action_class": action.action_class(),
+                        "local_reference": action.local_reference(),
+                        "remote_reference": action.remote_reference(),
+                        "expected_old_remote_object": action.expected_old_remote_object(),
+                        "proposed_new_remote_object": action.proposed_new_remote_object(),
+                        "non_force": action.is_non_force(),
+                        "requires_item_approval": action.requires_item_approval(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            if machine_output {
+                print_machine_value(
+                    "projects push-plan draft",
+                    serde_json::json!({
+                        "approval_hash": draft.approval_hash(),
+                        "warning": draft.warning(),
+                        "actions": actions,
+                    }),
+                );
+            } else {
+                println!("Push Plan review hash: {}", draft.approval_hash());
+                println!("Warning: {}", draft.warning());
+                for action in draft.actions() {
+                    println!(
+                        "{}: {} {} -> {} (expected {}, proposed {}, non-force)",
+                        action.action_id(),
+                        action.action_class(),
+                        action.local_reference(),
+                        action.remote_reference(),
+                        action.expected_old_remote_object(),
+                        action.proposed_new_remote_object(),
+                    );
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        [
+            namespace,
+            command,
+            action,
+            plan_flag,
+            push_plan,
+            hash_flag,
+            reviewed_hash,
+            output_flag,
+            approval,
+            acknowledgement,
+        ] if namespace == "projects"
+            && command == "push-plan"
+            && action == "approve"
+            && plan_flag == "--plan"
+            && hash_flag == "--reviewed-hash"
+            && output_flag == "--output"
+            && acknowledgement == "--acknowledge-remote-side-effects" =>
+        {
+            let receipt = PushPlanEngine::local()
+                .approve(
+                    PushPlanApprovalRequest::new(push_plan, reviewed_hash, approval)
+                        .acknowledge_remote_side_effects(),
+                )
+                .map_err(|error| CliError::Approval(error.to_string()))?;
+            if machine_output {
+                print_machine_value(
+                    "projects push-plan approve",
+                    serde_json::json!({"push_plan_hash": receipt.push_plan_hash()}),
+                );
+            } else {
+                println!("Push Plan approved: {}", receipt.push_plan_hash());
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        [
+            namespace,
+            command,
+            action,
+            plan_flag,
+            push_plan,
+            hash_flag,
+            reviewed_hash,
+            output_flag,
+            approval,
+        ] if namespace == "projects"
+            && command == "push-plan"
+            && action == "approve"
+            && plan_flag == "--plan"
+            && hash_flag == "--reviewed-hash"
+            && output_flag == "--output" =>
+        {
+            PushPlanEngine::local()
+                .approve(PushPlanApprovalRequest::new(
+                    push_plan,
+                    reviewed_hash,
+                    approval,
+                ))
+                .map_err(|error| CliError::Approval(error.to_string()))?;
+            unreachable!("Push Plan approval without acknowledgement cannot succeed")
         }
         [namespace, method, command, bundle_flag, bundle, document_flag, document]
             if namespace == "recovery"
@@ -701,6 +851,9 @@ fn machine_command_name(arguments: &[String]) -> String {
         [namespace, method, command, ..] if namespace == "recovery" => {
             format!("{namespace} {method} {command}")
         }
+        [namespace, command, action, ..] if namespace == "projects" && command == "push-plan" => {
+            format!("{namespace} {command} {action}")
+        }
         [namespace, command, ..]
             if namespace == "plan" || namespace == "fixture" || namespace == "projects" =>
         {
@@ -743,6 +896,7 @@ enum CliError {
     BundleInvalid(String),
     Conflict(String),
     GitAudit(String),
+    GitPublication(String),
     Usage(String),
     Operation(String),
 }
@@ -754,6 +908,7 @@ impl CliError {
             Self::BundleInvalid(_) => 20,
             Self::Conflict(_) => 50,
             Self::GitAudit(_) => 40,
+            Self::GitPublication(_) => 41,
             Self::Usage(_) => 2,
             Self::Operation(_) => 11,
         }
@@ -765,6 +920,7 @@ impl CliError {
             Self::BundleInvalid(_) => "INIZA-E020",
             Self::Conflict(_) => "INIZA-E050",
             Self::GitAudit(_) => "INIZA-E040",
+            Self::GitPublication(_) => "INIZA-E041",
             Self::Usage(_) => "INIZA-E002",
             Self::Operation(_) => "INIZA-E011",
         }
@@ -778,6 +934,7 @@ impl std::fmt::Display for CliError {
             | Self::BundleInvalid(message)
             | Self::Conflict(message)
             | Self::GitAudit(message)
+            | Self::GitPublication(message)
             | Self::Usage(message)
             | Self::Operation(message) => formatter.write_str(message),
         }
