@@ -6,7 +6,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use iniza::{
     GitPublicationOperation, GitPublicationOutput, GitPublicationProcess, PlanEngine,
-    ProjectAuditEngine, ProjectAuditRequest, PushPlanDraftRequest, PushPlanEngine, ScanRequest,
+    ProjectAuditEngine, ProjectAuditRequest, PushPlanApprovalRequest, PushPlanDraftRequest,
+    PushPlanEngine, ScanRequest,
 };
 
 struct TestDirectory(PathBuf);
@@ -293,6 +294,90 @@ fn command_line_approval_requires_the_exact_new_reference_action_identifier() {
         .expect("machine result should be valid JavaScript Object Notation");
     assert_eq!(result["command"], "projects push-plan approve");
     assert_eq!(result["status"], "success");
+}
+
+#[test]
+fn command_line_execution_creates_durable_partial_evidence_before_remote_contact() {
+    let directory = TestDirectory::new();
+    let project = directory.path().join("private-disposable-project");
+    let remote = directory.path().join("disposable-remote.git");
+    let directory_plan = directory.path().join("approved-directory-plan.toml");
+    let push_plan = directory.path().join("reviewed.push-plan.toml");
+    let approval = directory.path().join("reviewed.push-approval.toml");
+    let result_log = directory.path().join("publication-result.jsonl");
+    create_ahead_project(&project, &remote);
+
+    let mut plan = PlanEngine::local()
+        .scan(ScanRequest::for_directory(&project))
+        .expect("disposable Project should scan");
+    let directory_plan_hash = plan.approval_hash().expect("Plan should hash");
+    plan.approve(&directory_plan_hash)
+        .expect("exact Plan hash should approve");
+    let audit = ProjectAuditEngine::local()
+        .audit(ProjectAuditRequest::from_plan(&plan))
+        .expect("disposable Project should audit");
+    let project_audit = audit.projects().first().expect("Project should be present");
+    let project_identifier = project_audit.id().to_owned();
+    let engine = PushPlanEngine::with_git_publication_process(LocalGitPublication);
+    let draft = engine
+        .draft(PushPlanDraftRequest::new(
+            &plan,
+            project_audit,
+            "origin",
+            &push_plan,
+        ))
+        .expect("fixture should produce one immutable Push Plan");
+    engine
+        .approve(
+            PushPlanApprovalRequest::new(&push_plan, draft.approval_hash(), &approval)
+                .acknowledge_remote_side_effects(),
+        )
+        .expect("exact Push Plan should be approved");
+    plan.write_to(&directory_plan)
+        .expect("approved Plan should be written");
+
+    let output = iniza(&[
+        "--json",
+        "projects",
+        "push-plan",
+        "execute",
+        "--result",
+        result_log.to_str().expect("result path should be text"),
+        "--approval",
+        approval.to_str().expect("approval path should be text"),
+        "--project",
+        &project_identifier,
+        "--directory-plan",
+        directory_plan.to_str().expect("Plan path should be text"),
+        "--push-plan",
+        push_plan.to_str().expect("Push Plan path should be text"),
+    ]);
+
+    assert_eq!(output.status.code(), Some(41));
+    assert!(
+        result_log.is_file(),
+        "execution should preserve a durable result before remote contact"
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .expect("machine result should be valid JavaScript Object Notation");
+    assert_eq!(result["schema_version"], 1);
+    assert_eq!(result["command"], "projects push-plan execute");
+    assert_eq!(result["status"], "partial");
+    assert_eq!(result["data"]["succeeded_actions"], 0);
+    assert_eq!(result["data"]["failed_actions"], 1);
+    assert_eq!(
+        result["data"]["outcome_code"],
+        "remote-reference-observation-failed"
+    );
+    let visible = format!(
+        "{}{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+        fs::read_to_string(&result_log).expect("result log should be readable"),
+    );
+    assert!(!visible.contains(&project.display().to_string()));
+    assert!(!visible.contains(&remote.display().to_string()));
+    assert!(!visible.contains("private-disposable-project"));
 }
 
 fn iniza(arguments: &[&str]) -> Output {

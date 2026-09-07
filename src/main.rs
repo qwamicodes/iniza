@@ -4,8 +4,9 @@ use std::process::ExitCode;
 use iniza::{
     CoreError, InizaCore, OfflineRecoveryEngine, OfflineRecoveryRehearsalRequest, Plan,
     PlanApprovalState, PlanEngine, ProjectAuditEngine, ProjectAuditRequest,
-    ProtectionCandidateEngine, ProtectionCandidateRequest, PublicationPolicy,
-    PushPlanApprovalRequest, PushPlanDraftRequest, PushPlanEngine, ScanRequest,
+    ProtectionCandidateEngine, ProtectionCandidateRequest, PublicationPolicy, PushExecutionState,
+    PushPlanApprovalRequest, PushPlanDraftRequest, PushPlanEngine, PushPlanExecutionRequest,
+    ScanRequest,
 };
 
 fn main() -> ExitCode {
@@ -133,6 +134,11 @@ fn run(
             if namespace == "projects" && command == "push-plan" && action == "approve" =>
         {
             run_push_plan_approval(approval_arguments, machine_output)
+        }
+        [namespace, command, action, execution_arguments @ ..]
+            if namespace == "projects" && command == "push-plan" && action == "execute" =>
+        {
+            run_push_plan_execution(execution_arguments, machine_output)
         }
         [namespace, method, command, bundle_flag, bundle, document_flag, document]
             if namespace == "recovery"
@@ -478,6 +484,79 @@ fn run_push_plan_approval(
 fn push_plan_approval_usage() -> CliError {
     CliError::Usage(
         "usage: iniza projects push-plan approve --plan <PUSH_PLAN> --reviewed-hash <HASH> --output <APPROVAL_RECEIPT> --acknowledge-remote-side-effects [--approve-action <ACTION_IDENTIFIER>]..."
+            .to_owned(),
+    )
+}
+
+fn run_push_plan_execution(
+    arguments: &[String],
+    machine_output: bool,
+) -> Result<ExitCode, CliError> {
+    let mut directory_plan = None;
+    let mut project_identifier = None;
+    let mut push_plan = None;
+    let mut approval = None;
+    let mut result_log = None;
+    let mut index = 0;
+    while index < arguments.len() {
+        let destination = match arguments[index].as_str() {
+            "--directory-plan" if directory_plan.is_none() => &mut directory_plan,
+            "--project" if project_identifier.is_none() => &mut project_identifier,
+            "--push-plan" if push_plan.is_none() => &mut push_plan,
+            "--approval" if approval.is_none() => &mut approval,
+            "--result" if result_log.is_none() => &mut result_log,
+            _ => return Err(push_plan_execution_usage()),
+        };
+        *destination = Some(
+            arguments
+                .get(index + 1)
+                .ok_or_else(push_plan_execution_usage)?,
+        );
+        index += 2;
+    }
+    let plan = Plan::read_from(&PathBuf::from(
+        directory_plan.ok_or_else(push_plan_execution_usage)?,
+    ))
+    .map_err(|error| CliError::GitPublication(error.to_string()))?;
+    let audit = ProjectAuditEngine::local()
+        .audit(ProjectAuditRequest::from_plan(&plan))
+        .map_err(|error| CliError::GitPublication(error.to_string()))?;
+    let project_identifier = project_identifier.ok_or_else(push_plan_execution_usage)?;
+    let project = audit
+        .projects()
+        .iter()
+        .find(|project| project.id() == *project_identifier)
+        .ok_or_else(|| {
+            CliError::GitPublication(
+                "Push Plan Project is not present in the approved Plan".to_owned(),
+            )
+        })?;
+    let report = PushPlanEngine::local()
+        .execute(PushPlanExecutionRequest::new(
+            &plan,
+            project,
+            push_plan.ok_or_else(push_plan_execution_usage)?,
+            approval.ok_or_else(push_plan_execution_usage)?,
+            result_log.ok_or_else(push_plan_execution_usage)?,
+        ))
+        .map_err(|error| match error {
+            CoreError::DestinationAlreadyExists(_) => CliError::Conflict(error.to_string()),
+            _ => CliError::GitPublication(error.to_string()),
+        })?;
+    if machine_output {
+        println!("{}", report.machine_json_result());
+    } else {
+        println!("{}", report.human_result());
+    }
+    Ok(match report.state() {
+        PushExecutionState::Complete => ExitCode::SUCCESS,
+        PushExecutionState::Partial => ExitCode::from(41),
+    })
+}
+
+fn push_plan_execution_usage() -> CliError {
+    CliError::Usage(
+        "usage: iniza projects push-plan execute --directory-plan <DIRECTORY_PLAN> --project <PROJECT_IDENTIFIER> --push-plan <PUSH_PLAN> --approval <APPROVAL_RECEIPT> --result <RESULT_LOG>"
             .to_owned(),
     )
 }
