@@ -65,12 +65,22 @@ The first production slice does not claim support for:
 
 These states must be reported as blocking and Unverified. They must not be silently omitted, fetched, normalized, or downgraded to warnings. Git publication remains separate under ADR 0002; Project Capsule capture never fetches, pushes, pulls, merges, rebases, commits, checks out, resets, or stashes.
 
+## COKS-38 completion evidence
+
+COKS-38 implements the accepted production interface as a read-only review, reviewed capture, Bundle-bound in-memory expectation, and Recovery-Method-specific Restore Rehearsal. The review classifies every supported local state and reports bare repositories, linked worktrees, submodules, object alternates, sparse checkouts, partial clones, promisor objects, active Git locks, incomplete Git Large File Storage, and non-portable names as typed blockers.
+
+Ignored state is authorized by stable candidate identifier. Sensitive state enters capture only through an explicit encrypted-state decision. Reproducible generated state begins as a suggested exclusion and may be explicitly overridden. Live databases are never copied as verified raw state: the owner must select a distinct export already included by the approved Plan, two stable observations must match, and capture revalidates the export evidence. Results explicitly state that stable export bytes do not prove application-level database consistency.
+
+Capture permits one to three total attempts. Each attempt repeats Project observation, direct encrypted Pack, full Verify, and post-capture observation. A changed attempt is retained under an incomplete name rejected by ordinary Bundle commands. Only an unchanged attempt can be published to the requested final Bundle path or produce an expectation.
+
+The expectation binds the approved Plan and review hashes, stable Project identity, authenticated Bundle identity, current state, exact references, index digest, reviewed worktree state, executable-mode review, local Git Large File Storage evidence, database export evidence, and capture time. Restore Rehearsal authenticates the selected Bundle and validates against this expectation without consulting the source Project. Disposable fixtures prove both Recovery Methods independently, exact dirty and detached state, disabled hooks, no execution sentinels, no network fetching, and sanitized human and versioned machine results.
+
 ## Consequences
 
 - Project Capsules are larger than the Git-native prototype but have fewer format-specific reconstruction steps and no intermediate plaintext archive.
 - Exact local repository state can be protected even when there is no remote or publication is intentionally deferred.
 - A completed Project Capsule does not by itself make a Project Synchronized or make the machine safe to erase.
-- COKS-38 must integrate the selected capture with approved Plans, verified Project audits, Recovery Methods, Receipts, and Restore Rehearsals.
+- COKS-38 integrates the selected capture with approved Plans, verified Project audits, both Recovery Methods, and source-independent Restore Rehearsals. Durable authenticated Receipt persistence remains COKS-39.
 - Owner Dogfood still requires real Project selection, a real encrypted Bundle, verified independent copies, both Recovery Method rehearsals, and a successful Restore Rehearsal before any readiness conclusion.
 
 ## Owner decision

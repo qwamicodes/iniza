@@ -103,7 +103,7 @@ Expected result: Cargo completes successfully and builds the iniza library and c
 
    ~~~sh
    cargo test --test project_capsule production_capture_rejects_a_project_changed_after_its_verified_audit -- --exact
-   cargo test --test project_capsule production_capture_preserves_but_does_not_rely_on_a_bundle_when_the_project_changes -- --exact
+   cargo test --test project_capsule exhausted_capture_retains_changed_evidence_without_publishing_a_final_bundle -- --exact
    ~~~
 
    Expected result: both tests pass. A Project changed after audit is rejected before output. A Project changed after encrypted Pack retains its Bundle as evidence but receives Changed and Unverified state rather than a relied-on capture.
@@ -116,7 +116,7 @@ Run the focused suite:
 cargo test --test project_capsule
 ~~~
 
-Expected result: 9 passed, 0 failed.
+Expected result: 29 passed, 0 failed.
 
 Run formatting, static analysis, and every repository test:
 
@@ -138,7 +138,7 @@ If a test process is forcibly terminated, inspect the operating-system temporary
 
 ## Known limitations
 
-- The ProjectCapsuleEngine::capture library seam is implemented, but the supported personal-data command-line workflow remains part of later COKS-38 integration.
+- COKS-38 now implements the reviewed production capture and source-independent Restore Rehearsal library interfaces. Durable Receipt persistence and supported cross-process orchestration remain later integration work.
 - Bare repositories, linked worktrees, submodules, object alternates, incomplete Git Large File Storage state, sparse or partial clones, non-portable names, incompatible destination filesystem semantics, active Git locks, and changing Projects are not claimed as supported.
 - The size values in ADR 0012 come from the fixed synthetic fixture and are not estimates for a personal Project.
 - Passing this walkthrough does not establish Owner Dogfood readiness or authorize erasing the old Mac.
