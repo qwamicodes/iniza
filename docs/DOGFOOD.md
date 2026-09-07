@@ -4,7 +4,7 @@ This profile defines the first real Iniza use: protecting the project owner's im
 
 ## Must-protect scope
 
-- Every Project discovered beneath `~/Documents/projects`; the initial discovery found 22 repositories.
+- Every Project discovered beneath `~/Documents/projects`; the initial discovery found 22 repositories. A preliminary metadata-only check on 2026-09-07 found 23 working-repository markers, so the real Plan review must reconcile the changed count rather than assuming the original inventory is still current.
 - SSH, Git, Bash, and Zsh configuration.
 - Reviewed application configuration beneath explicit roots such as `~/.config`.
 - Named high-value files and directories added during Plan review.
@@ -50,9 +50,18 @@ The Vaultwarden service is external to the source Mac. Fresh-device sign-in, inc
 2. Restore under a fresh macOS user account or on another Mac where available.
 3. Validate file hashes, Project state, portable metadata, disabled hooks, and representative project builds.
 
-## Current prerequisites
+## Current prerequisite snapshot
 
-As of 2026-09-01, the official `bw` CLI is not installed and no external storage is mounted. Owner Dogfood remains blocked until connector access and the required physical storage are present and rehearsed.
+The following observations were collected on 2026-09-07 as preliminary host metadata. They are not Receipts, Owner Attestations, or substitutes for the later real Plan and storage rehearsals.
+
+- The official Bitwarden command-line client version 2026.8.0 is installed and passes Iniza's non-credentialed executable and interpreter review. The real owner-service recovery transaction, fresh-device sign-in, and independent multi-factor recovery confirmation remain incomplete.
+- No external physical disk or mounted external volume was detected. External Bundle storage and separately stored removable Offline Recovery Key media remain unavailable.
+- Time Machine is not running, and its configured destination could not be mounted. No current conventional-backup validation or representative Restore Attestation has been recorded.
+- The documented projects root occupies approximately 16.6 gibibytes. The source volume reported approximately 3.6 gibibytes available, which is insufficient even for one same-volume copy of that root before encryption overhead, temporary-space margin, or a second Verified Copy.
+- iCloud Drive is configured, but it shares the same reported local filesystem availability. This check does not prove cloud quota, complete local materialization, upload completion, independent availability, or enough capacity for a Verified Copy.
+- The preliminary repository-marker count is 23 rather than the original 22. COKS-40 must use Iniza discovery and owner review to determine whether every current Project is Must-Protect, Optional, excluded with a reason, or unsupported.
+
+Owner Dogfood remains blocked until the external storage, conventional backups, current Project inventory, both Recovery Methods, and required rehearsals are present and verified.
 
 ## Completion rule
 
