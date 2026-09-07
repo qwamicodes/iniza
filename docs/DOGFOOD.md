@@ -71,6 +71,12 @@ The approved capsule-only reference manifest still matched all fifteen branches 
 
 Project synchronization remains incomplete: `cashsynq` has one unpublished ahead commit, `beyond-scences` is three commits behind its locally known upstream, four current branches have no upstream, and the `halferpay/halferpay-core` remote check failed. Iniza does not reconcile these states. Owner Dogfood remains blocked until required Projects are both Restorable and Synchronized or an accepted capsule-only decision satisfies the local-only-reference rule.
 
+## Dependency security evidence
+
+On 2026-09-07 cargo-audit 0.22.2 checked the exact committed `Cargo.lock` against 1,240 advisories at RustSec database commit `faedffd5118c1835e13cca3babb6059afb1eb8d0`. All 98 locked dependencies passed with zero vulnerabilities and zero informational, unmaintained, unsound, notice, or yanked-package warnings while `--deny warnings` was active. The reproducible inputs and command are recorded in [the Owner Dogfood RustSec audit](research/owner-dogfood-rustsec-audit-2026-09-07.md).
+
+This automated result does not replace the independent cryptographic, parser, and key-lifecycle review required by ADR 0005. Real sole-copy owner data remains outside the currently accepted format scope.
+
 Owner Dogfood remains blocked until the external storage, conventional backups, current Project inventory, both Recovery Methods, and required rehearsals are present and verified.
 
 ## Completion rule
