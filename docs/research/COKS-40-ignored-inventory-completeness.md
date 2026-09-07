@@ -89,3 +89,9 @@ Confirming these seams authorizes only test-driven correction of ignored-state a
 `ProjectAudit::ignored_state_inventory` now exposes a Complete or Unavailable result. Complete inventories report pending candidates and the exact count covered by approved Plan exclusions. Git failure, nonzero exit, malformed output, and bounded-output overflow fail closed as Unavailable and add a Restorable gap without discarding other Project observations. The exact ignored-path enumeration command may retain at most thirty-two mebibytes of standard output; ordinary command output and all standard error remain bounded at one mebibyte per stream.
 
 Human output shows local review paths, coverage counts, and stable Unavailable reason codes. Machine output exposes only stable candidate identifiers, classifications, counts, state, and reason codes. Project Capsule operations reject an Unavailable inventory rather than treating it as an empty candidate list.
+
+## Real Plan verification evidence
+
+After the owner approved Project Plan `plan_blake3_83eccc795023f7b06e6f9d55c6545d8f5c2b01283df6a5e3d1ed47f478a1e479`, the production command completed a remote-aware read-only audit of all twenty-three Projects. Every ignored-state inventory was Complete, every local observation was verified and unchanged, and no Project returned an Unavailable reason. The report counted 1,319 pending ignored candidates retained for encrypted review and 712,885 candidates covered by exact approved Plan exclusions.
+
+The current complete result differs by one candidate from the earlier direct 1,320-item inventory. Both observations remain explicit; no warning or synthetic zero hides the difference. The audit also reconfirmed fifteen capsule-only branches and seventeen capsule-only tags, one ahead Project, one behind Project, four current branches without upstreams, and one failed remote check. Those Project synchronization and Project Capsule requirements remain separate blocking work.

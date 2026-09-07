@@ -61,6 +61,16 @@ The following observations were collected on 2026-09-07 as preliminary host meta
 - iCloud Drive is configured, but it shares the same reported local filesystem availability. This check does not prove cloud quota, complete local materialization, upload completion, independent availability, or enough capacity for a Verified Copy.
 - The preliminary repository-marker count is 23 rather than the original 22. COKS-40 must use Iniza discovery and owner review to determine whether every current Project is Must-Protect, Optional, excluded with a reason, or unsupported.
 
+## Reviewed Project evidence
+
+On 2026-09-07 the owner approved Project Plan `plan_blake3_83eccc795023f7b06e6f9d55c6545d8f5c2b01283df6a5e3d1ed47f478a1e479`. The approved Plan contains all twenty-three reviewed Project roots as Included and Must-Protect, the exact two hundred approved generated exclusions, thirty-one reviewed symbolic-link inclusions, and the `review-separately` publication policy. It contains no unresolved Must-Protect Plan Disposition.
+
+The post-approval read-only audit reported all twenty-three local observations verified and unchanged and all twenty-three ignored-state inventories Complete. It found 1,319 current ignored candidates retained for later encrypted Project Capsule review and 712,885 ignored entries covered by exact approved Plan exclusions. The prior direct inventory counted 1,320 retained candidates; the current complete audit is authoritative for the approved Plan, but the one-item snapshot drift remains recorded rather than silently normalized.
+
+The approved capsule-only reference manifest still matched all fifteen branches and seventeen tags by exact local object identifier. Those references remain unpublished and require verified Project Capsule protection. One `cashsynq` existing-upstream non-force action was prepared as immutable Push Plan `push_plan_blake3_b0adf61d28d24473a8bbde184c44e47057766c9b88bcc981d86b9f4142a58a2a`; it was neither approved nor executed. Push Plans expire after fifteen minutes and must be regenerated before later review when stale.
+
+Project synchronization remains incomplete: `cashsynq` has one unpublished ahead commit, `beyond-scences` is three commits behind its locally known upstream, four current branches have no upstream, and the `halferpay/halferpay-core` remote check failed. Iniza does not reconcile these states. Owner Dogfood remains blocked until required Projects are both Restorable and Synchronized or an accepted capsule-only decision satisfies the local-only-reference rule.
+
 Owner Dogfood remains blocked until the external storage, conventional backups, current Project inventory, both Recovery Methods, and required rehearsals are present and verified.
 
 ## Completion rule
