@@ -10,9 +10,12 @@ use std::os::unix::fs::{PermissionsExt, symlink};
 
 use iniza::{
     GitProcess, GitProcessOutput, InstalledGit, PlanEngine, ProjectAuditEngine,
-    ProjectAuditRequest, ProjectCapsuleCaptureRequest, ProjectCapsuleCaptureState,
-    ProjectCapsuleComparisonRequest, ProjectCapsuleEngine, ProjectCapsuleRepresentation,
-    ProjectCapsuleValidationRequest, RestoreEngine, RestoreRequest, ScanRequest,
+    ProjectAuditRequest, ProjectCapsuleBlockingFeature, ProjectCapsuleCaptureRequest,
+    ProjectCapsuleCaptureState, ProjectCapsuleComparisonRequest, ProjectCapsuleEngine,
+    ProjectCapsuleIgnoredRecommendation, ProjectCapsuleRepresentation,
+    ProjectCapsuleReviewDecision, ProjectCapsuleReviewDecisionKind, ProjectCapsuleReviewRequest,
+    ProjectCapsuleSupportedState, ProjectCapsuleValidationRequest, RestoreEngine, RestoreRequest,
+    ScanRequest,
 };
 
 static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -41,6 +44,162 @@ impl Drop for TestDirectory {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.path);
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn project_capsule_review_classifies_dirty_state_and_binds_explicit_ignored_decisions() {
+    let directory = TestDirectory::new("review-dirty-state");
+    let project = directory.path.join("owner-project");
+    create_dirty_project_fixture(
+        &project,
+        &directory.path.join("script-ran"),
+        &directory.path.join("hook-ran"),
+    );
+    fs::remove_file(project.join("unreviewed.secret"))
+        .expect("the extra ignored fixture should be removed");
+    fs::create_dir_all(project.join("node_modules/example"))
+        .expect("generated fixture directory should be created");
+    fs::write(
+        project.join("node_modules/example/generated.js"),
+        "synthetic generated dependency\n",
+    )
+    .expect("generated fixture should be written");
+    fs::write(project.join(".gitignore"), ".env.local\nnode_modules/\n")
+        .expect("review fixture ignore rules should be written");
+
+    let mut plan = PlanEngine::local()
+        .scan(ScanRequest::for_directory(&project))
+        .expect("dirty Project should scan");
+    let plan_hash = plan.approval_hash().expect("Plan should hash");
+    plan.approve(&plan_hash).expect("exact Plan should approve");
+    let audit = ProjectAuditEngine::local()
+        .audit(ProjectAuditRequest::from_plan(&plan))
+        .expect("dirty Project should audit");
+    let project_audit = audit.projects().first().expect("Project should be present");
+
+    let initial = ProjectCapsuleEngine::local()
+        .review(ProjectCapsuleReviewRequest::new(&plan, project_audit))
+        .expect("read-only Project Capsule review should complete");
+
+    for state in [
+        ProjectCapsuleSupportedState::AttachedCurrentState,
+        ProjectCapsuleSupportedState::Stashes,
+        ProjectCapsuleSupportedState::LocalOnlyBranches,
+        ProjectCapsuleSupportedState::LocalOnlyTags,
+        ProjectCapsuleSupportedState::StagedChanges,
+        ProjectCapsuleSupportedState::UnstagedChanges,
+        ProjectCapsuleSupportedState::UntrackedItems,
+        ProjectCapsuleSupportedState::RepositoryWithoutRemote,
+    ] {
+        assert!(
+            initial.support_report().supports(state),
+            "the observed dirty Project state should be classified as supported: {state:?}"
+        );
+    }
+    assert!(initial.support_report().blocking_features().is_empty());
+    let sensitive = initial
+        .ignored_candidates()
+        .iter()
+        .find(|candidate| {
+            candidate.recommendation()
+                == ProjectCapsuleIgnoredRecommendation::RequiresExplicitDecision
+        })
+        .expect("the synthetic environment file should require an explicit decision");
+    let sensitive_id = sensitive.candidate_id().to_owned();
+    assert_eq!(sensitive.decision(), None);
+    assert!(initial.ignored_candidates().iter().any(|candidate| {
+        candidate.recommendation()
+            == ProjectCapsuleIgnoredRecommendation::ExcludeReproducibleGeneratedState
+    }));
+
+    let decided = ProjectCapsuleEngine::local()
+        .review(
+            ProjectCapsuleReviewRequest::new(&plan, project_audit).with_decision(
+                ProjectCapsuleReviewDecision::include_as_encrypted_reviewed_state(&sensitive_id),
+            ),
+        )
+        .expect("the stable ignored candidate decision should bind to the review");
+
+    assert_ne!(initial.review_hash(), decided.review_hash());
+    assert_eq!(
+        decided
+            .ignored_candidate(&sensitive_id)
+            .expect("decided candidate should remain visible")
+            .decision(),
+        Some(ProjectCapsuleReviewDecisionKind::IncludeAsEncryptedReviewedState)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn project_capsule_review_reports_submodules_as_blocking_without_creating_a_bundle() {
+    let directory = TestDirectory::new("review-submodule");
+    let project = directory.path.join("owner-project");
+    let submodule_origin = directory.path.join("submodule-origin");
+    let bundle = directory.path.join("must-not-exist.iniza");
+    fs::create_dir_all(&submodule_origin).expect("submodule origin should be created");
+    git(&submodule_origin, &["init", "-q", "--initial-branch=main"]);
+    fs::write(submodule_origin.join("README.md"), "synthetic submodule\n")
+        .expect("submodule fixture should be written");
+    git(&submodule_origin, &["add", "README.md"]);
+    commit(
+        &submodule_origin,
+        "Create synthetic submodule",
+        "2026-01-01T00:00:00Z",
+    );
+    fs::create_dir_all(&project).expect("Project should be created");
+    git(&project, &["init", "-q", "--initial-branch=main"]);
+    fs::write(project.join("README.md"), "synthetic Project\n")
+        .expect("Project fixture should be written");
+    git(&project, &["add", "README.md"]);
+    commit(&project, "Create synthetic Project", "2026-01-01T00:00:00Z");
+    git(
+        &project,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            submodule_origin
+                .to_str()
+                .expect("submodule origin path should be text"),
+            "vendor/example",
+        ],
+    );
+    git(&project, &["add", ".gitmodules", "vendor/example"]);
+    commit(&project, "Add synthetic submodule", "2026-01-02T00:00:00Z");
+
+    let mut plan = PlanEngine::local()
+        .scan(ScanRequest::for_directory(&project))
+        .expect("Project should scan");
+    let plan_hash = plan.approval_hash().expect("Plan should hash");
+    plan.approve(&plan_hash).expect("exact Plan should approve");
+    let audit = ProjectAuditEngine::local()
+        .audit(ProjectAuditRequest::from_plan(&plan))
+        .expect("submodule state should audit without fetching");
+    let canonical_project = fs::canonicalize(&project).expect("Project path should canonicalize");
+    let project_audit = audit
+        .projects()
+        .iter()
+        .find(|candidate| candidate.root() == canonical_project)
+        .expect("parent Project should be present");
+
+    let review = ProjectCapsuleEngine::local()
+        .review(ProjectCapsuleReviewRequest::new(&plan, project_audit))
+        .expect("unsupported repository state should remain reviewable");
+
+    assert!(
+        review
+            .support_report()
+            .blocks(ProjectCapsuleBlockingFeature::Submodules)
+    );
+    assert!(!review.support_report().is_supported_for_capture());
+    assert!(
+        !bundle.exists(),
+        "read-only review must not create a Bundle"
+    );
 }
 
 #[cfg(unix)]

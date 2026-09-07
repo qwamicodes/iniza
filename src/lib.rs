@@ -52,9 +52,12 @@ pub use project_audit::{
     SanitizedRemote,
 };
 pub use project_capsule::{
-    ProjectCapsuleCandidateReport, ProjectCapsuleCaptureReport, ProjectCapsuleCaptureRequest,
-    ProjectCapsuleCaptureState, ProjectCapsuleComparisonReport, ProjectCapsuleComparisonRequest,
-    ProjectCapsuleEngine, ProjectCapsuleRepresentation, ProjectCapsuleValidationReport,
+    ProjectCapsuleBlockingFeature, ProjectCapsuleCandidateReport, ProjectCapsuleCaptureReport,
+    ProjectCapsuleCaptureRequest, ProjectCapsuleCaptureState, ProjectCapsuleComparisonReport,
+    ProjectCapsuleComparisonRequest, ProjectCapsuleEngine, ProjectCapsuleIgnoredRecommendation,
+    ProjectCapsuleIgnoredReview, ProjectCapsuleRepresentation, ProjectCapsuleReview,
+    ProjectCapsuleReviewDecision, ProjectCapsuleReviewDecisionKind, ProjectCapsuleReviewRequest,
+    ProjectCapsuleSupportReport, ProjectCapsuleSupportedState, ProjectCapsuleValidationReport,
     ProjectCapsuleValidationRequest,
 };
 pub use protection_candidates::{

@@ -9,9 +9,10 @@ use std::path::{Component, Path, PathBuf};
 use std::os::unix::fs::{PermissionsExt, symlink};
 
 use crate::{
-    BundleEngine, BundleVerification, CoreError, Disposition, GitProcess, InstalledGit,
-    MigrationItemKind, PackReport, PackRequest, Plan, PlanApprovalState, PlanEngine, ProjectAudit,
-    ProjectKind, RecoverySecret, RestoreEngine, RestoreRequest, ScanRequest, VerifyRequest,
+    BundleEngine, BundleVerification, CoreError, Disposition, GitProcess, IgnoredReview,
+    InstalledGit, MigrationItemKind, PackReport, PackRequest, Plan, PlanApprovalState, PlanEngine,
+    ProjectAudit, ProjectHead, ProjectKind, RecoverySecret, RestoreEngine, RestoreRequest,
+    ScanRequest, VerifyRequest,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -24,6 +25,142 @@ pub enum ProjectCapsuleRepresentation {
 pub enum ProjectCapsuleCaptureState {
     Verified,
     ChangedAndUnverified,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ProjectCapsuleSupportedState {
+    AttachedCurrentState,
+    Stashes,
+    LocalOnlyBranches,
+    LocalOnlyTags,
+    StagedChanges,
+    UnstagedChanges,
+    UntrackedItems,
+    RepositoryWithoutRemote,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ProjectCapsuleBlockingFeature {
+    Submodules,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectCapsuleSupportReport {
+    supported_states: BTreeSet<ProjectCapsuleSupportedState>,
+    blocking_features: BTreeSet<ProjectCapsuleBlockingFeature>,
+}
+
+impl ProjectCapsuleSupportReport {
+    pub fn supports(&self, state: ProjectCapsuleSupportedState) -> bool {
+        self.supported_states.contains(&state)
+    }
+
+    pub fn blocking_features(&self) -> &BTreeSet<ProjectCapsuleBlockingFeature> {
+        &self.blocking_features
+    }
+
+    pub fn blocks(&self, feature: ProjectCapsuleBlockingFeature) -> bool {
+        self.blocking_features.contains(&feature)
+    }
+
+    pub fn is_supported_for_capture(&self) -> bool {
+        self.blocking_features.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectCapsuleIgnoredRecommendation {
+    RequiresExplicitDecision,
+    ExcludeReproducibleGeneratedState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectCapsuleReviewDecisionKind {
+    IncludeAsEncryptedReviewedState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectCapsuleReviewDecision {
+    candidate_id: String,
+    kind: ProjectCapsuleReviewDecisionKind,
+}
+
+impl ProjectCapsuleReviewDecision {
+    pub fn include_as_encrypted_reviewed_state(candidate_id: impl Into<String>) -> Self {
+        Self {
+            candidate_id: candidate_id.into(),
+            kind: ProjectCapsuleReviewDecisionKind::IncludeAsEncryptedReviewedState,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectCapsuleIgnoredReview {
+    candidate_id: String,
+    recommendation: ProjectCapsuleIgnoredRecommendation,
+    decision: Option<ProjectCapsuleReviewDecisionKind>,
+}
+
+impl ProjectCapsuleIgnoredReview {
+    pub fn candidate_id(&self) -> &str {
+        &self.candidate_id
+    }
+
+    pub fn recommendation(&self) -> ProjectCapsuleIgnoredRecommendation {
+        self.recommendation
+    }
+
+    pub fn decision(&self) -> Option<ProjectCapsuleReviewDecisionKind> {
+        self.decision
+    }
+}
+
+pub struct ProjectCapsuleReviewRequest<'a> {
+    plan: &'a Plan,
+    project: &'a ProjectAudit,
+    decisions: Vec<ProjectCapsuleReviewDecision>,
+}
+
+impl<'a> ProjectCapsuleReviewRequest<'a> {
+    pub fn new(plan: &'a Plan, project: &'a ProjectAudit) -> Self {
+        Self {
+            plan,
+            project,
+            decisions: Vec::new(),
+        }
+    }
+
+    pub fn with_decision(mut self, decision: ProjectCapsuleReviewDecision) -> Self {
+        self.decisions.push(decision);
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectCapsuleReview {
+    support_report: ProjectCapsuleSupportReport,
+    ignored_candidates: Vec<ProjectCapsuleIgnoredReview>,
+    review_hash: String,
+}
+
+impl ProjectCapsuleReview {
+    pub fn support_report(&self) -> &ProjectCapsuleSupportReport {
+        &self.support_report
+    }
+
+    pub fn ignored_candidates(&self) -> &[ProjectCapsuleIgnoredReview] {
+        &self.ignored_candidates
+    }
+
+    pub fn ignored_candidate(&self, candidate_id: &str) -> Option<&ProjectCapsuleIgnoredReview> {
+        self.ignored_candidates
+            .iter()
+            .find(|candidate| candidate.candidate_id == candidate_id)
+    }
+
+    pub fn review_hash(&self) -> &str {
+        &self.review_hash
+    }
 }
 
 pub struct ProjectCapsuleCaptureRequest<'a> {
@@ -487,6 +624,93 @@ impl<G> ProjectCapsuleEngine<G> {
 }
 
 impl<G: GitProcess> ProjectCapsuleEngine<G> {
+    pub fn review(
+        &self,
+        request: ProjectCapsuleReviewRequest<'_>,
+    ) -> Result<ProjectCapsuleReview, CoreError> {
+        validate_review_request(&self.git, &request)?;
+        let local_state = request.project.local_state();
+        let mut supported_states = BTreeSet::new();
+        if matches!(local_state.head(), ProjectHead::Branch(_)) {
+            supported_states.insert(ProjectCapsuleSupportedState::AttachedCurrentState);
+        }
+        if local_state.stash_count() > 0 {
+            supported_states.insert(ProjectCapsuleSupportedState::Stashes);
+        }
+        if !local_state.local_only_branches().is_empty() {
+            supported_states.insert(ProjectCapsuleSupportedState::LocalOnlyBranches);
+        }
+        if !local_state.local_only_tags().is_empty() {
+            supported_states.insert(ProjectCapsuleSupportedState::LocalOnlyTags);
+        }
+        if local_state.staged_changes() > 0 {
+            supported_states.insert(ProjectCapsuleSupportedState::StagedChanges);
+        }
+        if local_state.unstaged_changes() > 0 {
+            supported_states.insert(ProjectCapsuleSupportedState::UnstagedChanges);
+        }
+        if local_state.untracked_items() > 0 {
+            supported_states.insert(ProjectCapsuleSupportedState::UntrackedItems);
+        }
+        if request.project.remotes().is_empty() {
+            supported_states.insert(ProjectCapsuleSupportedState::RepositoryWithoutRemote);
+        }
+        let mut blocking_features = BTreeSet::new();
+        if !request.project.submodules().is_empty() {
+            blocking_features.insert(ProjectCapsuleBlockingFeature::Submodules);
+        }
+        let support_report = ProjectCapsuleSupportReport {
+            supported_states,
+            blocking_features,
+        };
+        let mut decisions = BTreeMap::new();
+        for decision in request.decisions {
+            if decisions
+                .insert(decision.candidate_id, decision.kind)
+                .is_some()
+            {
+                return Err(CoreError::InvalidPlan(
+                    "Project Capsule review contains a duplicate ignored-state decision".to_owned(),
+                ));
+            }
+        }
+        let mut ignored_candidates = request
+            .project
+            .ignored_candidates()
+            .iter()
+            .map(|candidate| ProjectCapsuleIgnoredReview {
+                candidate_id: candidate.id().to_owned(),
+                recommendation: match candidate.review() {
+                    IgnoredReview::RequiresReview => {
+                        ProjectCapsuleIgnoredRecommendation::RequiresExplicitDecision
+                    }
+                    IgnoredReview::SuggestedExclusion => {
+                        ProjectCapsuleIgnoredRecommendation::ExcludeReproducibleGeneratedState
+                    }
+                },
+                decision: decisions.remove(candidate.id()),
+            })
+            .collect::<Vec<_>>();
+        if !decisions.is_empty() {
+            return Err(CoreError::InvalidPlan(
+                "Project Capsule review decision does not identify an audited ignored candidate"
+                    .to_owned(),
+            ));
+        }
+        ignored_candidates.sort_by(|left, right| left.candidate_id.cmp(&right.candidate_id));
+        let review_hash = project_capsule_review_hash(
+            request.plan,
+            request.project,
+            &support_report,
+            &ignored_candidates,
+        )?;
+        Ok(ProjectCapsuleReview {
+            support_report,
+            ignored_candidates,
+            review_hash,
+        })
+    }
+
     pub fn capture(
         &self,
         mut request: ProjectCapsuleCaptureRequest<'_>,
@@ -879,6 +1103,96 @@ impl<G: GitProcess> ProjectCapsuleEngine<G> {
         quarantine_hooks(restored)?;
         Ok(())
     }
+}
+
+fn validate_review_request(
+    git: &impl GitProcess,
+    request: &ProjectCapsuleReviewRequest<'_>,
+) -> Result<(), CoreError> {
+    if !request.plan.is_directory_plan()
+        || request.plan.approval_state()? != PlanApprovalState::Approved
+    {
+        return Err(CoreError::InvalidPlan(
+            "Project Capsule review requires an approved, non-stale directory Plan".to_owned(),
+        ));
+    }
+    if !request.project.local_audit_verified() || request.project.changed_during_audit() {
+        return Err(CoreError::InvalidPlan(
+            "Project Capsule review requires one verified, unchanged Project audit".to_owned(),
+        ));
+    }
+    let current_hash = crate::project_audit::observe_local_repository_hash(
+        git,
+        request.project.root(),
+        request.project.kind(),
+    )
+    .ok_or_else(|| {
+        CoreError::InvalidPlan(
+            "Project Capsule review could not revalidate the Project audit".to_owned(),
+        )
+    })?;
+    if request.project.local_state().observation_hash() != Some(current_hash.as_str()) {
+        return Err(CoreError::InvalidPlan(
+            "Project Capsule review requires a fresh Project audit".to_owned(),
+        ));
+    }
+    if !request
+        .plan
+        .approved_roots()
+        .iter()
+        .any(|root| request.project.root().starts_with(root))
+    {
+        return Err(CoreError::InvalidPlan(
+            "Project Capsule review audit is not bound to the approved Plan scope".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn project_capsule_review_hash(
+    plan: &Plan,
+    project: &ProjectAudit,
+    support_report: &ProjectCapsuleSupportReport,
+    ignored_candidates: &[ProjectCapsuleIgnoredReview],
+) -> Result<String, CoreError> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"iniza Project Capsule review v1\0");
+    for field in [
+        plan.approval_hash()?,
+        project.id().to_owned(),
+        project
+            .local_state()
+            .observation_hash()
+            .unwrap_or_default()
+            .to_owned(),
+    ] {
+        hasher.update(&(field.len() as u64).to_le_bytes());
+        hasher.update(field.as_bytes());
+    }
+    for state in &support_report.supported_states {
+        let name = format!("{state:?}");
+        hasher.update(&(name.len() as u64).to_le_bytes());
+        hasher.update(name.as_bytes());
+    }
+    for feature in &support_report.blocking_features {
+        let name = format!("{feature:?}");
+        hasher.update(&(name.len() as u64).to_le_bytes());
+        hasher.update(name.as_bytes());
+    }
+    for candidate in ignored_candidates {
+        hasher.update(&(candidate.candidate_id.len() as u64).to_le_bytes());
+        hasher.update(candidate.candidate_id.as_bytes());
+        let recommendation = format!("{:?}", candidate.recommendation);
+        hasher.update(&(recommendation.len() as u64).to_le_bytes());
+        hasher.update(recommendation.as_bytes());
+        let decision = format!("{:?}", candidate.decision);
+        hasher.update(&(decision.len() as u64).to_le_bytes());
+        hasher.update(decision.as_bytes());
+    }
+    Ok(format!(
+        "project_capsule_review_blake3_{}",
+        hasher.finalize().to_hex()
+    ))
 }
 
 fn validate_capture_request(
