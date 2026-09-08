@@ -18,6 +18,7 @@ mod push_plan;
 mod readiness_evidence;
 mod restore;
 mod restore_fs;
+mod stored_recovery_method;
 mod vaultwarden_recovery;
 
 pub use bundle::{
@@ -87,6 +88,10 @@ pub use readiness_evidence::{
 pub use restore::{
     RestoreCancellation, RestoreEngine, RestoreEvent, RestoreEventSink, RestoreReport,
     RestoreRequest, RestoreState,
+};
+pub use stored_recovery_method::{
+    LoadedRecoveryMethod, OfflineRecoveryLocator, StoredRecoveryMethodEngine,
+    StoredRecoveryMethodLocator, StoredRecoveryMethodRequest, VaultwardenRecoveryLocator,
 };
 pub use vaultwarden_recovery::{
     BitwardenCommandLine, BitwardenInstallationObservation, BitwardenRecoveryNote,
