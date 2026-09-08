@@ -2,11 +2,12 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use iniza::{
-    CoreError, InizaCore, OfflineRecoveryEngine, OfflineRecoveryRehearsalRequest, Plan,
-    PlanApprovalState, PlanEngine, ProjectAuditEngine, ProjectAuditRequest,
-    ProtectionCandidateEngine, ProtectionCandidateRequest, PublicationPolicy, PushExecutionState,
-    PushPlanApprovalRequest, PushPlanDraftRequest, PushPlanEngine, PushPlanExecutionRequest,
-    ScanRequest,
+    BundleEngine, CoreError, InizaCore, InspectRequest, OfflineRecoveryEngine,
+    OfflineRecoveryLocator, OfflineRecoveryRehearsalRequest, Plan, PlanApprovalState, PlanEngine,
+    ProjectAuditEngine, ProjectAuditRequest, ProtectionCandidateEngine, ProtectionCandidateRequest,
+    PublicationPolicy, PushExecutionState, PushPlanApprovalRequest, PushPlanDraftRequest,
+    PushPlanEngine, PushPlanExecutionRequest, ScanRequest, StoredRecoveryMethodEngine,
+    StoredRecoveryMethodRequest, VerifyRequest,
 };
 
 fn main() -> ExitCode {
@@ -387,6 +388,97 @@ fn run(
             }
             Ok(ExitCode::SUCCESS)
         }
+        [command, bundle_flag, bundle, recovery_flag, recovery_document]
+            if command == "verify"
+                && bundle_flag == "--bundle"
+                && recovery_flag == "--offline-recovery-document" =>
+        {
+            print_progress(machine_output, "Fully verifying encrypted Bundle");
+            let loaded = StoredRecoveryMethodEngine::local()
+                .load(StoredRecoveryMethodRequest::new(
+                    bundle,
+                    OfflineRecoveryLocator::new(recovery_document),
+                ))
+                .map_err(map_bundle_error)?;
+            let verification = BundleEngine::local()
+                .verify(VerifyRequest::new(bundle, loaded.recovery_secret()))
+                .map_err(map_bundle_error)?;
+            if machine_output {
+                println!("{}", verification.machine_json_result());
+            } else {
+                println!("Bundle fully verified");
+                println!("Recovery Method: {:?}", loaded.recovery_method());
+                println!(
+                    "Bundle format: IZ{}/{}",
+                    verification.summary.format_version,
+                    verification.summary.cryptographic_suite
+                );
+                println!(
+                    "Authenticated chunks: {}",
+                    verification.authenticated_chunks
+                );
+                println!("Authenticated bytes: {}", verification.authenticated_bytes);
+                println!("Included Migration Items: {}", verification.summary.included_items);
+                println!("Changed Migration Items: {}", verification.summary.changed_items);
+                println!(
+                    "Unsupported Migration Items: {}",
+                    verification.summary.unsupported_items
+                );
+                println!(
+                    "Unverified Migration Items: {}",
+                    verification.summary.unverified_items
+                );
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        [command, bundle_flag, bundle, recovery_flag, recovery_document]
+            if command == "inspect"
+                && bundle_flag == "--bundle"
+                && recovery_flag == "--offline-recovery-document" =>
+        {
+            print_progress(machine_output, "Inspecting authenticated encrypted Bundle");
+            let loaded = StoredRecoveryMethodEngine::local()
+                .load(StoredRecoveryMethodRequest::new(
+                    bundle,
+                    OfflineRecoveryLocator::new(recovery_document),
+                ))
+                .map_err(map_bundle_error)?;
+            let summary = BundleEngine::local()
+                .inspect(InspectRequest::new(bundle, loaded.recovery_secret()))
+                .map_err(map_bundle_error)?;
+            if machine_output {
+                print_machine_value(
+                    "inspect",
+                    serde_json::json!({
+                        "format_version": summary.format_version,
+                        "cryptographic_suite": summary.cryptographic_suite,
+                        "source_name": summary.source_name,
+                        "logical_size": summary.logical_size,
+                        "included_items": summary.included_items,
+                        "changed_items": summary.changed_items,
+                        "unsupported_items": summary.unsupported_items,
+                        "unverified_items": summary.unverified_items,
+                    }),
+                );
+            } else {
+                println!("Authenticated Bundle inspection");
+                println!("Recovery Method: {:?}", loaded.recovery_method());
+                println!(
+                    "Bundle format: IZ{}/{}",
+                    summary.format_version, summary.cryptographic_suite
+                );
+                println!("Source name: {}", summary.source_name);
+                println!("Logical size: {} bytes", summary.logical_size);
+                println!("Included Migration Items: {}", summary.included_items);
+                println!("Changed Migration Items: {}", summary.changed_items);
+                println!(
+                    "Unsupported Migration Items: {}",
+                    summary.unsupported_items
+                );
+                println!("Unverified Migration Items: {}", summary.unverified_items);
+            }
+            Ok(ExitCode::SUCCESS)
+        }
         [command, bundle] if command == "inspect" => {
             let bundle_path = PathBuf::from(bundle);
             print_progress(
@@ -399,7 +491,7 @@ fn run(
             unreachable!("encrypted Bundle inspection is not implemented")
         }
         _ => Err(CliError::Usage(
-            "usage: iniza scan <SOURCE> (--list-protection-candidates | --candidate <ID>... --output-plan <PLAN> | --output-plan <PLAN>) [SCAN OPTIONS] | iniza projects scan --plan <APPROVED_PLAN> [--remote-check] | iniza recovery offline rehearse --bundle <BUNDLE> --document <RECOVERY_DOCUMENT> | iniza plan show --plan <PLAN> | iniza plan validate --plan <PLAN> | iniza plan approve --plan <PLAN> --approved-hash <HASH> | iniza plan diff <OLD> <NEW> | iniza inspect <BUNDLE> | iniza fixture pack --plan <PLAN> --output <PATH.iniza-fixture> | iniza fixture inspect <PATH.iniza-fixture> | iniza fixture restore <PATH.iniza-fixture> --to <NEW_DESTINATION>"
+            "usage: iniza scan <SOURCE> (--list-protection-candidates | --candidate <ID>... --output-plan <PLAN> | --output-plan <PLAN>) [SCAN OPTIONS] | iniza projects scan --plan <APPROVED_PLAN> [--remote-check] | iniza recovery offline rehearse --bundle <BUNDLE> --document <RECOVERY_DOCUMENT> | iniza verify --bundle <BUNDLE> --offline-recovery-document <RECOVERY_DOCUMENT> | iniza inspect --bundle <BUNDLE> --offline-recovery-document <RECOVERY_DOCUMENT> | iniza plan show --plan <PLAN> | iniza plan validate --plan <PLAN> | iniza plan approve --plan <PLAN> --approved-hash <HASH> | iniza plan diff <OLD> <NEW> | iniza inspect <BUNDLE> | iniza fixture pack --plan <PLAN> --output <PATH.iniza-fixture> | iniza fixture inspect <PATH.iniza-fixture> | iniza fixture restore <PATH.iniza-fixture> --to <NEW_DESTINATION>"
                 .to_owned(),
         )),
     }
@@ -1006,6 +1098,16 @@ fn json_string(value: &str) -> String {
 fn map_restore_error(error: CoreError) -> CliError {
     match error {
         CoreError::DestinationAlreadyExists(_) => CliError::Conflict(error.to_string()),
+        _ => CliError::Operation(error.to_string()),
+    }
+}
+
+fn map_bundle_error(error: CoreError) -> CliError {
+    match error {
+        CoreError::AuthenticationFailed
+        | CoreError::BundleIncomplete(_)
+        | CoreError::BundleInvalid(_)
+        | CoreError::TestFixtureIsNotBundle(_) => CliError::BundleInvalid(error.to_string()),
         _ => CliError::Operation(error.to_string()),
     }
 }
