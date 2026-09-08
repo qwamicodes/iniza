@@ -215,3 +215,179 @@ fn owner_and_automation_can_inspect_an_authenticated_bundle_using_only_the_offli
     assert!(!machine_output.contains(document_text));
     assert!(!machine_output.contains(&"47".repeat(32)));
 }
+
+#[test]
+fn owner_and_automation_can_restore_exact_bytes_without_overwriting_using_only_the_offline_document_locator()
+ {
+    let directory = TestDirectory::new();
+    let (bundle, document) = completed_bundle_and_offline_document(&directory);
+    let bundle_text = bundle.to_str().unwrap();
+    let document_text = document.to_str().unwrap();
+    let owner_destination = directory.path().join("owner-restore");
+    let owner_destination_text = owner_destination.to_str().unwrap();
+
+    let human = iniza(&[
+        "restore",
+        "--bundle",
+        bundle_text,
+        "--to",
+        owner_destination_text,
+        "--offline-recovery-document",
+        document_text,
+    ]);
+    assert!(
+        human.status.success(),
+        "Restore should succeed: {}",
+        String::from_utf8_lossy(&human.stderr)
+    );
+    assert_eq!(
+        fs::read(owner_destination.join("settings.txt")).unwrap(),
+        b"synthetic encrypted command-line settings\n"
+    );
+    let human_output = String::from_utf8_lossy(&human.stdout);
+    assert!(human_output.contains("Restore completed"));
+    assert!(human_output.contains("Recovery Method: Offline"));
+    assert!(!human_output.contains('\u{1b}'));
+    assert!(!human_output.contains(bundle_text));
+    assert!(!human_output.contains(document_text));
+    assert!(!human_output.contains(&"47".repeat(32)));
+
+    let before_collision = fs::read(owner_destination.join("settings.txt")).unwrap();
+    let collision = iniza(&[
+        "restore",
+        "--bundle",
+        bundle_text,
+        "--to",
+        owner_destination_text,
+        "--offline-recovery-document",
+        document_text,
+    ]);
+    assert_eq!(collision.status.code(), Some(50));
+    assert!(String::from_utf8_lossy(&collision.stderr).contains("destination already exists"));
+    assert_eq!(
+        fs::read(owner_destination.join("settings.txt")).unwrap(),
+        before_collision
+    );
+
+    let automation_destination = directory.path().join("automation-restore");
+    let automation_destination_text = automation_destination.to_str().unwrap();
+    let machine = iniza(&[
+        "--json",
+        "restore",
+        "--bundle",
+        bundle_text,
+        "--to",
+        automation_destination_text,
+        "--offline-recovery-document",
+        document_text,
+    ]);
+    assert!(
+        machine.status.success(),
+        "machine Restore should succeed: {}",
+        String::from_utf8_lossy(&machine.stderr)
+    );
+    assert!(machine.stderr.is_empty());
+    assert_eq!(
+        fs::read(automation_destination.join("settings.txt")).unwrap(),
+        b"synthetic encrypted command-line settings\n"
+    );
+    let machine_output = String::from_utf8_lossy(&machine.stdout);
+    assert_eq!(machine_output.lines().count(), 1);
+    let result: serde_json::Value = serde_json::from_str(machine_output.trim()).unwrap();
+    assert_eq!(result["schema_version"], 1);
+    assert_eq!(result["command"], "restore");
+    assert_eq!(result["status"], "success");
+    assert_eq!(result["data"]["state"], "complete");
+    assert_eq!(result["data"]["restored_items"], 2);
+    assert_eq!(result["warnings"], serde_json::json!([]));
+    assert_eq!(result["errors"], serde_json::json!([]));
+    assert!(!machine_output.contains(bundle_text));
+    assert!(!machine_output.contains(document_text));
+    assert!(!machine_output.contains(automation_destination_text));
+    assert!(!machine_output.contains(&"47".repeat(32)));
+}
+
+#[test]
+fn owner_and_automation_can_create_a_verified_copy_without_overwriting_using_only_the_offline_document_locator()
+ {
+    let directory = TestDirectory::new();
+    let (bundle, document) = completed_bundle_and_offline_document(&directory);
+    let bundle_text = bundle.to_str().unwrap();
+    let document_text = document.to_str().unwrap();
+    let owner_copy = directory.path().join("owner-copy.iniza");
+    let owner_copy_text = owner_copy.to_str().unwrap();
+
+    let human = iniza(&[
+        "copy",
+        "--bundle",
+        bundle_text,
+        "--to",
+        owner_copy_text,
+        "--offline-recovery-document",
+        document_text,
+    ]);
+    assert!(
+        human.status.success(),
+        "Verified Copy should succeed: {}",
+        String::from_utf8_lossy(&human.stderr)
+    );
+    assert_eq!(fs::read(&owner_copy).unwrap(), fs::read(&bundle).unwrap());
+    let human_output = String::from_utf8_lossy(&human.stdout);
+    assert!(human_output.contains("Verified Copy created"));
+    assert!(human_output.contains("Recovery Method: Offline"));
+    assert!(!human_output.contains('\u{1b}'));
+    assert!(!human_output.contains(bundle_text));
+    assert!(!human_output.contains(document_text));
+    assert!(!human_output.contains(owner_copy_text));
+    assert!(!human_output.contains(&"47".repeat(32)));
+
+    let before_collision = fs::read(&owner_copy).unwrap();
+    let collision = iniza(&[
+        "copy",
+        "--bundle",
+        bundle_text,
+        "--to",
+        owner_copy_text,
+        "--offline-recovery-document",
+        document_text,
+    ]);
+    assert_eq!(collision.status.code(), Some(50));
+    assert!(String::from_utf8_lossy(&collision.stderr).contains("destination already exists"));
+    assert_eq!(fs::read(&owner_copy).unwrap(), before_collision);
+
+    let automation_copy = directory.path().join("automation-copy.iniza");
+    let automation_copy_text = automation_copy.to_str().unwrap();
+    let machine = iniza(&[
+        "--json",
+        "copy",
+        "--bundle",
+        bundle_text,
+        "--to",
+        automation_copy_text,
+        "--offline-recovery-document",
+        document_text,
+    ]);
+    assert!(
+        machine.status.success(),
+        "machine Verified Copy should succeed: {}",
+        String::from_utf8_lossy(&machine.stderr)
+    );
+    assert!(machine.stderr.is_empty());
+    assert_eq!(
+        fs::read(&automation_copy).unwrap(),
+        fs::read(&bundle).unwrap()
+    );
+    let machine_output = String::from_utf8_lossy(&machine.stdout);
+    assert_eq!(machine_output.lines().count(), 1);
+    let result: serde_json::Value = serde_json::from_str(machine_output.trim()).unwrap();
+    assert_eq!(result["schema_version"], 1);
+    assert_eq!(result["command"], "copy");
+    assert_eq!(result["status"], "success");
+    assert_eq!(result["data"]["verified"], true);
+    assert_eq!(result["warnings"], serde_json::json!([]));
+    assert_eq!(result["errors"], serde_json::json!([]));
+    assert!(!machine_output.contains(bundle_text));
+    assert!(!machine_output.contains(document_text));
+    assert!(!machine_output.contains(automation_copy_text));
+    assert!(!machine_output.contains(&"47".repeat(32)));
+}

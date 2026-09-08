@@ -6,8 +6,8 @@ use iniza::{
     OfflineRecoveryLocator, OfflineRecoveryRehearsalRequest, Plan, PlanApprovalState, PlanEngine,
     ProjectAuditEngine, ProjectAuditRequest, ProtectionCandidateEngine, ProtectionCandidateRequest,
     PublicationPolicy, PushExecutionState, PushPlanApprovalRequest, PushPlanDraftRequest,
-    PushPlanEngine, PushPlanExecutionRequest, ScanRequest, StoredRecoveryMethodEngine,
-    StoredRecoveryMethodRequest, VerifyRequest,
+    PushPlanEngine, PushPlanExecutionRequest, RestoreEngine, RestoreRequest, ScanRequest,
+    StoredRecoveryMethodEngine, StoredRecoveryMethodRequest, VerifiedCopyRequest, VerifyRequest,
 };
 
 fn main() -> ExitCode {
@@ -479,6 +479,82 @@ fn run(
             }
             Ok(ExitCode::SUCCESS)
         }
+        [
+            command,
+            bundle_flag,
+            bundle,
+            destination_flag,
+            destination,
+            recovery_flag,
+            recovery_document,
+        ] if command == "restore"
+            && bundle_flag == "--bundle"
+            && destination_flag == "--to"
+            && recovery_flag == "--offline-recovery-document" =>
+        {
+            print_progress(machine_output, "Restoring authenticated encrypted Bundle");
+            let loaded = StoredRecoveryMethodEngine::local()
+                .load(StoredRecoveryMethodRequest::new(
+                    bundle,
+                    OfflineRecoveryLocator::new(recovery_document),
+                ))
+                .map_err(map_bundle_error)?;
+            let report = RestoreEngine::local()
+                .restore(RestoreRequest::new(
+                    bundle,
+                    destination,
+                    loaded.recovery_secret(),
+                ))
+                .map_err(map_encrypted_restore_error)?;
+            if machine_output {
+                println!("{}", report.machine_json_result());
+            } else {
+                println!("{}", report.human_result());
+                println!("Recovery Method: {:?}", report.recovery_method());
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        [
+            command,
+            bundle_flag,
+            bundle,
+            destination_flag,
+            destination,
+            recovery_flag,
+            recovery_document,
+        ] if command == "copy"
+            && bundle_flag == "--bundle"
+            && destination_flag == "--to"
+            && recovery_flag == "--offline-recovery-document" =>
+        {
+            print_progress(machine_output, "Creating and authenticating Verified Copy");
+            let loaded = StoredRecoveryMethodEngine::local()
+                .load(StoredRecoveryMethodRequest::new(
+                    bundle,
+                    OfflineRecoveryLocator::new(recovery_document),
+                ))
+                .map_err(map_bundle_error)?;
+            let report = BundleEngine::local()
+                .copy_verified(VerifiedCopyRequest::new(
+                    bundle,
+                    destination,
+                    loaded.recovery_secret(),
+                ))
+                .map_err(map_verified_copy_error)?;
+            if machine_output {
+                println!("{}", report.machine_json_result());
+            } else {
+                println!("{}", report.human_summary());
+                println!("Recovery Method: {:?}", loaded.recovery_method());
+                println!("Verified: {}", report.is_verified());
+                println!("Storage location: {:?}", report.storage_location());
+                println!("Durability: {:?}", report.durability());
+                for warning in report.warnings() {
+                    println!("Warning: {warning}");
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
         [command, bundle] if command == "inspect" => {
             let bundle_path = PathBuf::from(bundle);
             print_progress(
@@ -491,7 +567,7 @@ fn run(
             unreachable!("encrypted Bundle inspection is not implemented")
         }
         _ => Err(CliError::Usage(
-            "usage: iniza scan <SOURCE> (--list-protection-candidates | --candidate <ID>... --output-plan <PLAN> | --output-plan <PLAN>) [SCAN OPTIONS] | iniza projects scan --plan <APPROVED_PLAN> [--remote-check] | iniza recovery offline rehearse --bundle <BUNDLE> --document <RECOVERY_DOCUMENT> | iniza verify --bundle <BUNDLE> --offline-recovery-document <RECOVERY_DOCUMENT> | iniza inspect --bundle <BUNDLE> --offline-recovery-document <RECOVERY_DOCUMENT> | iniza plan show --plan <PLAN> | iniza plan validate --plan <PLAN> | iniza plan approve --plan <PLAN> --approved-hash <HASH> | iniza plan diff <OLD> <NEW> | iniza inspect <BUNDLE> | iniza fixture pack --plan <PLAN> --output <PATH.iniza-fixture> | iniza fixture inspect <PATH.iniza-fixture> | iniza fixture restore <PATH.iniza-fixture> --to <NEW_DESTINATION>"
+            "usage: iniza scan <SOURCE> (--list-protection-candidates | --candidate <ID>... --output-plan <PLAN> | --output-plan <PLAN>) [SCAN OPTIONS] | iniza projects scan --plan <APPROVED_PLAN> [--remote-check] | iniza recovery offline rehearse --bundle <BUNDLE> --document <RECOVERY_DOCUMENT> | iniza verify --bundle <BUNDLE> --offline-recovery-document <RECOVERY_DOCUMENT> | iniza inspect --bundle <BUNDLE> --offline-recovery-document <RECOVERY_DOCUMENT> | iniza copy --bundle <BUNDLE> --to <NEW_BUNDLE> --offline-recovery-document <RECOVERY_DOCUMENT> | iniza restore --bundle <BUNDLE> --to <NEW_DESTINATION> --offline-recovery-document <RECOVERY_DOCUMENT> | iniza plan show --plan <PLAN> | iniza plan validate --plan <PLAN> | iniza plan approve --plan <PLAN> --approved-hash <HASH> | iniza plan diff <OLD> <NEW> | iniza inspect <BUNDLE> | iniza fixture pack --plan <PLAN> --output <PATH.iniza-fixture> | iniza fixture inspect <PATH.iniza-fixture> | iniza fixture restore <PATH.iniza-fixture> --to <NEW_DESTINATION>"
                 .to_owned(),
         )),
     }
@@ -1104,6 +1180,28 @@ fn map_restore_error(error: CoreError) -> CliError {
 
 fn map_bundle_error(error: CoreError) -> CliError {
     match error {
+        CoreError::AuthenticationFailed
+        | CoreError::BundleIncomplete(_)
+        | CoreError::BundleInvalid(_)
+        | CoreError::TestFixtureIsNotBundle(_) => CliError::BundleInvalid(error.to_string()),
+        _ => CliError::Operation(error.to_string()),
+    }
+}
+
+fn map_encrypted_restore_error(error: CoreError) -> CliError {
+    match error {
+        CoreError::DestinationAlreadyExists(_) => CliError::Conflict(error.to_string()),
+        CoreError::AuthenticationFailed
+        | CoreError::BundleIncomplete(_)
+        | CoreError::BundleInvalid(_)
+        | CoreError::TestFixtureIsNotBundle(_) => CliError::BundleInvalid(error.to_string()),
+        _ => CliError::Operation(error.to_string()),
+    }
+}
+
+fn map_verified_copy_error(error: CoreError) -> CliError {
+    match error {
+        CoreError::DestinationAlreadyExists(_) => CliError::Conflict(error.to_string()),
         CoreError::AuthenticationFailed
         | CoreError::BundleIncomplete(_)
         | CoreError::BundleInvalid(_)
