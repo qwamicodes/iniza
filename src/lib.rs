@@ -20,6 +20,7 @@ mod readiness_evidence;
 mod restore;
 mod restore_fs;
 mod stored_recovery_method;
+mod synthetic_migration_rehearsal;
 mod vaultwarden_recovery;
 
 pub use bundle::{
@@ -97,6 +98,10 @@ pub use restore::{
 pub use stored_recovery_method::{
     LoadedRecoveryMethod, OfflineRecoveryLocator, StoredRecoveryMethodEngine,
     StoredRecoveryMethodLocator, StoredRecoveryMethodRequest, VaultwardenRecoveryLocator,
+};
+pub use synthetic_migration_rehearsal::{
+    SyntheticMigrationRehearsalEngine, SyntheticMigrationRehearsalReport,
+    SyntheticMigrationRehearsalRequest,
 };
 pub use vaultwarden_recovery::{
     BitwardenCommandLine, BitwardenInstallationObservation, BitwardenRecoveryNote,

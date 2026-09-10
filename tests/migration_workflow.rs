@@ -10,8 +10,10 @@ use iniza::{
     CoreError, MigrationCaptureOwnerReview, MigrationCaptureRequest, MigrationCaptureState,
     MigrationWorkflowEngine, OfflineRecoveryPersistenceTransition, OfflineRecoveryStorage,
     PackCancellation, PlanEngine, RecoveryMethod, RecoverySecret, ScanRequest,
+    SyntheticMigrationRehearsalEngine, SyntheticMigrationRehearsalRequest,
     VaultwardenInstallationReport, VaultwardenInstallationRequest, VaultwardenItemIdentifier,
-    VaultwardenPreflightReport,
+    VaultwardenPreflightReport, VerifiedCopyDurability, VerifiedCopyPersistence,
+    VerifiedCopyPersistenceTransition, VerifiedCopyStorageLocation,
 };
 use zeroize::Zeroizing;
 
@@ -42,7 +44,7 @@ impl Drop for TestDirectory {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 struct SyntheticRemovableStorage;
 
 impl OfflineRecoveryStorage for SyntheticRemovableStorage {
@@ -342,6 +344,99 @@ fn owner_can_pause_and_resume_pack_only_inside_the_same_live_capture_engine() {
         completed.offline_receipt().bundle_identity(),
         completed.vaultwarden_receipt().bundle_identity()
     );
+}
+
+#[derive(Debug)]
+struct ClassifiedCopyStorage(VerifiedCopyStorageLocation);
+
+impl VerifiedCopyPersistence for ClassifiedCopyStorage {
+    fn prepare_transition(&self, _transition: VerifiedCopyPersistenceTransition) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn durability(&self) -> VerifiedCopyDurability {
+        VerifiedCopyDurability::Durable
+    }
+
+    fn storage_location(
+        &self,
+        _source: &Path,
+        _destination: &Path,
+    ) -> io::Result<VerifiedCopyStorageLocation> {
+        Ok(self.0)
+    }
+}
+
+#[test]
+fn complete_rehearsal_creates_two_verified_copies_and_resumes_an_exact_restore() {
+    let directory = TestDirectory::new();
+    let rehearsal_root = directory.path().join("complete-rehearsal");
+    let bitwarden = SyntheticBitwarden::default();
+    let engine = SyntheticMigrationRehearsalEngine::with_boundaries(
+        bitwarden,
+        SyntheticRemovableStorage,
+        ClassifiedCopyStorage(VerifiedCopyStorageLocation::ExternalStorage),
+        ClassifiedCopyStorage(VerifiedCopyStorageLocation::ICloudDrive),
+    );
+
+    let report = engine
+        .run(SyntheticMigrationRehearsalRequest::new(
+            &rehearsal_root,
+            VaultwardenInstallationRequest::explicit("/synthetic/trusted/bw"),
+            &ExactOwnerReview,
+        ))
+        .unwrap();
+
+    assert_eq!(report.capture().state(), MigrationCaptureState::Complete);
+    assert!(report.external_copy().is_verified());
+    assert_eq!(
+        report.external_copy().storage_location(),
+        VerifiedCopyStorageLocation::ExternalStorage
+    );
+    assert!(report.cloud_copy().is_verified());
+    assert_eq!(
+        report.cloud_copy().storage_location(),
+        VerifiedCopyStorageLocation::ICloudDrive
+    );
+    assert_ne!(
+        report.external_copy().destination_evidence_identity(),
+        report.cloud_copy().destination_evidence_identity()
+    );
+    assert!(report.restore_was_resumed());
+    assert!(report.exact_comparison_passed());
+    assert_eq!(
+        fs::read(
+            rehearsal_root
+                .join("restored")
+                .join("developer-config")
+                .join("shell-settings.txt")
+        )
+        .unwrap(),
+        b"synthetic shell settings\n"
+    );
+    assert!(!rehearsal_root.join("restored/.iniza-restore").exists());
+
+    let human = report.human_summary();
+    assert!(human.contains("two Verified Copies"));
+    assert!(human.contains("Restore Rehearsal"));
+    assert!(human.contains("does not authorize real source capture"));
+    assert!(human.contains("does not decide whether this machine is safe to erase"));
+    assert!(!human.contains("\u{1b}["));
+
+    let machine: serde_json::Value = serde_json::from_str(&report.machine_json_result()).unwrap();
+    assert_eq!(machine["schema_version"], 1);
+    assert_eq!(machine["command"], "migration rehearse");
+    assert_eq!(machine["status"], "success");
+    assert_eq!(machine["data"]["verified_copies"], 2);
+    assert_eq!(machine["data"]["restore_resumed"], true);
+    assert_eq!(machine["data"]["exact_comparison_passed"], true);
+    assert_eq!(machine["data"]["real_source_capture_authorized"], false);
+    assert_eq!(machine["data"]["safe_to_erase"], false);
+
+    let output = format!("{report:?}\n{human}\n{}", report.machine_json_result());
+    assert!(!output.contains(&rehearsal_root.display().to_string()));
+    assert!(!output.contains("synthetic shell settings"));
+    assert!(!output.contains("recovery_secret"));
 }
 
 fn decode_secret(encoded: &str) -> [u8; 32] {
