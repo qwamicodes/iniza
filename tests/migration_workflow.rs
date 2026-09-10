@@ -409,6 +409,9 @@ fn complete_rehearsal_creates_two_verified_copies_and_resumes_an_exact_restore()
     );
     assert!(report.restore_was_resumed());
     assert!(report.exact_comparison_passed());
+    assert_eq!(report.audited_project_count(), 2);
+    assert!(report.project_capsule_is_restorable());
+    assert!(report.project_state_matrix_passed());
     assert!(report.receipt_invalidation_was_detected());
     assert_eq!(
         report.readiness_status().state(),
@@ -476,6 +479,7 @@ fn complete_rehearsal_creates_two_verified_copies_and_resumes_an_exact_restore()
     let human = report.human_summary();
     assert!(human.contains("two Verified Copies"));
     assert!(human.contains("Restore Rehearsal"));
+    assert!(human.contains("Project Capsule"));
     assert!(human.contains("append-only Readiness Evidence"));
     assert!(human.contains("Owner Attestations remain unconfirmed"));
     assert!(human.contains("does not authorize real source capture"));
@@ -488,6 +492,9 @@ fn complete_rehearsal_creates_two_verified_copies_and_resumes_an_exact_restore()
     assert_eq!(machine["status"], "success");
     assert_eq!(machine["data"]["verified_copies"], 2);
     assert_eq!(machine["data"]["restore_resumed"], true);
+    assert_eq!(machine["data"]["audited_projects"], 2);
+    assert_eq!(machine["data"]["project_capsules_restorable"], 1);
+    assert_eq!(machine["data"]["project_state_matrix_passed"], true);
     assert_eq!(machine["data"]["exact_comparison_passed"], true);
     assert_eq!(machine["data"]["not_protected_items"], 3);
     assert_eq!(machine["data"]["must_protect_gaps"], 0);
