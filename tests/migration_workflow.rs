@@ -6,11 +6,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use iniza::{
     BitwardenCommandLine, BitwardenInstallationObservation, BitwardenRecoveryNote,
-    BitwardenRetrievedRecoveryNote, BitwardenVaultObservation, CoreError,
-    MigrationCaptureOwnerReview, MigrationCaptureRequest, MigrationCaptureState,
+    BitwardenRetrievedRecoveryNote, BitwardenVaultObservation, BundleEvent, BundleEventSink,
+    CoreError, MigrationCaptureOwnerReview, MigrationCaptureRequest, MigrationCaptureState,
     MigrationWorkflowEngine, OfflineRecoveryPersistenceTransition, OfflineRecoveryStorage,
-    PlanEngine, RecoveryMethod, RecoverySecret, ScanRequest, VaultwardenInstallationReport,
-    VaultwardenInstallationRequest, VaultwardenItemIdentifier, VaultwardenPreflightReport,
+    PackCancellation, PlanEngine, RecoveryMethod, RecoverySecret, ScanRequest,
+    VaultwardenInstallationReport, VaultwardenInstallationRequest, VaultwardenItemIdentifier,
+    VaultwardenPreflightReport,
 };
 use zeroize::Zeroizing;
 
@@ -89,6 +90,10 @@ impl SyntheticBitwarden {
             "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
         )
         .unwrap()
+    }
+
+    fn has_recovery_note(&self) -> bool {
+        self.note.lock().unwrap().is_some()
     }
 }
 
@@ -170,6 +175,18 @@ impl MigrationCaptureOwnerReview for ExactOwnerReview {
         report: &VaultwardenPreflightReport,
     ) -> Result<String, CoreError> {
         Ok(report.review_hash().to_owned())
+    }
+}
+
+struct StopAfterFirstCapturedItem<'a> {
+    cancellation: &'a PackCancellation,
+}
+
+impl BundleEventSink for StopAfterFirstCapturedItem<'_> {
+    fn emit(&mut self, event: BundleEvent) {
+        if matches!(event, BundleEvent::ItemCaptured { .. }) {
+            self.cancellation.request_stop();
+        }
     }
 }
 
@@ -255,6 +272,76 @@ fn owner_can_capture_and_independently_verify_both_recovery_methods_before_succe
     assert!(!output.contains(&source.display().to_string()));
     assert!(!output.contains(&offline_document.display().to_string()));
     assert!(!output.contains("recovery_secret"));
+}
+
+#[test]
+fn owner_can_pause_and_resume_pack_only_inside_the_same_live_capture_engine() {
+    let directory = TestDirectory::new();
+    let source = directory.path().join("source");
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("first.txt"), b"first protected value\n").unwrap();
+    fs::write(source.join("second.txt"), b"second protected value\n").unwrap();
+
+    let mut plan = PlanEngine::local()
+        .scan(ScanRequest::for_directory(&source))
+        .unwrap();
+    let plan_hash = plan.approval_hash().unwrap();
+    plan.approve(&plan_hash).unwrap();
+
+    let bundle = directory.path().join("migration.iniza");
+    let offline_document = directory.path().join("migration.iniza-recovery");
+    let bitwarden = SyntheticBitwarden::default();
+    let workflow =
+        MigrationWorkflowEngine::with_boundaries(bitwarden.clone(), SyntheticRemovableStorage);
+    let cancellation = PackCancellation::default();
+    let mut events = StopAfterFirstCapturedItem {
+        cancellation: &cancellation,
+    };
+
+    let paused = workflow
+        .capture(
+            MigrationCaptureRequest::new(
+                &plan,
+                &bundle,
+                &offline_document,
+                "Paused synthetic migration",
+                VaultwardenInstallationRequest::explicit("/synthetic/trusted/bw"),
+                &ExactOwnerReview,
+            )
+            .with_pack_cancellation(&cancellation)
+            .with_pack_event_sink(&mut events),
+        )
+        .unwrap();
+
+    assert_eq!(paused.state(), MigrationCaptureState::Paused);
+    assert!(!bundle.exists());
+    assert!(!offline_document.exists());
+    assert!(!bitwarden.has_recovery_note());
+    assert!(paused.human_summary().contains("same live process"));
+    assert!(!format!("{paused:?}").contains("recovery_secret"));
+
+    let completed = workflow
+        .capture(
+            MigrationCaptureRequest::new(
+                &plan,
+                &bundle,
+                &offline_document,
+                "Paused synthetic migration",
+                VaultwardenInstallationRequest::explicit("/synthetic/trusted/bw"),
+                &ExactOwnerReview,
+            )
+            .resume_paused_pack(),
+        )
+        .unwrap();
+
+    assert_eq!(completed.state(), MigrationCaptureState::Complete);
+    assert!(bundle.is_file());
+    assert!(offline_document.is_file());
+    assert!(bitwarden.has_recovery_note());
+    assert_eq!(
+        completed.offline_receipt().bundle_identity(),
+        completed.vaultwarden_receipt().bundle_identity()
+    );
 }
 
 fn decode_secret(encoded: &str) -> [u8; 32] {
