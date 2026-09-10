@@ -7,13 +7,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use iniza::{
     BitwardenCommandLine, BitwardenInstallationObservation, BitwardenRecoveryNote,
     BitwardenRetrievedRecoveryNote, BitwardenVaultObservation, BundleEvent, BundleEventSink,
-    CoreError, MigrationCaptureOwnerReview, MigrationCaptureRequest, MigrationCaptureState,
-    MigrationWorkflowEngine, OfflineRecoveryPersistenceTransition, OfflineRecoveryStorage,
-    PackCancellation, PlanEngine, RecoveryMethod, RecoverySecret, ScanRequest,
-    SyntheticMigrationRehearsalEngine, SyntheticMigrationRehearsalRequest,
-    VaultwardenInstallationReport, VaultwardenInstallationRequest, VaultwardenItemIdentifier,
-    VaultwardenPreflightReport, VerifiedCopyDurability, VerifiedCopyPersistence,
-    VerifiedCopyPersistenceTransition, VerifiedCopyStorageLocation,
+    CoreError, Disposition, MigrationCaptureOwnerReview, MigrationCaptureRequest,
+    MigrationCaptureState, MigrationWorkflowEngine, OfflineRecoveryPersistenceTransition,
+    OfflineRecoveryStorage, PackCancellation, PlanEngine, ProtectionRequirement, RecoveryMethod,
+    RecoverySecret, ScanRequest, SyntheticMigrationRehearsalEngine,
+    SyntheticMigrationRehearsalRequest, VaultwardenInstallationReport,
+    VaultwardenInstallationRequest, VaultwardenItemIdentifier, VaultwardenPreflightReport,
+    VerifiedCopyDurability, VerifiedCopyPersistence, VerifiedCopyPersistenceTransition,
+    VerifiedCopyStorageLocation,
 };
 use zeroize::Zeroizing;
 
@@ -404,6 +405,28 @@ fn complete_rehearsal_creates_two_verified_copies_and_resumes_an_exact_restore()
     );
     assert!(report.restore_was_resumed());
     assert!(report.exact_comparison_passed());
+    let not_protected = report.not_protected_report();
+    assert!(!not_protected.has_must_protect_gap());
+    assert!(not_protected.entries().iter().any(|entry| {
+        entry.relative_path() == Path::new("generated.cache")
+            && entry.disposition() == Disposition::Excluded
+            && entry.protection_requirement() == ProtectionRequirement::Optional
+    }));
+    assert!(not_protected.entries().iter().any(|entry| {
+        entry.relative_path() == Path::new("review-needed-link")
+            && entry.disposition() == Disposition::RequiresReview
+            && entry.protection_requirement() == ProtectionRequirement::Optional
+    }));
+    assert!(not_protected.entries().iter().any(|entry| {
+        entry.relative_path() == Path::new("optional-worker.pipe")
+            && entry.disposition() == Disposition::Unsupported
+            && entry.protection_requirement() == ProtectionRequirement::Optional
+    }));
+    assert!(
+        not_protected
+            .report_identity()
+            .starts_with("not_protected_blake3_")
+    );
     assert_eq!(
         fs::read(
             rehearsal_root
@@ -430,6 +453,8 @@ fn complete_rehearsal_creates_two_verified_copies_and_resumes_an_exact_restore()
     assert_eq!(machine["data"]["verified_copies"], 2);
     assert_eq!(machine["data"]["restore_resumed"], true);
     assert_eq!(machine["data"]["exact_comparison_passed"], true);
+    assert_eq!(machine["data"]["not_protected_items"], 3);
+    assert_eq!(machine["data"]["must_protect_gaps"], 0);
     assert_eq!(machine["data"]["real_source_capture_authorized"], false);
     assert_eq!(machine["data"]["safe_to_erase"], false);
 

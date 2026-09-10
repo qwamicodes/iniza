@@ -8,7 +8,7 @@ use serde_json::json;
 use crate::{
     BitwardenCommandLine, BundleEngine, CoreError, MigrationCaptureOwnerReview,
     MigrationCaptureReport, MigrationCaptureRequest, MigrationCaptureState,
-    MigrationWorkflowEngine, OfflineRecoveryEngine, OfflineRecoveryLoadRequest,
+    MigrationWorkflowEngine, NotProtectedReport, OfflineRecoveryEngine, OfflineRecoveryLoadRequest,
     OfflineRecoveryStorage, PlanEngine, RestoreCancellation, RestoreEngine, RestoreEvent,
     RestoreEventSink, RestoreReport, RestoreRequest, RestoreState, ScanRequest,
     VaultwardenInstallationRequest, VerifiedCopyPersistence, VerifiedCopyReport,
@@ -46,6 +46,7 @@ pub struct SyntheticMigrationRehearsalReport {
     restore: RestoreReport,
     restore_was_resumed: bool,
     exact_comparison_passed: bool,
+    not_protected_report: NotProtectedReport,
 }
 
 impl SyntheticMigrationRehearsalReport {
@@ -73,6 +74,10 @@ impl SyntheticMigrationRehearsalReport {
         self.exact_comparison_passed
     }
 
+    pub fn not_protected_report(&self) -> &NotProtectedReport {
+        &self.not_protected_report
+    }
+
     pub fn human_summary(&self) -> &'static str {
         "Synthetic migration rehearsal authenticated the Bundle through both Recovery Methods, created two Verified Copies, and completed an interrupted and resumed Restore Rehearsal with exact comparison. This result does not authorize real source capture and does not decide whether this machine is safe to erase."
     }
@@ -88,6 +93,8 @@ impl SyntheticMigrationRehearsalReport {
                 "verified_copies": 2,
                 "restore_resumed": self.restore_was_resumed,
                 "exact_comparison_passed": self.exact_comparison_passed,
+                "not_protected_items": self.not_protected_report.entries().len(),
+                "must_protect_gaps": self.not_protected_report.must_protect_gap_count(),
                 "real_source_capture_authorized": false,
                 "safe_to_erase": false,
             },
@@ -146,8 +153,54 @@ where
             SHELL_SETTINGS,
         )?;
         write_fixture(&source.join("ordinary-binary.bin"), ORDINARY_BINARY)?;
+        write_fixture(&source.join("generated.cache"), b"regenerable cache\n")?;
+        write_fixture(
+            &source.join("account-synced-app-state"),
+            b"optional duplicated account state\n",
+        )?;
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("ordinary-binary.bin", source.join("review-needed-link"))
+            .map_err(|source_error| CoreError::Io {
+                action: "create synthetic review-required symbolic link",
+                path: source.join("review-needed-link"),
+                source: source_error,
+            })?;
+        #[cfg(unix)]
+        create_synthetic_unsupported_entry(&source.join("optional-worker.pipe"))?;
 
-        let mut plan = PlanEngine::local().scan(ScanRequest::for_directory(&source))?;
+        let mut inventory_scan = ScanRequest::for_directory(&source)
+            .exclude("generated.cache")
+            .mark_optional("generated.cache")
+            .mark_optional("account-synced-app-state");
+        #[cfg(unix)]
+        {
+            inventory_scan = inventory_scan
+                .mark_optional("review-needed-link")
+                .mark_optional("optional-worker.pipe");
+        }
+        let inventory_plan = PlanEngine::local().scan(inventory_scan)?;
+        let not_protected_report = NotProtectedReport::from_plan(&inventory_plan);
+        #[cfg(unix)]
+        fs::remove_file(source.join("optional-worker.pipe")).map_err(|source_error| {
+            CoreError::Io {
+                action: "remove disposable unsupported entry before safe capture",
+                path: source.join("optional-worker.pipe"),
+                source: source_error,
+            }
+        })?;
+
+        let mut capture_scan = ScanRequest::for_directory(&source)
+            .exclude("generated.cache")
+            .mark_optional("generated.cache")
+            .mark_optional("account-synced-app-state");
+        #[cfg(unix)]
+        {
+            capture_scan = capture_scan
+                .mark_optional("review-needed-link")
+                .exclude("optional-worker.pipe")
+                .mark_optional("optional-worker.pipe");
+        }
+        let mut plan = PlanEngine::local().scan(capture_scan)?;
         let reviewed_plan_hash = plan.approval_hash()?;
         plan.approve(&reviewed_plan_hash)?;
 
@@ -261,6 +314,7 @@ where
             restore,
             restore_was_resumed: true,
             exact_comparison_passed,
+            not_protected_report,
         })
     }
 }
@@ -298,6 +352,27 @@ fn read_fixture(path: &Path) -> Result<Vec<u8>, CoreError> {
         path: path.to_path_buf(),
         source,
     })
+}
+
+#[cfg(unix)]
+fn create_synthetic_unsupported_entry(destination: &Path) -> Result<(), CoreError> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let encoded = CString::new(destination.as_os_str().as_bytes()).map_err(|_| {
+        CoreError::BundleInvalid("synthetic unsupported-entry path contains a null byte".to_owned())
+    })?;
+    // SAFETY: `encoded` is a valid, null-terminated path and the mode contains
+    // only ordinary permission bits. The created first-in-first-out node is
+    // isolated beneath the disposable rehearsal root.
+    if unsafe { libc::mkfifo(encoded.as_ptr(), 0o600) } != 0 {
+        return Err(CoreError::Io {
+            action: "create synthetic unsupported first-in-first-out node",
+            path: destination.to_path_buf(),
+            source: std::io::Error::last_os_error(),
+        });
+    }
+    Ok(())
 }
 
 struct CancelWhenStagingValidated {

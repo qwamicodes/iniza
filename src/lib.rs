@@ -7,6 +7,7 @@ use std::path::{Component, Path, PathBuf};
 mod bundle;
 mod iz1;
 mod migration_workflow;
+mod not_protected_report;
 mod offline_recovery;
 mod plan_comparison;
 mod plan_document;
@@ -40,6 +41,7 @@ pub use migration_workflow::{
     MigrationCaptureOwnerReview, MigrationCaptureReport, MigrationCaptureRequest,
     MigrationCaptureState, MigrationWorkflowEngine,
 };
+pub use not_protected_report::{NotProtectedEntry, NotProtectedReport};
 pub use offline_recovery::{
     LoadedOfflineRecoveryKey, LocalOfflineRecoveryStorage, OfflineRecoveryDocumentReport,
     OfflineRecoveryEngine, OfflineRecoveryLoadRequest, OfflineRecoveryPersistenceTransition,
