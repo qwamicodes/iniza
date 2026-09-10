@@ -6,6 +6,7 @@ use std::path::{Component, Path, PathBuf};
 
 mod bundle;
 mod iz1;
+mod migration_workflow;
 mod offline_recovery;
 mod plan_comparison;
 mod plan_document;
@@ -33,6 +34,10 @@ pub use bundle::{
 };
 pub use iz1::{
     AuthenticatedBundleSummary, Iz1Prototype, RecoveryMethod, RecoverySecret, SealedBundle,
+};
+pub use migration_workflow::{
+    MigrationCaptureOwnerReview, MigrationCaptureReport, MigrationCaptureRequest,
+    MigrationCaptureState, MigrationWorkflowEngine,
 };
 pub use offline_recovery::{
     LoadedOfflineRecoveryKey, LocalOfflineRecoveryStorage, OfflineRecoveryDocumentReport,

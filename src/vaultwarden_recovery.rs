@@ -219,6 +219,14 @@ impl BitwardenRecoveryNote<'_> {
     pub fn recovery_method(&self) -> RecoveryMethod {
         self.recovery_secret.method()
     }
+
+    /// Encodes the Recovery Secret only for a reviewed external storage adapter.
+    ///
+    /// The returned allocation is zeroized when dropped. Human and machine
+    /// output must never include this value.
+    pub fn recovery_secret_hex_for_storage(&self) -> Zeroizing<String> {
+        recovery_secret_hex(self.recovery_secret)
+    }
 }
 
 impl fmt::Debug for BitwardenRecoveryNote<'_> {
@@ -393,7 +401,7 @@ impl BitwardenCommandLine for InstalledBitwarden {
                 "Unlock the official Bitwarden command-line client outside Iniza, then retry. Iniza never asks for your Vaultwarden master password.",
             )
         })?;
-        let secret_hex = recovery_secret_hex(note.recovery_secret);
+        let secret_hex = note.recovery_secret_hex_for_storage();
         let mut fields = vec![
             ExactBitwardenField::text("iniza_bundle_id", note.bundle_identity),
             ExactBitwardenField::text("iniza_format", note.bundle_format),
