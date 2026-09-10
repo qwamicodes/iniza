@@ -250,6 +250,20 @@ fn exact_vaultwarden_secure_note_is_retrieved_and_authenticates_the_completed_bu
             .item_name()
             .starts_with("Iniza Recovery — Owner migration — ")
     );
+    let preflight_summary = preflight.human_summary();
+    assert!(preflight_summary.contains("https://vaultwarden.example.test"));
+    assert!(preflight_summary.contains(preflight.server_identity_hash()));
+    assert!(preflight_summary.contains(preflight.item_name()));
+    assert!(preflight_summary.contains(preflight.bundle_identity()));
+    assert!(preflight_summary.contains("IZ2/IZ1"));
+    assert!(preflight_summary.contains("verified external Bundle copy"));
+    assert!(preflight_summary.contains(preflight.review_hash()));
+    assert!(
+        preflight_summary.contains(
+            "Creating this Secure Note changes the reviewed external Vaultwarden service."
+        )
+    );
+    assert!(!preflight_summary.contains("\u{1b}["));
 
     let report = engine
         .store_and_rehearse(VaultwardenStoreRequest::new(
@@ -303,11 +317,12 @@ fn exact_vaultwarden_secure_note_is_retrieved_and_authenticates_the_completed_bu
         "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
     ];
     let visible = format!(
-        "{:?}\n{}\n{}\n{:?}\n{}\n{}",
+        "{:?}\n{}\n{}\n{:?}\n{}\n{}\n{}",
         installation,
         installation.human_summary(),
         installation.machine_json_result(),
         preflight,
+        preflight.human_summary(),
         preflight.machine_json_result(),
         report.machine_json_result(),
     );

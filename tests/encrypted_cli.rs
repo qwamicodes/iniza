@@ -99,6 +99,118 @@ fn completed_bundle_and_offline_document(directory: &TestDirectory) -> (PathBuf,
 }
 
 #[test]
+fn pack_dry_run_validates_the_complete_request_without_reading_or_writing_protected_state() {
+    let directory = TestDirectory::new();
+    let source = directory.path().join("source");
+    fs::create_dir(&source).unwrap();
+    fs::write(
+        source.join("settings.txt"),
+        b"synthetic protected settings\n",
+    )
+    .unwrap();
+    let mut plan = PlanEngine::local()
+        .scan(ScanRequest::for_directory(&source))
+        .unwrap();
+    let reviewed_hash = plan.approval_hash().unwrap();
+    plan.approve(&reviewed_hash).unwrap();
+    let plan_path = directory.path().join("approved-plan.toml");
+    plan.write_to(&plan_path).unwrap();
+    let bundle = directory.path().join("migration.iniza");
+    let recovery_document = directory.path().join("separate.iniza-recovery");
+
+    let output = iniza(&[
+        "--json",
+        "pack",
+        "--plan",
+        plan_path.to_str().unwrap(),
+        "--output",
+        bundle.to_str().unwrap(),
+        "--name",
+        "Synthetic command-line migration",
+        "--bitwarden",
+        "--offline-recovery",
+        recovery_document.to_str().unwrap(),
+        "--dry-run",
+    ]);
+
+    assert!(
+        output.status.success(),
+        "Pack dry run should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    assert!(!bundle.exists());
+    assert!(!recovery_document.exists());
+    let standard_output = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(standard_output.lines().count(), 1);
+    assert!(!standard_output.contains("synthetic protected settings"));
+    assert!(!standard_output.contains(&source.display().to_string()));
+    let result: serde_json::Value = serde_json::from_str(standard_output.trim()).unwrap();
+    assert_eq!(result["schema_version"], 1);
+    assert_eq!(result["command"], "pack");
+    assert_eq!(result["status"], "success");
+    assert_eq!(result["data"]["dry_run"], true);
+    assert_eq!(result["data"]["plan_approval"], "approved");
+    assert_eq!(result["data"]["recovery_methods"], 2);
+    assert_eq!(result["data"]["would_contact_vaultwarden"], false);
+    assert_eq!(result["data"]["would_create_artifacts"], false);
+}
+
+#[test]
+fn machine_pack_refuses_interactive_owner_review_before_creating_artifacts() {
+    let directory = TestDirectory::new();
+    let source = directory.path().join("source");
+    fs::create_dir(&source).unwrap();
+    fs::write(
+        source.join("settings.txt"),
+        b"synthetic protected settings\n",
+    )
+    .unwrap();
+    let mut plan = PlanEngine::local()
+        .scan(ScanRequest::for_directory(&source))
+        .unwrap();
+    let reviewed_hash = plan.approval_hash().unwrap();
+    plan.approve(&reviewed_hash).unwrap();
+    let plan_path = directory.path().join("approved-plan.toml");
+    plan.write_to(&plan_path).unwrap();
+    let bundle = directory.path().join("migration.iniza");
+    let recovery_document = directory.path().join("separate.iniza-recovery");
+
+    let output = iniza(&[
+        "--json",
+        "pack",
+        "--plan",
+        plan_path.to_str().unwrap(),
+        "--output",
+        bundle.to_str().unwrap(),
+        "--name",
+        "Synthetic command-line migration",
+        "--bitwarden",
+        "--offline-recovery",
+        recovery_document.to_str().unwrap(),
+    ]);
+
+    assert_eq!(output.status.code(), Some(10));
+    assert!(output.stderr.is_empty());
+    assert!(!bundle.exists());
+    assert!(!recovery_document.exists());
+    let standard_output = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(standard_output.lines().count(), 1);
+    assert!(!standard_output.contains("synthetic protected settings"));
+    assert!(!standard_output.contains(&source.display().to_string()));
+    let result: serde_json::Value = serde_json::from_str(standard_output.trim()).unwrap();
+    assert_eq!(result["command"], "pack");
+    assert_eq!(result["status"], "error");
+    assert_eq!(result["errors"][0]["code"], "INIZA-E010");
+    assert!(
+        result["errors"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("interactive owner review")
+    );
+}
+
+#[test]
 fn owner_and_automation_can_fully_verify_a_bundle_using_only_the_offline_document_locator() {
     let directory = TestDirectory::new();
     let (bundle, document) = completed_bundle_and_offline_document(&directory);

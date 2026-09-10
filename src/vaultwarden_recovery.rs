@@ -659,6 +659,22 @@ impl VaultwardenPreflightReport {
         &self.review_hash
     }
 
+    pub fn human_summary(&self) -> String {
+        let location = self.location_hint.as_deref().unwrap_or("not provided");
+        format!(
+            "Vaultwarden Recovery Method preflight\nServer: {}\nServer identity hash: {}\nVault state: {}\nSecure Note name: {}\nBundle identity: {}\nBundle format: {}\nBundle created at: {}\nLocation hint: {}\nPreflight review hash: {}\nWarning: Creating this Secure Note changes the reviewed external Vaultwarden service.",
+            self.server_origin,
+            self.server_identity_hash,
+            self.vault_state,
+            self.item_name,
+            self.bundle_identity,
+            self.bundle_format,
+            self.created_at,
+            location,
+            self.review_hash,
+        )
+    }
+
     pub fn machine_json_result(&self) -> String {
         json!({
             "schema_version": 1,

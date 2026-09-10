@@ -25,7 +25,7 @@ impl OfflineRecoveryLocator {
 pub struct VaultwardenRecoveryLocator {
     item_identifier: VaultwardenItemIdentifier,
     expected_server_identity_hash: String,
-    installation: VaultwardenInstallationReport,
+    installation: Box<VaultwardenInstallationReport>,
     reviewed_installation_hash: String,
 }
 
@@ -39,7 +39,7 @@ impl VaultwardenRecoveryLocator {
         Self {
             item_identifier,
             expected_server_identity_hash: expected_server_identity_hash.into(),
-            installation,
+            installation: Box::new(installation),
             reviewed_installation_hash: reviewed_installation_hash.into(),
         }
     }

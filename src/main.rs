@@ -1,22 +1,27 @@
+use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use iniza::{
-    BundleEngine, CoreError, InizaCore, InspectRequest, OfflineRecoveryEngine,
+    BundleEngine, CoreError, InizaCore, InspectRequest, MigrationCaptureOwnerReview,
+    MigrationCaptureRequest, MigrationCaptureState, MigrationWorkflowEngine, OfflineRecoveryEngine,
     OfflineRecoveryLocator, OfflineRecoveryRehearsalRequest, Plan, PlanApprovalState, PlanEngine,
     ProjectAuditEngine, ProjectAuditRequest, ProtectionCandidateEngine, ProtectionCandidateRequest,
     PublicationPolicy, PushExecutionState, PushPlanApprovalRequest, PushPlanDraftRequest,
     PushPlanEngine, PushPlanExecutionRequest, RestoreEngine, RestoreRequest, ScanRequest,
-    StoredRecoveryMethodEngine, StoredRecoveryMethodRequest, VerifiedCopyRequest, VerifyRequest,
+    StoredRecoveryMethodEngine, StoredRecoveryMethodRequest, VaultwardenInstallationReport,
+    VaultwardenInstallationRequest, VaultwardenPreflightReport, VerifiedCopyRequest, VerifyRequest,
 };
 
 fn main() -> ExitCode {
     let mut arguments: Vec<String> = std::env::args().skip(1).collect();
     let machine_output = remove_global_flag(&mut arguments, "--json");
     let json_events = remove_global_flag(&mut arguments, "--json-events");
+    let non_interactive = remove_global_flag(&mut arguments, "--non-interactive");
+    remove_global_flag(&mut arguments, "--no-color");
     let command_name = machine_command_name(&arguments);
 
-    match run(arguments, machine_output, json_events) {
+    match run(arguments, machine_output, json_events, non_interactive) {
         Ok(exit_code) => exit_code,
         Err(error) => {
             if machine_output {
@@ -33,6 +38,7 @@ fn run(
     arguments: Vec<String>,
     machine_output: bool,
     json_events: bool,
+    non_interactive: bool,
 ) -> Result<ExitCode, CliError> {
     match arguments.as_slice() {
         [command, scan_arguments @ ..] if command == "scan" => {
@@ -388,6 +394,9 @@ fn run(
             }
             Ok(ExitCode::SUCCESS)
         }
+        [command, pack_arguments @ ..] if command == "pack" => {
+            run_pack(pack_arguments, machine_output, non_interactive)
+        }
         [command, bundle_flag, bundle, recovery_flag, recovery_document]
             if command == "verify"
                 && bundle_flag == "--bundle"
@@ -571,6 +580,245 @@ fn run(
                 .to_owned(),
         )),
     }
+}
+
+fn run_pack(
+    arguments: &[String],
+    machine_output: bool,
+    non_interactive: bool,
+) -> Result<ExitCode, CliError> {
+    let mut plan_path = None;
+    let mut output = None;
+    let mut friendly_name = None;
+    let mut offline_recovery = None;
+    let mut bitwarden_executable = None;
+    let mut bitwarden = false;
+    let mut dry_run = false;
+    let mut resume = false;
+    let mut index = 0;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "--plan" if plan_path.is_none() => {
+                plan_path = Some(arguments.get(index + 1).ok_or_else(pack_usage)?);
+                index += 2;
+            }
+            "--output" if output.is_none() => {
+                output = Some(arguments.get(index + 1).ok_or_else(pack_usage)?);
+                index += 2;
+            }
+            "--name" if friendly_name.is_none() => {
+                friendly_name = Some(arguments.get(index + 1).ok_or_else(pack_usage)?);
+                index += 2;
+            }
+            "--offline-recovery" if offline_recovery.is_none() => {
+                offline_recovery = Some(arguments.get(index + 1).ok_or_else(pack_usage)?);
+                index += 2;
+            }
+            "--bitwarden" if !bitwarden => {
+                bitwarden = true;
+                index += 1;
+            }
+            "--bitwarden-executable" if bitwarden_executable.is_none() => {
+                bitwarden_executable = Some(arguments.get(index + 1).ok_or_else(pack_usage)?);
+                index += 2;
+            }
+            "--resume" if !resume => {
+                resume = true;
+                index += 1;
+            }
+            "--dry-run" if !dry_run => {
+                dry_run = true;
+                index += 1;
+            }
+            _ => return Err(pack_usage()),
+        }
+    }
+
+    let plan_path = PathBuf::from(plan_path.ok_or_else(pack_usage)?);
+    let output = PathBuf::from(output.ok_or_else(pack_usage)?);
+    let friendly_name = friendly_name.ok_or_else(pack_usage)?;
+    let offline_recovery = PathBuf::from(offline_recovery.ok_or_else(pack_usage)?);
+    if !bitwarden {
+        return Err(CliError::Approval(
+            "Pack requires the Vaultwarden Recovery Method".to_owned(),
+        ));
+    }
+    if friendly_name.trim().is_empty() {
+        return Err(pack_usage());
+    }
+    if resume {
+        return Err(CliError::Interrupted(
+            "Pack Resume is available only inside the same live migration capture; a fresh command cannot reconstruct secret live state"
+                .to_owned(),
+        ));
+    }
+    if output.extension().and_then(|value| value.to_str()) != Some("iniza") {
+        return Err(CliError::Usage(
+            "Pack output must end with .iniza".to_owned(),
+        ));
+    }
+    if !offline_recovery
+        .to_string_lossy()
+        .ends_with(".iniza-recovery")
+    {
+        return Err(CliError::Usage(
+            "Offline Recovery Key document must end with .iniza-recovery".to_owned(),
+        ));
+    }
+
+    let plan =
+        Plan::read_from(&plan_path).map_err(|error| CliError::Approval(error.to_string()))?;
+    if plan
+        .approval_state()
+        .map_err(|error| CliError::Approval(error.to_string()))?
+        != PlanApprovalState::Approved
+    {
+        return Err(CliError::Approval(
+            "Pack requires an approved, non-stale Plan".to_owned(),
+        ));
+    }
+    let coverage = plan.coverage_summary();
+    if coverage.must_protect_blocking > 0 {
+        return Err(CliError::Approval(format!(
+            "Pack is blocked by {} unresolved Must-Protect Item(s)",
+            coverage.must_protect_blocking
+        )));
+    }
+    if output.exists() || offline_recovery.exists() {
+        return Err(CliError::Conflict(
+            "Pack never overwrites an existing Bundle or Offline Recovery Key document".to_owned(),
+        ));
+    }
+
+    if (machine_output || non_interactive) && !dry_run {
+        return Err(CliError::Approval(
+            "Pack requires interactive owner review of the Bitwarden installation and Vaultwarden preflight; --json never prompts"
+                .to_owned(),
+        ));
+    }
+    if dry_run && machine_output {
+        print_machine_value(
+            "pack",
+            serde_json::json!({
+                "dry_run": true,
+                "plan_approval": "approved",
+                "estimated_logical_bytes": plan.estimated_logical_size(),
+                "included_items": coverage.included,
+                "optional_warnings": coverage.optional_warnings,
+                "recovery_methods": 2,
+                "would_contact_vaultwarden": false,
+                "would_create_artifacts": false,
+            }),
+        );
+        return Ok(ExitCode::SUCCESS);
+    } else if dry_run {
+        println!(
+            "Pack dry run passed. Plan is approved; {} included Migration Item(s), {} estimated logical bytes, and both Recovery Methods are selected. No Bundle, Recovery Method, or external-service change was made.",
+            coverage.included,
+            plan.estimated_logical_size(),
+        );
+        return Ok(ExitCode::SUCCESS);
+    } else if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
+        return Err(CliError::Approval(
+            "interactive Pack requires a controlling terminal for exact owner review".to_owned(),
+        ));
+    }
+
+    let installation = bitwarden_executable
+        .map(|path| VaultwardenInstallationRequest::explicit(PathBuf::from(path)))
+        .unwrap_or_else(VaultwardenInstallationRequest::trusted_path);
+    let owner_review = TerminalMigrationCaptureOwnerReview;
+    eprintln!(
+        "Packing the approved Plan, writing the Offline Recovery Key document to the reviewed separate device, and then reviewing Vaultwarden. This creates protected artifacts and may create one external Secure Note."
+    );
+    let report = MigrationWorkflowEngine::local()
+        .capture(MigrationCaptureRequest::new(
+            &plan,
+            &output,
+            &offline_recovery,
+            friendly_name,
+            installation,
+            &owner_review,
+        ))
+        .map_err(map_migration_capture_error)?;
+    if report.state() != MigrationCaptureState::Complete {
+        return Err(CliError::Interrupted(report.human_summary().to_owned()));
+    }
+    println!("{}", report.human_summary());
+    println!(
+        "Bundle identity: {}",
+        report.offline_verification().bundle_identity()
+    );
+    println!(
+        "Offline Recovery Method identity: {}",
+        report.offline_receipt().recovery_method_identity()
+    );
+    println!(
+        "Vaultwarden item identifier: {}",
+        report.vaultwarden_receipt().item_identifier().as_str()
+    );
+    println!(
+        "Vaultwarden server identity hash: {}",
+        report.vaultwarden_receipt().server_identity_hash()
+    );
+    println!(
+        "Bitwarden installation review hash: {}",
+        report.installation_review_hash()
+    );
+    println!(
+        "Vaultwarden preflight review hash: {}",
+        report.preflight_review_hash()
+    );
+    println!("Safe to erase this machine: no");
+    Ok(ExitCode::SUCCESS)
+}
+
+fn pack_usage() -> CliError {
+    CliError::Usage(
+        "usage: iniza pack --plan <APPROVED_PLAN> --output <PATH.iniza> --name <FRIENDLY_NAME> --bitwarden [--bitwarden-executable <PATH>] --offline-recovery <PATH.iniza-recovery> [--resume] [--dry-run]"
+            .to_owned(),
+    )
+}
+
+struct TerminalMigrationCaptureOwnerReview;
+
+impl MigrationCaptureOwnerReview for TerminalMigrationCaptureOwnerReview {
+    fn review_bitwarden_installation(
+        &self,
+        report: &VaultwardenInstallationReport,
+    ) -> Result<String, CoreError> {
+        eprintln!("{}", report.human_summary());
+        eprintln!(
+            "This inspection does not prove vendor provenance. Confirm that you installed the official Bitwarden command-line package through your trusted channel."
+        );
+        prompt_for_complete_review_hash(
+            "Type the complete installation review hash to approve credentialed work: ",
+        )
+    }
+
+    fn review_vaultwarden_preflight(
+        &self,
+        report: &VaultwardenPreflightReport,
+    ) -> Result<String, CoreError> {
+        eprintln!("{}", report.human_summary());
+        prompt_for_complete_review_hash(
+            "Type the complete preflight review hash to authorize creating one real Secure Note: ",
+        )
+    }
+}
+
+fn prompt_for_complete_review_hash(prompt: &str) -> Result<String, CoreError> {
+    eprint!("{prompt}");
+    io::stderr().flush().map_err(|error| {
+        CoreError::Vaultwarden(format!(
+            "could not present the owner review prompt: {error}"
+        ))
+    })?;
+    let mut reviewed_hash = String::new();
+    io::stdin().read_line(&mut reviewed_hash).map_err(|error| {
+        CoreError::Vaultwarden(format!("could not read the owner review decision: {error}"))
+    })?;
+    Ok(reviewed_hash.trim().to_owned())
 }
 
 fn run_push_plan_approval(
@@ -1210,6 +1458,21 @@ fn map_verified_copy_error(error: CoreError) -> CliError {
     }
 }
 
+fn map_migration_capture_error(error: CoreError) -> CliError {
+    match error {
+        CoreError::AuthenticationFailed => CliError::Recovery(error.to_string()),
+        CoreError::BundleIncomplete(_)
+        | CoreError::BundleInvalid(_)
+        | CoreError::TestFixtureIsNotBundle(_) => CliError::BundleInvalid(error.to_string()),
+        CoreError::DestinationAlreadyExists(_) => CliError::Conflict(error.to_string()),
+        CoreError::InsufficientSpace { .. } | CoreError::Io { .. } => {
+            CliError::Storage(error.to_string())
+        }
+        CoreError::Vaultwarden(_) => CliError::Vaultwarden(error.to_string()),
+        _ => CliError::Operation(error.to_string()),
+    }
+}
+
 #[derive(Debug)]
 enum CliError {
     Approval(String),
@@ -1217,7 +1480,11 @@ enum CliError {
     Conflict(String),
     GitAudit(String),
     GitPublication(String),
+    Interrupted(String),
+    Recovery(String),
+    Storage(String),
     Usage(String),
+    Vaultwarden(String),
     Operation(String),
 }
 
@@ -1229,7 +1496,11 @@ impl CliError {
             Self::Conflict(_) => 50,
             Self::GitAudit(_) => 40,
             Self::GitPublication(_) => 41,
+            Self::Interrupted(_) => 70,
+            Self::Recovery(_) => 21,
+            Self::Storage(_) => 22,
             Self::Usage(_) => 2,
+            Self::Vaultwarden(_) => 31,
             Self::Operation(_) => 11,
         }
     }
@@ -1241,7 +1512,11 @@ impl CliError {
             Self::Conflict(_) => "INIZA-E050",
             Self::GitAudit(_) => "INIZA-E040",
             Self::GitPublication(_) => "INIZA-E041",
+            Self::Interrupted(_) => "INIZA-E070",
+            Self::Recovery(_) => "INIZA-E021",
+            Self::Storage(_) => "INIZA-E022",
             Self::Usage(_) => "INIZA-E002",
+            Self::Vaultwarden(_) => "INIZA-E031",
             Self::Operation(_) => "INIZA-E011",
         }
     }
@@ -1255,7 +1530,11 @@ impl std::fmt::Display for CliError {
             | Self::Conflict(message)
             | Self::GitAudit(message)
             | Self::GitPublication(message)
+            | Self::Interrupted(message)
+            | Self::Recovery(message)
+            | Self::Storage(message)
             | Self::Usage(message)
+            | Self::Vaultwarden(message)
             | Self::Operation(message) => formatter.write_str(message),
         }
     }
