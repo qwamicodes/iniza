@@ -8,7 +8,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use iniza::{
     BundleEngine, OfflineRecoveryEngine, OfflineRecoveryPersistenceTransition,
     OfflineRecoveryStorage, OfflineRecoveryWriteRequest, PackRecoveryContext, PackRequest,
-    PlanEngine, RecoveryMethod, RecoverySecret, ScanRequest,
+    PlanEngine, ReadinessEvidenceEngine, ReadinessEvidenceInitializationRequest,
+    ReadinessReceiptRecordRequest, RecoveryMethod, RecoverySecret, ScanRequest, VerifyRequest,
 };
 use zeroize::Zeroizing;
 
@@ -208,6 +209,102 @@ fn machine_pack_refuses_interactive_owner_review_before_creating_artifacts() {
             .unwrap()
             .contains("interactive owner review")
     );
+}
+
+#[test]
+fn status_revalidates_stored_receipts_and_never_returns_an_erase_decision() {
+    let directory = TestDirectory::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let source = directory.path().join("source");
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("settings.txt"), b"synthetic readiness input\n").unwrap();
+    let mut plan = PlanEngine::local()
+        .scan(ScanRequest::for_directory(&source))
+        .unwrap();
+    let reviewed_hash = plan.approval_hash().unwrap();
+    plan.approve(&reviewed_hash).unwrap();
+    let plan_path = directory.path().join("approved-plan.toml");
+    plan.write_to(&plan_path).unwrap();
+    let recovery = PackRecoveryContext::from_secrets(
+        RecoverySecret::from_bytes(RecoveryMethod::Vaultwarden, Zeroizing::new([0x51; 32])),
+        RecoverySecret::from_bytes(RecoveryMethod::Offline, Zeroizing::new([0x62; 32])),
+    )
+    .unwrap();
+    let bundle = directory.path().join("migration.iniza");
+    BundleEngine::local()
+        .pack(PackRequest::new(&plan, &bundle).with_recovery_context(&recovery))
+        .unwrap();
+    let document = directory.path().join("separate.iniza-recovery");
+    let offline = OfflineRecoveryEngine::with_storage(SyntheticRemovableStorage);
+    offline
+        .write(OfflineRecoveryWriteRequest::new(
+            &bundle,
+            &document,
+            recovery.offline_recovery_key(),
+        ))
+        .unwrap();
+    let receipt = offline
+        .rehearse(iniza::OfflineRecoveryRehearsalRequest::new(
+            &bundle, &document,
+        ))
+        .unwrap();
+    let verification = BundleEngine::local()
+        .verify(VerifyRequest::new(&bundle, recovery.offline_recovery_key()))
+        .unwrap();
+    let receipts = directory.path().join("receipts");
+    let evidence = ReadinessEvidenceEngine::local();
+    evidence
+        .initialize(ReadinessEvidenceInitializationRequest::new(
+            &plan, &receipts,
+        ))
+        .unwrap();
+    evidence
+        .record_receipt(ReadinessReceiptRecordRequest::bundle_verification(
+            &receipts,
+            &plan,
+            &bundle,
+            &verification,
+        ))
+        .unwrap();
+    evidence
+        .record_receipt(ReadinessReceiptRecordRequest::offline_recovery(
+            &receipts, &plan, &receipt,
+        ))
+        .unwrap();
+
+    let output = iniza(&[
+        "--json",
+        "status",
+        "--plan",
+        plan_path.to_str().unwrap(),
+        "--receipts",
+        receipts.to_str().unwrap(),
+        "--bundle",
+        bundle.to_str().unwrap(),
+        "--offline-recovery-document",
+        document.to_str().unwrap(),
+    ]);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stderr.is_empty());
+    let standard_output = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(standard_output.lines().count(), 1);
+    assert!(!standard_output.contains("synthetic readiness input"));
+    assert!(!standard_output.contains(&source.display().to_string()));
+    let result: serde_json::Value = serde_json::from_str(standard_output.trim()).unwrap();
+    assert_eq!(result["command"], "readiness status");
+    assert_eq!(result["status"], "blocking-gaps");
+    assert_eq!(result["data"]["bundle_verification"], "current");
+    assert_eq!(result["data"]["offline_recovery_method"], "current");
+    assert_eq!(
+        result["warnings"][0],
+        "This is not permission to erase a machine."
+    );
+    assert!(result["data"].get("safe_to_erase").is_none());
 }
 
 #[test]

@@ -186,11 +186,14 @@ For a new restore, the destination must be absent or empty. `--resume` may use a
 ### `iniza status`
 
 ```text
-iniza status [BUNDLE]
+iniza status
+  --plan <APPROVED_PLAN>
   --receipts <DIRECTORY>
+  --bundle <PATH.iniza>
+  --offline-recovery-document <PATH.iniza-recovery>
 ```
 
-Summarizes available evidence. It never returns an erase-safety decision.
+Revalidates the selected Bundle and Offline Recovery Method against the append-only evidence store, summarizes current and blocking evidence, and never returns an erase-safety decision. Missing Vaultwarden, Verified Copy, Project, Restore Rehearsal, Not Protected Report, or Owner Attestation inputs remain visible as gaps; later command slices may add their non-secret locators without changing this fail-closed baseline.
 
 ### `iniza connector bitwarden status`
 

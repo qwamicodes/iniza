@@ -9,10 +9,13 @@ use crate::{
     BitwardenCommandLine, BundleEngine, CoreError, MigrationCaptureOwnerReview,
     MigrationCaptureReport, MigrationCaptureRequest, MigrationCaptureState,
     MigrationWorkflowEngine, NotProtectedReport, OfflineRecoveryEngine, OfflineRecoveryLoadRequest,
-    OfflineRecoveryStorage, PlanEngine, RestoreCancellation, RestoreEngine, RestoreEvent,
+    OfflineRecoveryStorage, PlanEngine, ReadinessEvidenceConclusion, ReadinessEvidenceEngine,
+    ReadinessEvidenceInitializationRequest, ReadinessEvidenceStatusReport,
+    ReadinessEvidenceStatusRequest, ReadinessEvidenceStorage, ReadinessEvidenceStorageTransition,
+    ReadinessReceiptRecordRequest, RestoreCancellation, RestoreEngine, RestoreEvent,
     RestoreEventSink, RestoreReport, RestoreRequest, RestoreState, ScanRequest,
-    VaultwardenInstallationRequest, VerifiedCopyPersistence, VerifiedCopyReport,
-    VerifiedCopyRequest, VerifiedCopyStorageLocation,
+    VaultwardenInstallationRequest, VaultwardenLoadRequest, VaultwardenRecoveryEngine,
+    VerifiedCopyPersistence, VerifiedCopyReport, VerifiedCopyRequest, VerifiedCopyStorageLocation,
 };
 
 const SHELL_SETTINGS: &[u8] = b"synthetic shell settings\n";
@@ -47,6 +50,8 @@ pub struct SyntheticMigrationRehearsalReport {
     restore_was_resumed: bool,
     exact_comparison_passed: bool,
     not_protected_report: NotProtectedReport,
+    readiness_status: ReadinessEvidenceStatusReport,
+    receipt_invalidation_was_detected: bool,
 }
 
 impl SyntheticMigrationRehearsalReport {
@@ -78,8 +83,16 @@ impl SyntheticMigrationRehearsalReport {
         &self.not_protected_report
     }
 
+    pub fn readiness_status(&self) -> &ReadinessEvidenceStatusReport {
+        &self.readiness_status
+    }
+
+    pub fn receipt_invalidation_was_detected(&self) -> bool {
+        self.receipt_invalidation_was_detected
+    }
+
     pub fn human_summary(&self) -> &'static str {
-        "Synthetic migration rehearsal authenticated the Bundle through both Recovery Methods, created two Verified Copies, and completed an interrupted and resumed Restore Rehearsal with exact comparison. This result does not authorize real source capture and does not decide whether this machine is safe to erase."
+        "Synthetic migration rehearsal authenticated the Bundle through both Recovery Methods, created two Verified Copies, completed an interrupted and resumed Restore Rehearsal with exact comparison, appended machine Receipts to append-only Readiness Evidence, and proved that mutation invalidates a Receipt. Owner Attestations remain unconfirmed. This result does not authorize real source capture and does not decide whether this machine is safe to erase."
     }
 
     pub fn machine_json_result(&self) -> String {
@@ -95,6 +108,11 @@ impl SyntheticMigrationRehearsalReport {
                 "exact_comparison_passed": self.exact_comparison_passed,
                 "not_protected_items": self.not_protected_report.entries().len(),
                 "must_protect_gaps": self.not_protected_report.must_protect_gap_count(),
+                "receipt_invalidation_detected": self.receipt_invalidation_was_detected,
+                "readiness_state": match self.readiness_status.state() {
+                    crate::ReadinessEvidenceState::CompleteEvidence => "complete-evidence",
+                    crate::ReadinessEvidenceState::BlockingGaps => "blocking-gaps",
+                },
                 "real_source_capture_authorized": false,
                 "safe_to_erase": false,
             },
@@ -210,6 +228,7 @@ where
             self.bitwarden.clone(),
             self.offline_storage.clone(),
         );
+        let installation_request = request.installation.clone();
         let capture = capture_engine.capture(
             MigrationCaptureRequest::new(
                 &plan,
@@ -236,10 +255,11 @@ where
             )
             .with_persistence(&self.external_copy_storage),
         )?;
+        let first_cloud_copy_path = cloud_copy_path(&request.root);
         let cloud_copy = BundleEngine::local().copy_verified(
             VerifiedCopyRequest::new(
                 &bundle,
-                cloud_copy_path(&request.root),
+                &first_cloud_copy_path,
                 loaded_for_copy.recovery_secret(),
             )
             .with_persistence(&self.cloud_copy_storage),
@@ -281,12 +301,12 @@ where
         drop(loaded_for_interrupted_restore);
 
         let loaded_for_resumed_restore = offline_engine.load(OfflineRecoveryLoadRequest::new(
-            cloud_copy_path(&request.root),
+            &first_cloud_copy_path,
             &offline_document,
         ))?;
         let restore = RestoreEngine::local().restore(
             RestoreRequest::new(
-                cloud_copy_path(&request.root),
+                &first_cloud_copy_path,
                 &restored,
                 loaded_for_resumed_restore.recovery_secret(),
             )
@@ -307,6 +327,119 @@ where
             ));
         }
 
+        let evidence_directory = request.root.join("readiness-evidence");
+        let replacement_cloud_copy_path = request.root.join("icloud-drive-replacement.iniza");
+        let readiness = ReadinessEvidenceEngine::with_storage(RehearsalReadinessStorage {
+            external_copy: request.root.join("external-storage.iniza"),
+            cloud_copies: vec![
+                first_cloud_copy_path.clone(),
+                replacement_cloud_copy_path.clone(),
+            ],
+        });
+        readiness.initialize(ReadinessEvidenceInitializationRequest::new(
+            &plan,
+            &evidence_directory,
+        ))?;
+        readiness.record_receipt(ReadinessReceiptRecordRequest::bundle_verification(
+            &evidence_directory,
+            &plan,
+            &bundle,
+            capture.offline_verification(),
+        ))?;
+        readiness.record_receipt(ReadinessReceiptRecordRequest::offline_recovery(
+            &evidence_directory,
+            &plan,
+            capture.offline_receipt(),
+        ))?;
+        readiness.record_receipt(ReadinessReceiptRecordRequest::vaultwarden_recovery(
+            &evidence_directory,
+            &plan,
+            capture.vaultwarden_receipt(),
+        ))?;
+        readiness.record_receipt(ReadinessReceiptRecordRequest::verified_copy(
+            &evidence_directory,
+            &plan,
+            &external_copy,
+        ))?;
+        readiness.record_receipt(ReadinessReceiptRecordRequest::verified_copy(
+            &evidence_directory,
+            &plan,
+            &cloud_copy,
+        ))?;
+        readiness.record_receipt(ReadinessReceiptRecordRequest::not_protected_report(
+            &evidence_directory,
+            &plan,
+        ))?;
+        readiness.record_receipt(ReadinessReceiptRecordRequest::restore_rehearsal(
+            &evidence_directory,
+            &plan,
+            &restore,
+        ))?;
+
+        let vaultwarden = VaultwardenRecoveryEngine::with_command_line(self.bitwarden.clone());
+        let installation = vaultwarden.inspect_installation(installation_request)?;
+        let reviewed_installation_hash = request
+            .owner_review
+            .review_bitwarden_installation(&installation)?;
+        let loaded_vaultwarden = vaultwarden.load(VaultwardenLoadRequest::new(
+            &bundle,
+            capture.vaultwarden_receipt().item_identifier().clone(),
+            capture.vaultwarden_receipt().server_identity_hash(),
+            &installation,
+            reviewed_installation_hash,
+        ))?;
+        let loaded_for_status =
+            offline_engine.load(OfflineRecoveryLoadRequest::new(&bundle, &offline_document))?;
+        let status_request = |cloud_copy: &Path| {
+            ReadinessEvidenceStatusRequest::new(&evidence_directory, &plan)
+                .with_bundle(&bundle, loaded_for_status.recovery_secret())
+                .with_offline_recovery_document(&offline_document)
+                .with_vaultwarden_recovery(&loaded_vaultwarden)
+                .with_verified_copy(request.root.join("external-storage.iniza"))
+                .with_verified_copy(cloud_copy)
+                .with_restore_rehearsal(&restored)
+        };
+        let before_mutation = readiness.status(status_request(&first_cloud_copy_path))?;
+        if before_mutation.verified_copy() != ReadinessEvidenceConclusion::Current {
+            return Err(CoreError::ReadinessEvidence(
+                "synthetic Verified Copy Receipts were not current before mutation".to_owned(),
+            ));
+        }
+        fs::write(&first_cloud_copy_path, b"synthetic changed copy\n").map_err(|source_error| {
+            CoreError::Io {
+                action: "mutate disposable synthetic Verified Copy",
+                path: first_cloud_copy_path.clone(),
+                source: source_error,
+            }
+        })?;
+        let invalidated = readiness.status(status_request(&first_cloud_copy_path))?;
+        let receipt_invalidation_was_detected =
+            invalidated.verified_copy() == ReadinessEvidenceConclusion::Invalidated;
+        if !receipt_invalidation_was_detected {
+            return Err(CoreError::ReadinessEvidence(
+                "synthetic Verified Copy mutation did not invalidate its Receipt".to_owned(),
+            ));
+        }
+        let cloud_copy = BundleEngine::local().copy_verified(
+            VerifiedCopyRequest::new(
+                &bundle,
+                &replacement_cloud_copy_path,
+                loaded_for_status.recovery_secret(),
+            )
+            .with_persistence(&self.cloud_copy_storage),
+        )?;
+        readiness.record_receipt(ReadinessReceiptRecordRequest::verified_copy(
+            &evidence_directory,
+            &plan,
+            &cloud_copy,
+        ))?;
+        let readiness_status = readiness.status(status_request(&replacement_cloud_copy_path))?;
+        if readiness_status.verified_copy() != ReadinessEvidenceConclusion::Current {
+            return Err(CoreError::ReadinessEvidence(
+                "replacement synthetic Verified Copy Receipt is not current".to_owned(),
+            ));
+        }
+
         Ok(SyntheticMigrationRehearsalReport {
             capture,
             external_copy,
@@ -315,7 +448,38 @@ where
             restore_was_resumed: true,
             exact_comparison_passed,
             not_protected_report,
+            readiness_status,
+            receipt_invalidation_was_detected,
         })
+    }
+}
+
+#[derive(Debug)]
+struct RehearsalReadinessStorage {
+    external_copy: PathBuf,
+    cloud_copies: Vec<PathBuf>,
+}
+
+impl ReadinessEvidenceStorage for RehearsalReadinessStorage {
+    fn prepare_transition(
+        &self,
+        _transition: ReadinessEvidenceStorageTransition,
+    ) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn verified_copy_storage_location(
+        &self,
+        _source: &Path,
+        destination: &Path,
+    ) -> std::io::Result<VerifiedCopyStorageLocation> {
+        if destination == self.external_copy {
+            Ok(VerifiedCopyStorageLocation::ExternalStorage)
+        } else if self.cloud_copies.iter().any(|copy| copy == destination) {
+            Ok(VerifiedCopyStorageLocation::ICloudDrive)
+        } else {
+            Ok(VerifiedCopyStorageLocation::Other)
+        }
     }
 }
 
@@ -327,7 +491,19 @@ fn create_rehearsal_root(path: &Path) -> Result<(), CoreError> {
     if path.exists() {
         return Err(CoreError::DestinationAlreadyExists(path.to_path_buf()));
     }
-    create_directory(path)
+    create_directory(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|source| {
+            CoreError::Io {
+                action: "secure synthetic rehearsal directory",
+                path: path.to_path_buf(),
+                source,
+            }
+        })?;
+    }
+    Ok(())
 }
 
 fn create_directory(path: &Path) -> Result<(), CoreError> {

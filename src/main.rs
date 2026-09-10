@@ -8,7 +8,8 @@ use iniza::{
     OfflineRecoveryLocator, OfflineRecoveryRehearsalRequest, Plan, PlanApprovalState, PlanEngine,
     ProjectAuditEngine, ProjectAuditRequest, ProtectionCandidateEngine, ProtectionCandidateRequest,
     PublicationPolicy, PushExecutionState, PushPlanApprovalRequest, PushPlanDraftRequest,
-    PushPlanEngine, PushPlanExecutionRequest, RestoreEngine, RestoreRequest, ScanRequest,
+    PushPlanEngine, PushPlanExecutionRequest, ReadinessEvidenceEngine,
+    ReadinessEvidenceStatusRequest, RestoreEngine, RestoreRequest, ScanRequest,
     StoredRecoveryMethodEngine, StoredRecoveryMethodRequest, VaultwardenInstallationReport,
     VaultwardenInstallationRequest, VaultwardenPreflightReport, VerifiedCopyRequest, VerifyRequest,
 };
@@ -396,6 +397,48 @@ fn run(
         }
         [command, pack_arguments @ ..] if command == "pack" => {
             run_pack(pack_arguments, machine_output, non_interactive)
+        }
+        [
+            command,
+            plan_flag,
+            plan_path,
+            receipts_flag,
+            receipts,
+            bundle_flag,
+            bundle,
+            recovery_flag,
+            recovery_document,
+        ] if command == "status"
+            && plan_flag == "--plan"
+            && receipts_flag == "--receipts"
+            && bundle_flag == "--bundle"
+            && recovery_flag == "--offline-recovery-document" =>
+        {
+            print_progress(machine_output, "Revalidating append-only Readiness Evidence");
+            let plan = Plan::read_from(&PathBuf::from(plan_path))
+                .map_err(|error| CliError::Approval(error.to_string()))?;
+            let loaded = StoredRecoveryMethodEngine::local()
+                .load(StoredRecoveryMethodRequest::new(
+                    bundle,
+                    OfflineRecoveryLocator::new(recovery_document),
+                ))
+                .map_err(map_bundle_error)?;
+            let report = ReadinessEvidenceEngine::local()
+                .status(
+                    ReadinessEvidenceStatusRequest::new(receipts, &plan)
+                        .with_bundle(bundle, loaded.recovery_secret())
+                        .with_offline_recovery_document(recovery_document),
+                )
+                .map_err(|error| CliError::Operation(error.to_string()))?;
+            if machine_output {
+                println!("{}", report.machine_json_result());
+            } else {
+                println!("{}", report.human_result());
+                for gap in report.blocking_gaps() {
+                    println!("Blocking gap: {} ({})", gap.code(), gap.count());
+                }
+            }
+            Ok(ExitCode::from(report.exit_code()))
         }
         [command, bundle_flag, bundle, recovery_flag, recovery_document]
             if command == "verify"

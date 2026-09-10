@@ -1,6 +1,7 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -9,16 +10,18 @@ use iniza::{
     BitwardenRetrievedRecoveryNote, BitwardenVaultObservation, BundleEvent, BundleEventSink,
     CoreError, Disposition, MigrationCaptureOwnerReview, MigrationCaptureRequest,
     MigrationCaptureState, MigrationWorkflowEngine, OfflineRecoveryPersistenceTransition,
-    OfflineRecoveryStorage, PackCancellation, PlanEngine, ProtectionRequirement, RecoveryMethod,
-    RecoverySecret, ScanRequest, SyntheticMigrationRehearsalEngine,
-    SyntheticMigrationRehearsalRequest, VaultwardenInstallationReport,
-    VaultwardenInstallationRequest, VaultwardenItemIdentifier, VaultwardenPreflightReport,
-    VerifiedCopyDurability, VerifiedCopyPersistence, VerifiedCopyPersistenceTransition,
-    VerifiedCopyStorageLocation,
+    OfflineRecoveryStorage, PackCancellation, PlanEngine, ProtectionRequirement,
+    ReadinessEvidenceConclusion, ReadinessEvidenceState, RecoveryMethod, RecoverySecret,
+    ScanRequest, SyntheticMigrationRehearsalEngine, SyntheticMigrationRehearsalRequest,
+    VaultwardenInstallationReport, VaultwardenInstallationRequest, VaultwardenItemIdentifier,
+    VaultwardenPreflightReport, VerifiedCopyDurability, VerifiedCopyPersistence,
+    VerifiedCopyPersistenceTransition, VerifiedCopyStorageLocation,
 };
 use zeroize::Zeroizing;
 
 struct TestDirectory(PathBuf);
+
+static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
 impl TestDirectory {
     fn new() -> Self {
@@ -26,8 +29,9 @@ impl TestDirectory {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
+        let sequence = NEXT_TEST_DIRECTORY.fetch_add(1, AtomicOrdering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "iniza-migration-workflow-{}-{unique}",
+            "iniza-migration-workflow-{}-{unique}-{sequence}",
             std::process::id()
         ));
         fs::create_dir(&path).unwrap();
@@ -405,6 +409,36 @@ fn complete_rehearsal_creates_two_verified_copies_and_resumes_an_exact_restore()
     );
     assert!(report.restore_was_resumed());
     assert!(report.exact_comparison_passed());
+    assert!(report.receipt_invalidation_was_detected());
+    assert_eq!(
+        report.readiness_status().state(),
+        ReadinessEvidenceState::BlockingGaps,
+        "synthetic machine evidence must not invent the owner attestations"
+    );
+    assert_eq!(
+        report.readiness_status().bundle_verification(),
+        ReadinessEvidenceConclusion::Current
+    );
+    assert_eq!(
+        report.readiness_status().offline_recovery_method(),
+        ReadinessEvidenceConclusion::Current
+    );
+    assert_eq!(
+        report.readiness_status().vaultwarden_recovery_method(),
+        ReadinessEvidenceConclusion::Current
+    );
+    assert_eq!(
+        report.readiness_status().verified_copy(),
+        ReadinessEvidenceConclusion::Current
+    );
+    assert_eq!(
+        report.readiness_status().not_protected_report(),
+        ReadinessEvidenceConclusion::Current
+    );
+    assert_eq!(
+        report.readiness_status().restore_rehearsal(),
+        ReadinessEvidenceConclusion::Current
+    );
     let not_protected = report.not_protected_report();
     assert!(!not_protected.has_must_protect_gap());
     assert!(not_protected.entries().iter().any(|entry| {
@@ -442,6 +476,8 @@ fn complete_rehearsal_creates_two_verified_copies_and_resumes_an_exact_restore()
     let human = report.human_summary();
     assert!(human.contains("two Verified Copies"));
     assert!(human.contains("Restore Rehearsal"));
+    assert!(human.contains("append-only Readiness Evidence"));
+    assert!(human.contains("Owner Attestations remain unconfirmed"));
     assert!(human.contains("does not authorize real source capture"));
     assert!(human.contains("does not decide whether this machine is safe to erase"));
     assert!(!human.contains("\u{1b}["));
@@ -455,6 +491,8 @@ fn complete_rehearsal_creates_two_verified_copies_and_resumes_an_exact_restore()
     assert_eq!(machine["data"]["exact_comparison_passed"], true);
     assert_eq!(machine["data"]["not_protected_items"], 3);
     assert_eq!(machine["data"]["must_protect_gaps"], 0);
+    assert_eq!(machine["data"]["receipt_invalidation_detected"], true);
+    assert_eq!(machine["data"]["readiness_state"], "blocking-gaps");
     assert_eq!(machine["data"]["real_source_capture_authorized"], false);
     assert_eq!(machine["data"]["safe_to_erase"], false);
 
