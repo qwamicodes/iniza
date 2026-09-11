@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use iniza::{PlanEngine, ScanRequest};
+use iniza::{PlanEngine, ProjectAuditEngine, ProjectAuditRequest, ScanRequest};
 
 struct TestDirectory {
     path: PathBuf,
@@ -123,6 +123,71 @@ fn owner_and_automation_receive_the_same_project_gaps_without_machine_path_leaks
     assert!(!machine_text.contains("private Project marker 74f3d9"));
 }
 
+#[test]
+fn ineligible_remote_overlay_decision_never_writes_a_revised_plan() {
+    let directory = TestDirectory::new("ineligible-overlay");
+    let project_root = directory.path.join("private-project");
+    let plan_path = directory.path.join("approved.toml");
+    let revised_path = directory.path.join("revised.toml");
+    init_repository(&project_root);
+    git(&project_root, &["config", "user.name", "Synthetic Owner"]);
+    git(
+        &project_root,
+        &["config", "user.email", "synthetic@example.invalid"],
+    );
+    fs::write(
+        project_root.join("tracked.txt"),
+        "synthetic tracked state\n",
+    )
+    .expect("tracked fixture should be written");
+    fs::write(project_root.join(".gitignore"), ".env\n").expect("ignore fixture should be written");
+    git(&project_root, &["add", "tracked.txt", ".gitignore"]);
+    git(&project_root, &["commit", "-q", "-m", "synthetic fixture"]);
+    fs::write(project_root.join(".env"), "SYNTHETIC_ONLY=value\n")
+        .expect("ignored fixture should be written");
+
+    let mut plan = PlanEngine::local()
+        .scan(ScanRequest::for_directory(&project_root))
+        .expect("Project should scan");
+    let reviewed_hash = plan.approval_hash().expect("Plan should have a hash");
+    plan.approve(&reviewed_hash)
+        .expect("matching reviewed hash should approve the Plan");
+    plan.write_to(&plan_path)
+        .expect("approved Plan should be written");
+    let audit = ProjectAuditEngine::local()
+        .audit(ProjectAuditRequest::from_plan(&plan))
+        .expect("local Project audit should succeed");
+    let project = &audit.projects()[0];
+    let candidate = &project
+        .ignored_candidates()
+        .expect("ignored inventory should be complete")[0];
+    let selection = format!("{}:project_protection_blake3_stale", project.id());
+    let ignored = format!("{}:{}", project.id(), candidate.id());
+
+    let result = iniza(&[
+        "projects",
+        "scan",
+        "--plan",
+        plan_path.to_str().expect("Plan path should be text"),
+        "--remote-check",
+        "--remote-overlay",
+        &selection,
+        "--include-ignored",
+        &ignored,
+        "--output-plan",
+        revised_path
+            .to_str()
+            .expect("revised Plan path should be text"),
+    ]);
+
+    assert!(!result.status.success());
+    assert!(!revised_path.exists());
+    assert!(
+        String::from_utf8_lossy(&result.stderr)
+            .contains("stale or is not eligible for remote reconstruction")
+    );
+}
+
 fn iniza(arguments: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_iniza"))
         .args(arguments)
@@ -141,6 +206,20 @@ fn init_repository(path: &Path) {
     assert!(
         output.status.success(),
         "Git repository should initialize: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn git(path: &Path, arguments: &[&str]) {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(arguments)
+        .output()
+        .expect("Git fixture command should start");
+    assert!(
+        output.status.success(),
+        "Git fixture command failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 }

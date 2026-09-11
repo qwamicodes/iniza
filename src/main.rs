@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -7,13 +8,14 @@ use iniza::{
     MigrationCaptureOwnerReview, MigrationCaptureRequest, MigrationCaptureState,
     MigrationWorkflowEngine, OfflineRecoveryEngine, OfflineRecoveryLocator,
     OfflineRecoveryRehearsalRequest, Plan, PlanApprovalState, PlanEngine, ProjectAuditEngine,
-    ProjectAuditRequest, ProtectionCandidateEngine, ProtectionCandidateRequest, PublicationPolicy,
-    PushExecutionState, PushPlanApprovalRequest, PushPlanDraftRequest, PushPlanEngine,
-    PushPlanExecutionRequest, ReadinessEvidenceEngine, ReadinessEvidenceStatusRequest,
-    RestoreEngine, RestoreRequest, ScanRequest, StoredRecoveryMethodEngine,
-    StoredRecoveryMethodRequest, VaultwardenInstallationReport, VaultwardenInstallationRequest,
-    VaultwardenItemIdentifier, VaultwardenPreflightReport, VaultwardenRecoveryEngine,
-    VaultwardenRecoveryLocator, VerifiedCopyRequest, VerifyRequest,
+    ProjectAuditRequest, ProjectIgnoredStateDecision, ProjectProtectionEngine,
+    ProjectProtectionPlanRequest, ProtectionCandidateEngine, ProtectionCandidateRequest,
+    PublicationPolicy, PushExecutionState, PushPlanApprovalRequest, PushPlanDraftRequest,
+    PushPlanEngine, PushPlanExecutionRequest, ReadinessEvidenceEngine,
+    ReadinessEvidenceStatusRequest, RestoreEngine, RestoreRequest, ScanRequest,
+    StoredRecoveryMethodEngine, StoredRecoveryMethodRequest, VaultwardenInstallationReport,
+    VaultwardenInstallationRequest, VaultwardenItemIdentifier, VaultwardenPreflightReport,
+    VaultwardenRecoveryEngine, VaultwardenRecoveryLocator, VerifiedCopyRequest, VerifyRequest,
 };
 
 fn main() -> ExitCode {
@@ -466,7 +468,7 @@ fn run(
             Ok(ExitCode::from(report.exit_code()))
         }
         _ => Err(CliError::Usage(
-            "usage: iniza scan <SOURCE> (--list-protection-candidates | --candidate <IDENTIFIER>... --output-plan <PLAN> | --output-plan <PLAN>) [SCAN OPTIONS] | iniza projects scan --plan <APPROVED_PLAN> [--remote-check] | iniza recovery offline rehearse --bundle <BUNDLE> --document <RECOVERY_DOCUMENT> | iniza pack [PACK OPTIONS] | iniza verify [ENCRYPTED OPTIONS] | iniza inspect [ENCRYPTED OPTIONS] | iniza copy [ENCRYPTED OPTIONS] | iniza restore [ENCRYPTED OPTIONS] | iniza status --plan <PLAN> --receipts <EVIDENCE_DIRECTORY> --bundle <BUNDLE> --offline-recovery-document <RECOVERY_DOCUMENT> | iniza plan show --plan <PLAN> | iniza plan validate --plan <PLAN> | iniza plan approve --plan <PLAN> --approved-hash <HASH> | iniza plan diff <OLD> <NEW> | iniza fixture pack --plan <PLAN> --output <PATH.iniza-fixture> | iniza fixture inspect <PATH.iniza-fixture> | iniza fixture restore <PATH.iniza-fixture> --to <NEW_DESTINATION>"
+            "usage: iniza scan <SOURCE> (--list-protection-candidates | --candidate <IDENTIFIER>... --output-plan <PLAN> | --output-plan <PLAN>) [SCAN OPTIONS] | iniza projects scan --plan <APPROVED_PLAN> [PROJECT SCAN OPTIONS] | iniza recovery offline rehearse --bundle <BUNDLE> --document <RECOVERY_DOCUMENT> | iniza pack [PACK OPTIONS] | iniza verify [ENCRYPTED OPTIONS] | iniza inspect [ENCRYPTED OPTIONS] | iniza copy [ENCRYPTED OPTIONS] | iniza restore [ENCRYPTED OPTIONS] | iniza status --plan <PLAN> --receipts <EVIDENCE_DIRECTORY> --bundle <BUNDLE> --offline-recovery-document <RECOVERY_DOCUMENT> | iniza plan show --plan <PLAN> | iniza plan validate --plan <PLAN> | iniza plan approve --plan <PLAN> --approved-hash <HASH> | iniza plan diff <OLD> <NEW> | iniza fixture pack --plan <PLAN> --output <PATH.iniza-fixture> | iniza fixture inspect <PATH.iniza-fixture> | iniza fixture restore <PATH.iniza-fixture> --to <NEW_DESTINATION>"
                 .to_owned(),
         )),
     }
@@ -1482,6 +1484,9 @@ fn run_project_audit(
 ) -> Result<ExitCode, CliError> {
     let mut plan_path = None;
     let mut remote_check = false;
+    let mut output_plan = None;
+    let mut remote_overlays = Vec::new();
+    let mut ignored_decisions = BTreeMap::<String, Vec<ProjectIgnoredStateDecision>>::new();
     let mut index = 0;
     while index < arguments.len() {
         match arguments[index].as_str() {
@@ -1495,8 +1500,42 @@ fn run_project_audit(
                 remote_check = true;
                 index += 1;
             }
+            "--output-plan" => {
+                output_plan = Some(PathBuf::from(
+                    arguments.get(index + 1).ok_or_else(project_audit_usage)?,
+                ));
+                index += 2;
+            }
+            "--remote-overlay" => {
+                let value = arguments.get(index + 1).ok_or_else(project_audit_usage)?;
+                let (project_id, review_hash) =
+                    value.split_once(':').ok_or_else(project_audit_usage)?;
+                remote_overlays.push((project_id.to_owned(), review_hash.to_owned()));
+                index += 2;
+            }
+            "--include-ignored" | "--exclude-ignored" => {
+                let include = arguments[index] == "--include-ignored";
+                let value = arguments.get(index + 1).ok_or_else(project_audit_usage)?;
+                let (project_id, candidate_id) =
+                    value.split_once(':').ok_or_else(project_audit_usage)?;
+                let decision = if include {
+                    ProjectIgnoredStateDecision::include(candidate_id)
+                } else {
+                    ProjectIgnoredStateDecision::exclude(candidate_id)
+                };
+                ignored_decisions
+                    .entry(project_id.to_owned())
+                    .or_default()
+                    .push(decision);
+                index += 2;
+            }
             _ => return Err(project_audit_usage()),
         }
+    }
+    let preparing_plan =
+        output_plan.is_some() || !remote_overlays.is_empty() || !ignored_decisions.is_empty();
+    if preparing_plan && (!remote_check || output_plan.is_none() || remote_overlays.is_empty()) {
+        return Err(project_audit_usage());
     }
     let plan_path = plan_path.ok_or_else(project_audit_usage)?;
     let plan =
@@ -1518,6 +1557,36 @@ fn run_project_audit(
             error @ CoreError::InvalidPlan(_) => CliError::Approval(error.to_string()),
             error => CliError::GitAudit(error.to_string()),
         })?;
+    let prepared_plan = if let Some(output_plan) = output_plan.as_ref() {
+        if output_plan.exists() {
+            return Err(CliError::Approval(
+                "revised Project Plan destination already exists".to_owned(),
+            ));
+        }
+        let mut preparation = ProjectProtectionPlanRequest::new(&plan, &report);
+        for (project_id, review_hash) in remote_overlays {
+            let decisions = ignored_decisions.remove(&project_id).unwrap_or_default();
+            preparation = preparation.with_remote_overlay(project_id, review_hash, decisions);
+        }
+        if !ignored_decisions.is_empty() {
+            return Err(CliError::Approval(
+                "ignored-state decision has no matching remote-overlay Project".to_owned(),
+            ));
+        }
+        let revised = ProjectProtectionEngine::prepare_plan(preparation)
+            .map_err(|error| CliError::Approval(error.to_string()))?;
+        revised
+            .write_to(output_plan)
+            .map_err(|error| CliError::Approval(error.to_string()))?;
+        Some((
+            output_plan,
+            revised
+                .approval_hash()
+                .map_err(|error| CliError::Approval(error.to_string()))?,
+        ))
+    } else {
+        None
+    };
     if json_events {
         print_json_event(
             "project-audit-completed",
@@ -1525,15 +1594,32 @@ fn run_project_audit(
         );
     }
     if machine_output {
-        println!("{}", report.machine_json_result());
+        let mut value: serde_json::Value = serde_json::from_str(&report.machine_json_result())
+            .map_err(|error| CliError::Operation(error.to_string()))?;
+        if let Some((_, approval_hash)) = &prepared_plan {
+            value["data"]["prepared_plan"] = serde_json::json!({
+                "approval_hash": approval_hash,
+                "approval_state": "unapproved",
+            });
+        }
+        println!("{value}");
     } else {
         println!("{}", report.to_human_text());
+        if let Some((path, approval_hash)) = &prepared_plan {
+            println!();
+            println!("Revised Project Plan prepared: {}", path.display());
+            println!("Plan approval hash: {approval_hash}");
+            println!("Approval: Unapproved");
+        }
     }
     Ok(ExitCode::from(1))
 }
 
 fn project_audit_usage() -> CliError {
-    CliError::Usage("usage: iniza projects scan --plan <APPROVED_PLAN> [--remote-check]".to_owned())
+    CliError::Usage(
+        "usage: iniza projects scan --plan <APPROVED_PLAN> [--remote-check [--remote-overlay <PROJECT_IDENTIFIER>:<REVIEW_HASH> --include-ignored <PROJECT_IDENTIFIER>:<CANDIDATE_IDENTIFIER>... --exclude-ignored <PROJECT_IDENTIFIER>:<CANDIDATE_IDENTIFIER>... --output-plan <NEW_PLAN>]]"
+            .to_owned(),
+    )
 }
 
 fn scan_usage() -> CliError {

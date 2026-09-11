@@ -284,11 +284,13 @@ Audit collects:
 - Submodule status
 - Git LFS presence and pointer inventory
 - Ahead/behind when fetch-free local refs permit it
-- Remote reachability only when the user requested a network check
+- Remote reachability and advertised head and tag object identifiers only when the user requested a network check
 
 The default audit is local-only. An explicit remote check permits only Hypertext Transfer Protocol Secure and Secure Shell transports and uses `git ls-remote --heads --tags`; local file, external-helper, unauthenticated Git, and all other transports fail closed. Configured remote user information, passwords, queries, fragments, local paths, and terminal control characters are absent or neutralized in reports. Pre-audit and post-audit status and reference observations identify Projects that changed during inspection and mark their local evidence Unverified.
 
-Restorable and Synchronized are separate conclusions. Until a Project Capsule and Restore Rehearsal exist, the audit always reports a Restorable gap. Remote absence, skipped or failed checks, missing upstreams, ahead or behind state, and local-only references appear as Synchronized gaps. A remote failure retains the local audit and cannot block later Project protection.
+Restorable and Synchronized are separate conclusions. Until a selected Project representation and Restore Rehearsal exist, the audit always reports a Restorable gap. Remote absence, skipped or failed checks, missing upstreams, ahead or behind state, a live upstream revision mismatch, and local-only references appear as Synchronized gaps. A remote failure retains the local audit and cannot block later full Project Capsule protection.
+
+Protection classification is deterministic and Plan-bound. Local-only state selects a full Project Capsule. A remotely reconstructed representation is eligible only when the Project is clean, current, has no local-only references or stash, and the live remote advertises the exact local commit on the configured upstream branch. Every pending ignored-state candidate receives one explicit decision. The resulting revised Plan is unapproved and records the selected local overlay plus the exact remote reconstruction recipe; it cannot itself establish Restorable status.
 
 ### Capsule representation
 

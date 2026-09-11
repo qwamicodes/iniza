@@ -25,6 +25,7 @@ pub enum ProjectHead {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectLocalState {
     head: ProjectHead,
+    head_object: Option<String>,
     upstream: Option<String>,
     ahead: Option<u64>,
     behind: Option<u64>,
@@ -42,6 +43,10 @@ pub struct ProjectLocalState {
 impl ProjectLocalState {
     pub fn head(&self) -> &ProjectHead {
         &self.head
+    }
+
+    pub fn head_object(&self) -> Option<&str> {
+        self.head_object.as_deref()
     }
 
     pub fn upstream(&self) -> Option<&str> {
@@ -272,6 +277,7 @@ pub struct SanitizedRemote {
     name: String,
     address: String,
     check_outcome: RemoteCheckOutcome,
+    advertised_references: BTreeMap<String, String>,
 }
 
 impl SanitizedRemote {
@@ -317,6 +323,504 @@ impl<'a> ProjectAuditRequest<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectAuditReport {
     projects: Vec<ProjectAudit>,
+    plan_hash: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectProtectionClassification {
+    FullProjectCapsule,
+    RemoteReconstructionWithLocalOverlay,
+    ActionRequired,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectProtectionReason {
+    AheadCommits(u64),
+    BehindCommits(u64),
+    DivergedCommits { ahead: u64, behind: u64 },
+    MissingUpstream,
+    RemoteCheckNotRequested,
+    RemoteCheckFailed,
+    RemoteRevisionMismatch,
+    UpstreamComparisonUnavailable,
+    LocalAuditUnverified,
+    ChangedDuringAudit,
+    IgnoredStateUnavailable,
+    LocalStateRequiresFullCapsule,
+    RepositoryWithoutRemote,
+}
+
+pub struct ProjectProtectionRequest<'a> {
+    plan: &'a Plan,
+    project: &'a ProjectAudit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectIgnoredStateDecisionKind {
+    IncludeInLocalOverlay,
+    Exclude,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectIgnoredStateDecision {
+    candidate_id: String,
+    kind: ProjectIgnoredStateDecisionKind,
+}
+
+impl ProjectIgnoredStateDecision {
+    pub fn include(candidate_id: impl Into<String>) -> Self {
+        Self {
+            candidate_id: candidate_id.into(),
+            kind: ProjectIgnoredStateDecisionKind::IncludeInLocalOverlay,
+        }
+    }
+
+    pub fn exclude(candidate_id: impl Into<String>) -> Self {
+        Self {
+            candidate_id: candidate_id.into(),
+            kind: ProjectIgnoredStateDecisionKind::Exclude,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RemoteOverlaySelection {
+    project_id: String,
+    review_hash: String,
+    ignored_decisions: Vec<ProjectIgnoredStateDecision>,
+}
+
+pub struct ProjectProtectionPlanRequest<'a> {
+    plan: &'a Plan,
+    report: &'a ProjectAuditReport,
+    remote_overlays: Vec<RemoteOverlaySelection>,
+}
+
+impl<'a> ProjectProtectionPlanRequest<'a> {
+    pub fn new(plan: &'a Plan, report: &'a ProjectAuditReport) -> Self {
+        Self {
+            plan,
+            report,
+            remote_overlays: Vec::new(),
+        }
+    }
+
+    pub fn with_remote_overlay(
+        mut self,
+        project_id: impl Into<String>,
+        review_hash: impl Into<String>,
+        ignored_decisions: Vec<ProjectIgnoredStateDecision>,
+    ) -> Self {
+        self.remote_overlays.push(RemoteOverlaySelection {
+            project_id: project_id.into(),
+            review_hash: review_hash.into(),
+            ignored_decisions,
+        });
+        self
+    }
+}
+
+impl<'a> ProjectProtectionRequest<'a> {
+    pub fn new(plan: &'a Plan, project: &'a ProjectAudit) -> Self {
+        Self { plan, project }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectProtectionAssessment {
+    classification: ProjectProtectionClassification,
+    reasons: Vec<ProjectProtectionReason>,
+    review_hash: String,
+}
+
+impl ProjectProtectionAssessment {
+    pub fn classification(&self) -> ProjectProtectionClassification {
+        self.classification
+    }
+
+    pub fn reasons(&self) -> &[ProjectProtectionReason] {
+        &self.reasons
+    }
+
+    pub fn review_hash(&self) -> &str {
+        &self.review_hash
+    }
+}
+
+pub struct ProjectProtectionEngine;
+
+impl ProjectProtectionEngine {
+    pub fn classify(
+        request: ProjectProtectionRequest<'_>,
+    ) -> Result<ProjectProtectionAssessment, CoreError> {
+        if request.plan.approval_state()? != PlanApprovalState::Approved {
+            return Err(CoreError::InvalidPlan(
+                "Project protection classification requires an approved, non-stale directory Plan"
+                    .to_owned(),
+            ));
+        }
+        let mut assessment = classify_project(request.project);
+        assessment.review_hash = project_protection_review_hash(
+            &request.plan.approval_hash()?,
+            request.project,
+            &assessment,
+        );
+        Ok(assessment)
+    }
+
+    pub fn prepare_plan(request: ProjectProtectionPlanRequest<'_>) -> Result<Plan, CoreError> {
+        if request.plan.approval_state()? != PlanApprovalState::Approved
+            || request.report.plan_hash != request.plan.approval_hash()?
+        {
+            return Err(CoreError::InvalidPlan(
+                "Project protection planning requires the exact approved Plan and its bound audit"
+                    .to_owned(),
+            ));
+        }
+
+        let mut revised = request.plan.clone();
+        let mut selected_projects = std::collections::BTreeSet::new();
+        for selection in request.remote_overlays {
+            if !selected_projects.insert(selection.project_id.clone()) {
+                return Err(CoreError::InvalidPlan(
+                    "Project protection planning contains a duplicate Project decision".to_owned(),
+                ));
+            }
+            apply_remote_overlay_selection(&mut revised, request.report, selection)?;
+        }
+        revised.approved_hash = None;
+        revised.recipes.sort();
+        revised.recipes.dedup();
+        Ok(revised)
+    }
+}
+
+fn apply_remote_overlay_selection(
+    revised: &mut Plan,
+    report: &ProjectAuditReport,
+    selection: RemoteOverlaySelection,
+) -> Result<(), CoreError> {
+    let project = report
+        .projects
+        .iter()
+        .find(|project| project.id == selection.project_id)
+        .ok_or_else(|| CoreError::InvalidPlan("unknown Project protection decision".to_owned()))?;
+    let mut assessment = classify_project(project);
+    assessment.review_hash =
+        project_protection_review_hash(&report.plan_hash, project, &assessment);
+    if assessment.classification
+        != ProjectProtectionClassification::RemoteReconstructionWithLocalOverlay
+        || assessment.review_hash != selection.review_hash
+    {
+        return Err(CoreError::InvalidPlan(
+            "Project protection decision is stale or is not eligible for remote reconstruction"
+                .to_owned(),
+        ));
+    }
+
+    let candidates = project
+        .ignored_state_inventory
+        .candidates()
+        .ok_or_else(|| {
+            CoreError::InvalidPlan("ignored-state inventory is unavailable".to_owned())
+        })?;
+    let mut decisions = BTreeMap::new();
+    for decision in selection.ignored_decisions {
+        if decisions
+            .insert(decision.candidate_id, decision.kind)
+            .is_some()
+        {
+            return Err(CoreError::InvalidPlan(
+                "Project protection planning contains a duplicate ignored-state decision"
+                    .to_owned(),
+            ));
+        }
+    }
+    if decisions.len() != candidates.len()
+        || candidates
+            .iter()
+            .any(|candidate| !decisions.contains_key(candidate.id()))
+    {
+        return Err(CoreError::InvalidPlan(
+            "every ignored-state candidate requires one exact protection decision".to_owned(),
+        ));
+    }
+
+    let plan_root = revised
+        .approved_roots
+        .iter()
+        .find(|root| project.root.starts_with(root))
+        .ok_or_else(|| CoreError::InvalidPlan("Project escaped the approved Plan".to_owned()))?;
+    let relative_project = project
+        .root
+        .strip_prefix(plan_root)
+        .map_err(|_| CoreError::InvalidPlan("Project escaped the approved Plan".to_owned()))?;
+    let relative_project = if relative_project.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        relative_project.to_path_buf()
+    };
+    let mut included_paths = std::collections::BTreeSet::new();
+    included_paths.insert(relative_project.clone());
+    for candidate in candidates {
+        if decisions.get(candidate.id())
+            == Some(&ProjectIgnoredStateDecisionKind::IncludeInLocalOverlay)
+        {
+            let candidate_path = if relative_project == Path::new(".") {
+                candidate.relative_path.clone()
+            } else {
+                relative_project.join(&candidate.relative_path)
+            };
+            let mut current = Some(candidate_path.as_path());
+            while let Some(path) = current {
+                included_paths.insert(path.to_path_buf());
+                if path == relative_project {
+                    break;
+                }
+                current = path
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty());
+            }
+        }
+    }
+
+    for item in &mut revised.items {
+        let inside_project = relative_project == Path::new(".")
+            || item.relative_path == relative_project
+            || item.relative_path.starts_with(&relative_project);
+        if !inside_project {
+            continue;
+        }
+        if included_paths.contains(&item.relative_path) {
+            item.disposition = crate::Disposition::Included;
+            item.explanation =
+                "included in the reviewed encrypted Project local overlay".to_owned();
+        } else {
+            item.disposition = crate::Disposition::Excluded;
+            item.protection_requirement = ProtectionRequirement::Optional;
+            item.explanation =
+                "excluded because the reviewed Project is remotely reconstructable".to_owned();
+        }
+    }
+    let upstream = project.local_state.upstream.as_deref().ok_or_else(|| {
+        CoreError::InvalidPlan("remote reconstruction recipe requires an upstream".to_owned())
+    })?;
+    let remote_name = upstream.split_once('/').map_or(upstream, |(name, _)| name);
+    let remote = project
+        .remotes
+        .iter()
+        .find(|remote| remote.name == remote_name)
+        .ok_or_else(|| {
+            CoreError::InvalidPlan(
+                "remote reconstruction recipe requires the reviewed upstream remote".to_owned(),
+            )
+        })?;
+    let head_object = project.local_state.head_object.as_deref().ok_or_else(|| {
+        CoreError::InvalidPlan(
+            "remote reconstruction recipe requires an exact commit object identifier".to_owned(),
+        )
+    })?;
+    let recipe = serde_json::json!({
+        "commit_object": head_object,
+        "project_id": project.id,
+        "remote": remote.address,
+        "review_hash": assessment.review_hash,
+        "upstream": upstream,
+        "validation": "checkout-must-match-exact-commit-object",
+    });
+    revised
+        .recipes
+        .push(format!("project-remote-overlay-v1:{recipe}"));
+    Ok(())
+}
+
+fn classify_project(project: &ProjectAudit) -> ProjectProtectionAssessment {
+    let local = &project.local_state;
+    let ignored_state_is_complete = matches!(
+        project.ignored_state_inventory,
+        IgnoredStateInventory::Complete { .. }
+    );
+    let current_branch_without_upstream = match (&local.head, local.upstream.as_deref()) {
+        (ProjectHead::Branch(branch), None) => Some(branch.as_str()),
+        _ => None,
+    };
+    let has_unpublished_local_branch = local
+        .local_only_branches
+        .iter()
+        .any(|branch| current_branch_without_upstream != Some(branch.as_str()));
+    let has_local_only_state = local.staged_changes > 0
+        || local.unstaged_changes > 0
+        || local.untracked_items > 0
+        || local.stash_count > 0
+        || has_unpublished_local_branch
+        || !local.local_only_tags.is_empty()
+        || !matches!(local.head, ProjectHead::Branch(_));
+
+    let mut reasons = Vec::new();
+    if !local.verified {
+        reasons.push(ProjectProtectionReason::LocalAuditUnverified);
+    }
+    if local.changed_during_audit {
+        reasons.push(ProjectProtectionReason::ChangedDuringAudit);
+    }
+    if !ignored_state_is_complete {
+        reasons.push(ProjectProtectionReason::IgnoredStateUnavailable);
+    }
+    if !reasons.is_empty() {
+        return ProjectProtectionAssessment {
+            classification: ProjectProtectionClassification::ActionRequired,
+            reasons,
+            review_hash: String::new(),
+        };
+    }
+
+    if has_local_only_state {
+        return ProjectProtectionAssessment {
+            classification: ProjectProtectionClassification::FullProjectCapsule,
+            reasons: vec![ProjectProtectionReason::LocalStateRequiresFullCapsule],
+            review_hash: String::new(),
+        };
+    }
+    if project.remotes.is_empty() {
+        return ProjectProtectionAssessment {
+            classification: ProjectProtectionClassification::FullProjectCapsule,
+            reasons: vec![ProjectProtectionReason::RepositoryWithoutRemote],
+            review_hash: String::new(),
+        };
+    }
+
+    let Some(upstream) = local.upstream.as_deref() else {
+        return ProjectProtectionAssessment {
+            classification: ProjectProtectionClassification::ActionRequired,
+            reasons: vec![ProjectProtectionReason::MissingUpstream],
+            review_hash: String::new(),
+        };
+    };
+    match (local.ahead, local.behind) {
+        (Some(ahead), Some(behind)) if ahead > 0 && behind > 0 => {
+            reasons.push(ProjectProtectionReason::DivergedCommits { ahead, behind });
+        }
+        (Some(ahead), Some(0)) if ahead > 0 => {
+            reasons.push(ProjectProtectionReason::AheadCommits(ahead));
+        }
+        (Some(0), Some(behind)) if behind > 0 => {
+            reasons.push(ProjectProtectionReason::BehindCommits(behind));
+        }
+        (Some(0), Some(0)) => {}
+        _ => reasons.push(ProjectProtectionReason::UpstreamComparisonUnavailable),
+    }
+
+    let upstream_remote = upstream.split_once('/').map(|(remote, _)| remote);
+    let remote_outcome = upstream_remote.and_then(|upstream_remote| {
+        project
+            .remotes
+            .iter()
+            .find(|remote| remote.name == upstream_remote)
+            .map(|remote| &remote.check_outcome)
+    });
+    match remote_outcome {
+        Some(RemoteCheckOutcome::Reachable) => {
+            if !upstream_remote_advertises_local_head(project) {
+                reasons.push(ProjectProtectionReason::RemoteRevisionMismatch);
+            }
+        }
+        Some(RemoteCheckOutcome::NotRequested) => {
+            reasons.push(ProjectProtectionReason::RemoteCheckNotRequested);
+        }
+        Some(RemoteCheckOutcome::Failed { .. }) | None => {
+            reasons.push(ProjectProtectionReason::RemoteCheckFailed);
+        }
+    }
+
+    ProjectProtectionAssessment {
+        classification: if reasons.is_empty() {
+            ProjectProtectionClassification::RemoteReconstructionWithLocalOverlay
+        } else {
+            ProjectProtectionClassification::ActionRequired
+        },
+        reasons,
+        review_hash: String::new(),
+    }
+}
+
+fn upstream_remote_advertises_local_head(project: &ProjectAudit) -> bool {
+    project
+        .local_state
+        .upstream
+        .as_deref()
+        .and_then(|upstream| upstream.split_once('/'))
+        .and_then(|(remote_name, branch)| {
+            let reference = format!("refs/heads/{branch}");
+            project
+                .remotes
+                .iter()
+                .find(|remote| remote.name == remote_name)
+                .filter(|remote| remote.check_outcome == RemoteCheckOutcome::Reachable)
+                .and_then(|remote| remote.advertised_references.get(&reference))
+        })
+        .zip(project.local_state.head_object.as_ref())
+        .is_some_and(|(advertised, local)| advertised == local)
+}
+
+fn project_protection_review_hash(
+    plan_hash: &str,
+    project: &ProjectAudit,
+    assessment: &ProjectProtectionAssessment,
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"iniza project protection review v1\0");
+    hasher.update(plan_hash.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(project.id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(
+        project
+            .local_state
+            .observation_hash
+            .as_deref()
+            .unwrap_or("unverified")
+            .as_bytes(),
+    );
+    hasher.update(b"\0");
+    hasher.update(machine_protection_classification(assessment.classification).as_bytes());
+    for reason in &assessment.reasons {
+        hasher.update(b"\0reason\0");
+        hasher.update(machine_protection_reason(reason).to_string().as_bytes());
+    }
+    for remote in &project.remotes {
+        hasher.update(b"\0remote\0");
+        hasher.update(remote.name.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(remote.address.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(remote_check_name(&remote.check_outcome).as_bytes());
+        for (reference, object) in &remote.advertised_references {
+            hasher.update(b"\0advertised-reference\0");
+            hasher.update(reference.as_bytes());
+            hasher.update(b"\0");
+            hasher.update(object.as_bytes());
+        }
+    }
+    match &project.ignored_state_inventory {
+        IgnoredStateInventory::Complete {
+            candidates,
+            excluded_by_plan_count,
+        } => {
+            hasher.update(b"\0ignored-complete\0");
+            hasher.update(excluded_by_plan_count.to_string().as_bytes());
+            for candidate in candidates {
+                hasher.update(b"\0candidate\0");
+                hasher.update(candidate.id.as_bytes());
+                hasher.update(b"\0");
+                hasher.update(ignored_review_name(candidate.review).as_bytes());
+            }
+        }
+        IgnoredStateInventory::Unavailable { reason } => {
+            hasher.update(b"\0ignored-unavailable\0");
+            hasher.update(ignored_state_unavailable_reason_code(*reason).as_bytes());
+        }
+    }
+    format!("project_protection_blake3_{}", hasher.finalize().to_hex())
 }
 
 impl ProjectAuditReport {
@@ -339,12 +843,41 @@ impl ProjectAuditReport {
                 protection_requirement_name(project.protection_requirement)
             ));
             lines.push(format!("  head: {}", human_head(&project.local_state.head)));
+            if let (Some(upstream), Some(ahead), Some(behind)) = (
+                project.local_state.upstream.as_deref(),
+                project.local_state.ahead,
+                project.local_state.behind,
+            ) {
+                lines.push(format!(
+                    "  upstream: {} ({} ahead, {} behind)",
+                    safe_text(upstream),
+                    ahead,
+                    behind,
+                ));
+            }
             lines.push(format!(
                 "  working tree: {} staged, {} unstaged, {} untracked",
                 project.local_state.staged_changes,
                 project.local_state.unstaged_changes,
                 project.local_state.untracked_items,
             ));
+            let mut protection = classify_project(project);
+            protection.review_hash =
+                project_protection_review_hash(&self.plan_hash, project, &protection);
+            lines.push(format!(
+                "  protection: {}",
+                human_protection_classification(protection.classification)
+            ));
+            lines.push(format!(
+                "  protection review hash: {}",
+                protection.review_hash
+            ));
+            for reason in &protection.reasons {
+                lines.push(format!(
+                    "  protection reason: {}",
+                    human_protection_reason(reason)
+                ));
+            }
             for remote in &project.remotes {
                 lines.push(format!(
                     "  remote: {} {} ({})",
@@ -365,7 +898,8 @@ impl ProjectAuditReport {
                     ));
                     for candidate in candidates {
                         lines.push(format!(
-                            "  ignored review: {} — {}",
+                            "  ignored review: {}  {} — {}",
+                            candidate.id,
                             safe_path_display(&candidate.relative_path),
                             ignored_review_name(candidate.review),
                         ));
@@ -420,6 +954,9 @@ impl ProjectAuditReport {
                         })
                     })
                     .collect::<Vec<_>>();
+                let mut protection = classify_project(project);
+                protection.review_hash =
+                    project_protection_review_hash(&self.plan_hash, project, &protection);
                 serde_json::json!({
                     "project_id": project.id,
                     "kind": project_kind_name(project.kind),
@@ -445,6 +982,11 @@ impl ProjectAuditReport {
                         "configured": project.git_large_file_storage.configured,
                         "pointer_files": project.git_large_file_storage.pointer_files,
                     },
+                    "protection": {
+                        "classification": machine_protection_classification(protection.classification),
+                        "reasons": protection.reasons.iter().map(machine_protection_reason).collect::<Vec<_>>(),
+                        "review_hash": protection.review_hash,
+                    },
                     "restorable": {
                         "state": "gap",
                         "reasons": project.restorable_gaps(),
@@ -468,6 +1010,116 @@ impl ProjectAuditReport {
             "errors": [],
         })
         .to_string()
+    }
+}
+
+fn human_protection_classification(
+    classification: ProjectProtectionClassification,
+) -> &'static str {
+    match classification {
+        ProjectProtectionClassification::FullProjectCapsule => "Full Project Capsule",
+        ProjectProtectionClassification::RemoteReconstructionWithLocalOverlay => {
+            "Remote Reconstruction with Local Overlay"
+        }
+        ProjectProtectionClassification::ActionRequired => "Action Required",
+    }
+}
+
+fn machine_protection_classification(
+    classification: ProjectProtectionClassification,
+) -> &'static str {
+    match classification {
+        ProjectProtectionClassification::FullProjectCapsule => "full-project-capsule",
+        ProjectProtectionClassification::RemoteReconstructionWithLocalOverlay => {
+            "remote-reconstruction-with-local-overlay"
+        }
+        ProjectProtectionClassification::ActionRequired => "action-required",
+    }
+}
+
+fn machine_protection_reason(reason: &ProjectProtectionReason) -> serde_json::Value {
+    match reason {
+        ProjectProtectionReason::AheadCommits(count) => {
+            serde_json::json!({"reason": "ahead-commits", "count": count})
+        }
+        ProjectProtectionReason::BehindCommits(count) => {
+            serde_json::json!({"reason": "behind-commits", "count": count})
+        }
+        ProjectProtectionReason::DivergedCommits { ahead, behind } => {
+            serde_json::json!({"reason": "diverged-commits", "ahead": ahead, "behind": behind})
+        }
+        ProjectProtectionReason::MissingUpstream => {
+            serde_json::json!({"reason": "missing-upstream"})
+        }
+        ProjectProtectionReason::RemoteCheckNotRequested => {
+            serde_json::json!({"reason": "remote-check-not-requested"})
+        }
+        ProjectProtectionReason::RemoteCheckFailed => {
+            serde_json::json!({"reason": "remote-check-failed"})
+        }
+        ProjectProtectionReason::RemoteRevisionMismatch => {
+            serde_json::json!({"reason": "remote-revision-mismatch"})
+        }
+        ProjectProtectionReason::UpstreamComparisonUnavailable => {
+            serde_json::json!({"reason": "upstream-comparison-unavailable"})
+        }
+        ProjectProtectionReason::LocalAuditUnverified => {
+            serde_json::json!({"reason": "local-audit-unverified"})
+        }
+        ProjectProtectionReason::ChangedDuringAudit => {
+            serde_json::json!({"reason": "changed-during-audit"})
+        }
+        ProjectProtectionReason::IgnoredStateUnavailable => {
+            serde_json::json!({"reason": "ignored-state-unavailable"})
+        }
+        ProjectProtectionReason::LocalStateRequiresFullCapsule => {
+            serde_json::json!({"reason": "local-state-requires-full-capsule"})
+        }
+        ProjectProtectionReason::RepositoryWithoutRemote => {
+            serde_json::json!({"reason": "repository-without-remote"})
+        }
+    }
+}
+
+fn human_protection_reason(reason: &ProjectProtectionReason) -> String {
+    match reason {
+        ProjectProtectionReason::AheadCommits(count) => {
+            format!("{count} ahead commit(s) require a separately reviewed Push Plan")
+        }
+        ProjectProtectionReason::BehindCommits(count) => {
+            format!("{count} behind commit(s) require owner reconciliation outside Iniza")
+        }
+        ProjectProtectionReason::DivergedCommits { ahead, behind } => format!(
+            "diverged by {ahead} ahead and {behind} behind commit(s); owner reconciliation is required outside Iniza"
+        ),
+        ProjectProtectionReason::MissingUpstream => "the current branch has no upstream".to_owned(),
+        ProjectProtectionReason::RemoteCheckNotRequested => {
+            "the reviewed remote check was not requested".to_owned()
+        }
+        ProjectProtectionReason::RemoteCheckFailed => {
+            "the reviewed upstream remote check failed".to_owned()
+        }
+        ProjectProtectionReason::RemoteRevisionMismatch => {
+            "the reviewed upstream remote does not advertise the exact local commit".to_owned()
+        }
+        ProjectProtectionReason::UpstreamComparisonUnavailable => {
+            "ahead and behind comparison is unavailable".to_owned()
+        }
+        ProjectProtectionReason::LocalAuditUnverified => {
+            "the local Project audit is unverified".to_owned()
+        }
+        ProjectProtectionReason::ChangedDuringAudit => {
+            "the Project changed during audit".to_owned()
+        }
+        ProjectProtectionReason::IgnoredStateUnavailable => {
+            "the ignored-state inventory is unavailable".to_owned()
+        }
+        ProjectProtectionReason::LocalStateRequiresFullCapsule => {
+            "local-only state requires a full Project Capsule".to_owned()
+        }
+        ProjectProtectionReason::RepositoryWithoutRemote => {
+            "a Project without a remote requires a full Project Capsule".to_owned()
+        }
     }
 }
 
@@ -513,6 +1165,15 @@ impl ProjectAudit {
         }
         if self.local_state.ahead.is_some_and(|count| count > 0) {
             gaps.push("ahead commits require a separately reviewed Push Plan");
+        }
+        if self.local_state.upstream.is_some()
+            && self
+                .remotes
+                .iter()
+                .any(|remote| remote.check_outcome == RemoteCheckOutcome::Reachable)
+            && !upstream_remote_advertises_local_head(self)
+        {
+            gaps.push("the live upstream revision differs from the local commit");
         }
         if !self.local_state.local_only_branches.is_empty()
             || !self.local_state.local_only_tags.is_empty()
@@ -823,7 +1484,10 @@ impl<G: GitProcess> ProjectAuditEngine<G> {
             });
         }
 
-        Ok(ProjectAuditReport { projects })
+        Ok(ProjectAuditReport {
+            projects,
+            plan_hash: request.plan.approval_hash()?,
+        })
     }
 }
 
@@ -1123,6 +1787,7 @@ fn audit_remotes(git: &impl GitProcess, root: &Path, remote_check: bool) -> Remo
                     name: safe_text(name),
                     address: sanitize_remote_address(&address),
                     check_outcome: RemoteCheckOutcome::NotRequested,
+                    advertised_references: BTreeMap::new(),
                 },
             ))
         })
@@ -1143,6 +1808,7 @@ fn audit_remotes(git: &impl GitProcess, root: &Path, remote_check: bool) -> Remo
                 match git.run(root, &arguments) {
                     Ok(output) if output.status_code == Some(0) => {
                         remote.check_outcome = RemoteCheckOutcome::Reachable;
+                        remote.advertised_references = parse_advertised_references(&output.stdout);
                         published_tags.extend(parse_advertised_tags(&output.stdout));
                     }
                     _ => {
@@ -1165,6 +1831,14 @@ fn audit_remotes(git: &impl GitProcess, root: &Path, remote_check: bool) -> Remo
         remotes,
         published_tags: all_reachable.then_some(published_tags),
     }
+}
+
+fn parse_advertised_references(bytes: &[u8]) -> BTreeMap<String, String> {
+    String::from_utf8_lossy(bytes)
+        .lines()
+        .filter_map(|line| line.split_once('\t'))
+        .map(|(object, reference)| (safe_text(reference), safe_text(object)))
+        .collect()
 }
 
 fn parse_advertised_tags(bytes: &[u8]) -> std::collections::BTreeSet<String> {
@@ -1245,6 +1919,9 @@ fn audit_local_state(
     } else {
         ProjectHead::Unborn
     };
+    let head_object = run_optional(git, root, &["rev-parse", "--verify", "HEAD"])
+        .map(|value| safe_text(value.trim()))
+        .filter(|value| !value.is_empty());
     let upstream = run_optional(
         git,
         root,
@@ -1319,6 +1996,7 @@ fn audit_local_state(
 
     ProjectLocalState {
         head,
+        head_object,
         upstream,
         ahead,
         behind,

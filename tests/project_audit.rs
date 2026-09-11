@@ -12,9 +12,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::os::unix::fs::PermissionsExt;
 
 use iniza::{
-    GitProcess, GitProcessOutput, IgnoredReview, InstalledGit, PlanEngine, ProjectAuditEngine,
-    ProjectAuditRequest, ProjectHead, ProjectKind, ProtectionRequirement, RemoteCheckOutcome,
-    ScanRequest,
+    Disposition, GitProcess, GitProcessOutput, IgnoredReview, InstalledGit, PlanApprovalState,
+    PlanEngine, ProjectAuditEngine, ProjectAuditRequest, ProjectHead, ProjectIgnoredStateDecision,
+    ProjectKind, ProjectProtectionClassification, ProjectProtectionEngine,
+    ProjectProtectionPlanRequest, ProjectProtectionReason, ProjectProtectionRequest,
+    ProtectionRequirement, RemoteCheckOutcome, ScanRequest,
 };
 
 static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -228,6 +230,516 @@ fn owner_sees_branch_working_tree_stash_and_local_only_branch_risk_without_a_rem
     assert_eq!(local.untracked_items(), 1);
     assert_eq!(local.stash_count(), 1);
     assert_eq!(local.local_only_branches(), &["local-only"]);
+
+    let human = report.to_human_text();
+    assert!(
+        human.contains("upstream: origin/main (1 ahead, 0 behind)"),
+        "human review must show exact ahead and behind counts: {human}"
+    );
+}
+
+#[test]
+fn clean_current_project_uses_remote_reconstruction_with_a_local_overlay() {
+    let directory = TestDirectory::new("remote-reconstruction");
+    let project_root = directory.path.join("required-project");
+    init_repository(&project_root);
+    git(&project_root, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+    fs::write(project_root.join("tracked.txt"), "tracked fixture\n")
+        .expect("tracked fixture should be written");
+    fs::write(project_root.join(".gitignore"), ".env\nnode_modules/\n")
+        .expect("ignore fixture should be written");
+    git(&project_root, &["add", "tracked.txt", ".gitignore"]);
+    commit(&project_root, "initial fixture");
+    fs::write(project_root.join(".env"), "SYNTHETIC_ONLY=value\n")
+        .expect("ignored environment fixture should be written");
+    fs::create_dir(project_root.join("node_modules"))
+        .expect("generated directory should be created");
+    fs::write(
+        project_root.join("node_modules/generated.js"),
+        "generated fixture\n",
+    )
+    .expect("generated fixture should be written");
+    git(
+        &project_root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://example.invalid/private/repository.git",
+        ],
+    );
+    git(
+        &project_root,
+        &["update-ref", "refs/remotes/origin/main", "HEAD"],
+    );
+    git(
+        &project_root,
+        &["branch", "--set-upstream-to=origin/main", "main"],
+    );
+
+    let mut plan = PlanEngine::local()
+        .scan(ScanRequest::for_directory(&project_root).exclude("node_modules"))
+        .expect("required Project should scan");
+    let reviewed_hash = plan.approval_hash().expect("Plan should have a hash");
+    plan.approve(&reviewed_hash)
+        .expect("matching reviewed hash should approve the Plan");
+    let commit_id = git_stdout(&project_root, &["rev-parse", "HEAD"]);
+    let report = ProjectAuditEngine::with_git_process(ScriptedRemoteGit {
+        installed: InstalledGit::default(),
+        remote_status: 0,
+        remote_stdout: format!("{commit_id}\trefs/heads/main\n").into_bytes(),
+        remote_stderr: Vec::new(),
+    })
+    .audit(ProjectAuditRequest::from_plan(&plan).with_remote_check())
+    .expect("verified remote-aware Project audit should succeed");
+    let project = report
+        .projects()
+        .first()
+        .expect("Project should be reported");
+
+    let assessment =
+        ProjectProtectionEngine::classify(ProjectProtectionRequest::new(&plan, project))
+            .expect("clean synchronized Project should classify");
+    let repeated = ProjectProtectionEngine::classify(ProjectProtectionRequest::new(&plan, project))
+        .expect("unchanged Project classification should repeat");
+
+    assert_eq!(
+        assessment.classification(),
+        ProjectProtectionClassification::RemoteReconstructionWithLocalOverlay
+    );
+    assert_eq!(assessment.review_hash(), repeated.review_hash());
+    assert!(
+        assessment
+            .review_hash()
+            .starts_with("project_protection_blake3_"),
+        "classification must expose a domain-specific review hash"
+    );
+    let ignored = project
+        .ignored_candidates()
+        .expect("ignored-state inventory should be complete");
+    assert_eq!(ignored.len(), 1, "generated state is already excluded");
+    assert_eq!(ignored[0].relative_path(), Path::new(".env"));
+    let incomplete_error = ProjectProtectionEngine::prepare_plan(
+        ProjectProtectionPlanRequest::new(&plan, &report).with_remote_overlay(
+            project.id(),
+            assessment.review_hash(),
+            Vec::new(),
+        ),
+    )
+    .expect_err("every ignored candidate must receive an explicit decision");
+    assert_eq!(
+        incomplete_error.to_string(),
+        "every ignored-state candidate requires one exact protection decision"
+    );
+    let stale_error = ProjectProtectionEngine::prepare_plan(
+        ProjectProtectionPlanRequest::new(&plan, &report).with_remote_overlay(
+            project.id(),
+            "project_protection_blake3_stale",
+            vec![ProjectIgnoredStateDecision::include(ignored[0].id())],
+        ),
+    )
+    .expect_err("a stale protection decision must fail closed");
+    assert_eq!(
+        stale_error.to_string(),
+        "Project protection decision is stale or is not eligible for remote reconstruction"
+    );
+    let revised = ProjectProtectionEngine::prepare_plan(
+        ProjectProtectionPlanRequest::new(&plan, &report).with_remote_overlay(
+            project.id(),
+            assessment.review_hash(),
+            vec![ProjectIgnoredStateDecision::include(ignored[0].id())],
+        ),
+    )
+    .expect("reviewed remote overlay should produce a revised Plan");
+    assert_eq!(
+        revised.approval_state().unwrap(),
+        PlanApprovalState::Unapproved
+    );
+    assert_ne!(
+        revised.approval_hash().unwrap(),
+        plan.approval_hash().unwrap()
+    );
+    for (relative_path, expected) in [
+        (".", Disposition::Included),
+        (".env", Disposition::Included),
+        ("tracked.txt", Disposition::Excluded),
+        (".git/HEAD", Disposition::Excluded),
+        ("node_modules/generated.js", Disposition::Excluded),
+    ] {
+        assert_eq!(
+            revised
+                .items()
+                .iter()
+                .find(|item| item.relative_path == Path::new(relative_path))
+                .unwrap_or_else(|| panic!("missing revised item {relative_path}"))
+                .disposition,
+            expected,
+            "unexpected revised Disposition for {relative_path}"
+        );
+    }
+    let recovery_recipe = revised
+        .recipes()
+        .iter()
+        .find(|recipe| recipe.starts_with("project-remote-overlay-v1:"))
+        .expect("revised Plan should retain an exact remote reconstruction recipe");
+    assert!(recovery_recipe.contains("https://example.invalid/private/repository.git"));
+    assert!(recovery_recipe.contains("origin/main"));
+    assert!(recovery_recipe.contains(&commit_id));
+    assert!(recovery_recipe.contains(assessment.review_hash()));
+    assert!(
+        report
+            .to_human_text()
+            .contains("protection: Remote Reconstruction with Local Overlay"),
+        "human Project scan must show the selected protection strategy"
+    );
+    assert!(
+        report.to_human_text().contains(assessment.review_hash()),
+        "human Project scan must show the exact protection review hash"
+    );
+    assert!(
+        report
+            .to_human_text()
+            .contains(&format!("ignored review: {}  .env —", ignored[0].id())),
+        "human Project scan must expose the stable ignored-state candidate identifier"
+    );
+    let machine: serde_json::Value = serde_json::from_str(&report.machine_json_result())
+        .expect("machine Project scan should remain valid JavaScript Object Notation");
+    assert_eq!(
+        machine["data"]["projects"][0]["protection"]["classification"],
+        "remote-reconstruction-with-local-overlay"
+    );
+    assert_eq!(
+        machine["data"]["projects"][0]["protection"]["review_hash"],
+        assessment.review_hash()
+    );
+    let machine_text = report.machine_json_result();
+    assert!(!machine_text.contains(".env"));
+    assert!(!machine_text.contains("SYNTHETIC_ONLY"));
+}
+
+#[test]
+fn untracked_local_state_requires_a_full_project_capsule() {
+    let directory = TestDirectory::new("full-capsule");
+    let project_root = directory.path.join("required-project");
+    init_repository(&project_root);
+    git(&project_root, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+    fs::write(project_root.join("tracked.txt"), "tracked fixture\n")
+        .expect("tracked fixture should be written");
+    git(&project_root, &["add", "tracked.txt"]);
+    commit(&project_root, "initial fixture");
+    git(
+        &project_root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://example.invalid/private/repository.git",
+        ],
+    );
+    git(
+        &project_root,
+        &["update-ref", "refs/remotes/origin/main", "HEAD"],
+    );
+    git(
+        &project_root,
+        &["branch", "--set-upstream-to=origin/main", "main"],
+    );
+    fs::write(project_root.join("local-only.txt"), "local-only fixture\n")
+        .expect("untracked fixture should be written");
+
+    let mut plan = PlanEngine::local()
+        .scan(ScanRequest::for_directory(&project_root))
+        .expect("required Project should scan");
+    let reviewed_hash = plan.approval_hash().expect("Plan should have a hash");
+    plan.approve(&reviewed_hash)
+        .expect("matching reviewed hash should approve the Plan");
+    let commit_id = git_stdout(&project_root, &["rev-parse", "HEAD"]);
+    let report = ProjectAuditEngine::with_git_process(ScriptedRemoteGit {
+        installed: InstalledGit::default(),
+        remote_status: 0,
+        remote_stdout: format!("{commit_id}\trefs/heads/main\n").into_bytes(),
+        remote_stderr: Vec::new(),
+    })
+    .audit(ProjectAuditRequest::from_plan(&plan).with_remote_check())
+    .expect("verified remote-aware Project audit should succeed");
+    let project = report
+        .projects()
+        .first()
+        .expect("Project should be reported");
+
+    let assessment =
+        ProjectProtectionEngine::classify(ProjectProtectionRequest::new(&plan, project))
+            .expect("Project with local-only state should classify");
+
+    assert_eq!(
+        assessment.classification(),
+        ProjectProtectionClassification::FullProjectCapsule
+    );
+}
+
+#[test]
+fn ahead_project_requires_an_exact_push_plan_action() {
+    let directory = TestDirectory::new("ahead-action");
+    let project_root = directory.path.join("required-project");
+    init_repository(&project_root);
+    git(&project_root, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+    fs::write(project_root.join("tracked.txt"), "tracked fixture\n")
+        .expect("tracked fixture should be written");
+    git(&project_root, &["add", "tracked.txt"]);
+    commit(&project_root, "published fixture");
+    let published_commit = git_stdout(&project_root, &["rev-parse", "HEAD"]);
+    git(
+        &project_root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://example.invalid/private/repository.git",
+        ],
+    );
+    git(
+        &project_root,
+        &["update-ref", "refs/remotes/origin/main", &published_commit],
+    );
+    git(
+        &project_root,
+        &["branch", "--set-upstream-to=origin/main", "main"],
+    );
+    fs::write(project_root.join("ahead.txt"), "ahead fixture\n")
+        .expect("ahead fixture should be written");
+    git(&project_root, &["add", "ahead.txt"]);
+    commit(&project_root, "ahead fixture");
+
+    let mut plan = PlanEngine::local()
+        .scan(ScanRequest::for_directory(&project_root))
+        .expect("required Project should scan");
+    let reviewed_hash = plan.approval_hash().expect("Plan should have a hash");
+    plan.approve(&reviewed_hash)
+        .expect("matching reviewed hash should approve the Plan");
+    let report = ProjectAuditEngine::with_git_process(ScriptedRemoteGit {
+        installed: InstalledGit::default(),
+        remote_status: 0,
+        remote_stdout: format!("{published_commit}\trefs/heads/main\n").into_bytes(),
+        remote_stderr: Vec::new(),
+    })
+    .audit(ProjectAuditRequest::from_plan(&plan).with_remote_check())
+    .expect("verified remote-aware Project audit should succeed");
+    let project = report
+        .projects()
+        .first()
+        .expect("Project should be reported");
+
+    let assessment =
+        ProjectProtectionEngine::classify(ProjectProtectionRequest::new(&plan, project))
+            .expect("ahead Project should classify");
+
+    assert_eq!(
+        assessment.classification(),
+        ProjectProtectionClassification::ActionRequired
+    );
+    assert_eq!(
+        assessment.reasons(),
+        &[
+            ProjectProtectionReason::AheadCommits(1),
+            ProjectProtectionReason::RemoteRevisionMismatch,
+        ]
+    );
+}
+
+#[test]
+fn reachable_remote_with_a_different_revision_requires_owner_action() {
+    let directory = TestDirectory::new("remote-revision-mismatch");
+    let project_root = directory.path.join("required-project");
+    init_repository(&project_root);
+    git(&project_root, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+    fs::write(project_root.join("tracked.txt"), "tracked fixture\n")
+        .expect("tracked fixture should be written");
+    git(&project_root, &["add", "tracked.txt"]);
+    commit(&project_root, "local fixture");
+    git(
+        &project_root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://example.invalid/private/repository.git",
+        ],
+    );
+    git(
+        &project_root,
+        &["update-ref", "refs/remotes/origin/main", "HEAD"],
+    );
+    git(
+        &project_root,
+        &["branch", "--set-upstream-to=origin/main", "main"],
+    );
+
+    let mut plan = PlanEngine::local()
+        .scan(ScanRequest::for_directory(&project_root))
+        .expect("required Project should scan");
+    let reviewed_hash = plan.approval_hash().expect("Plan should have a hash");
+    plan.approve(&reviewed_hash)
+        .expect("matching reviewed hash should approve the Plan");
+    let report = ProjectAuditEngine::with_git_process(ScriptedRemoteGit {
+        installed: InstalledGit::default(),
+        remote_status: 0,
+        remote_stdout: b"0123456789012345678901234567890123456789\trefs/heads/main\n".to_vec(),
+        remote_stderr: Vec::new(),
+    })
+    .audit(ProjectAuditRequest::from_plan(&plan).with_remote_check())
+    .expect("reachable remote audit should succeed");
+    let project = report
+        .projects()
+        .first()
+        .expect("Project should be reported");
+
+    let assessment =
+        ProjectProtectionEngine::classify(ProjectProtectionRequest::new(&plan, project))
+            .expect("remote revision mismatch should classify");
+
+    assert_eq!(
+        assessment.classification(),
+        ProjectProtectionClassification::ActionRequired
+    );
+    assert_eq!(
+        assessment.reasons(),
+        &[ProjectProtectionReason::RemoteRevisionMismatch]
+    );
+    assert!(
+        report
+            .to_human_text()
+            .contains("Synchronized gap: the live upstream revision differs from the local commit")
+    );
+}
+
+#[test]
+fn behind_project_requires_owner_reconciliation_with_the_exact_count() {
+    let directory = TestDirectory::new("behind-action");
+    let project_root = directory.path.join("required-project");
+    init_repository(&project_root);
+    git(&project_root, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+    fs::write(project_root.join("tracked.txt"), "tracked fixture\n")
+        .expect("tracked fixture should be written");
+    git(&project_root, &["add", "tracked.txt"]);
+    commit(&project_root, "initial fixture");
+    git(&project_root, &["switch", "-q", "-c", "remote-main"]);
+    fs::write(project_root.join("remote.txt"), "remote fixture\n")
+        .expect("remote fixture should be written");
+    git(&project_root, &["add", "remote.txt"]);
+    commit(&project_root, "remote fixture");
+    let remote_commit = git_stdout(&project_root, &["rev-parse", "HEAD"]);
+    git(&project_root, &["switch", "-q", "main"]);
+    git(
+        &project_root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://example.invalid/private/repository.git",
+        ],
+    );
+    git(
+        &project_root,
+        &["update-ref", "refs/remotes/origin/main", &remote_commit],
+    );
+    git(&project_root, &["branch", "-D", "remote-main"]);
+    git(
+        &project_root,
+        &["branch", "--set-upstream-to=origin/main", "main"],
+    );
+
+    let mut plan = PlanEngine::local()
+        .scan(ScanRequest::for_directory(&project_root))
+        .expect("required Project should scan");
+    let reviewed_hash = plan.approval_hash().expect("Plan should have a hash");
+    plan.approve(&reviewed_hash)
+        .expect("matching reviewed hash should approve the Plan");
+    let report = ProjectAuditEngine::with_git_process(ScriptedRemoteGit {
+        installed: InstalledGit::default(),
+        remote_status: 0,
+        remote_stdout: format!("{remote_commit}\trefs/heads/main\n").into_bytes(),
+        remote_stderr: Vec::new(),
+    })
+    .audit(ProjectAuditRequest::from_plan(&plan).with_remote_check())
+    .expect("verified remote-aware Project audit should succeed");
+    let project = report
+        .projects()
+        .first()
+        .expect("Project should be reported");
+
+    let assessment =
+        ProjectProtectionEngine::classify(ProjectProtectionRequest::new(&plan, project))
+            .expect("behind Project should classify");
+
+    assert_eq!(
+        assessment.classification(),
+        ProjectProtectionClassification::ActionRequired
+    );
+    assert_eq!(
+        assessment.reasons(),
+        &[
+            ProjectProtectionReason::BehindCommits(1),
+            ProjectProtectionReason::RemoteRevisionMismatch,
+        ]
+    );
+}
+
+#[test]
+fn clean_project_without_an_upstream_requires_an_explicit_owner_action() {
+    let directory = TestDirectory::new("missing-upstream-action");
+    let project_root = directory.path.join("required-project");
+    init_repository(&project_root);
+    git(&project_root, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+    fs::write(project_root.join("tracked.txt"), "tracked fixture\n")
+        .expect("tracked fixture should be written");
+    git(&project_root, &["add", "tracked.txt"]);
+    commit(&project_root, "initial fixture");
+    git(
+        &project_root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://example.invalid/private/repository.git",
+        ],
+    );
+    let commit_id = git_stdout(&project_root, &["rev-parse", "HEAD"]);
+    git(
+        &project_root,
+        &["update-ref", "refs/remotes/origin/main", &commit_id],
+    );
+
+    let mut plan = PlanEngine::local()
+        .scan(ScanRequest::for_directory(&project_root))
+        .expect("required Project should scan");
+    let reviewed_hash = plan.approval_hash().expect("Plan should have a hash");
+    plan.approve(&reviewed_hash)
+        .expect("matching reviewed hash should approve the Plan");
+    let report = ProjectAuditEngine::with_git_process(ScriptedRemoteGit {
+        installed: InstalledGit::default(),
+        remote_status: 0,
+        remote_stdout: format!("{commit_id}\trefs/heads/main\n").into_bytes(),
+        remote_stderr: Vec::new(),
+    })
+    .audit(ProjectAuditRequest::from_plan(&plan).with_remote_check())
+    .expect("verified remote-aware Project audit should succeed");
+    let project = report
+        .projects()
+        .first()
+        .expect("Project should be reported");
+
+    let assessment =
+        ProjectProtectionEngine::classify(ProjectProtectionRequest::new(&plan, project))
+            .expect("Project without an upstream should classify");
+
+    assert_eq!(
+        assessment.classification(),
+        ProjectProtectionClassification::ActionRequired
+    );
+    assert_eq!(
+        assessment.reasons(),
+        &[ProjectProtectionReason::MissingUpstream]
+    );
 }
 
 #[test]

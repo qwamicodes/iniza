@@ -72,11 +72,22 @@ iniza plan diff <OLD> <NEW>
 
 ```text
 iniza projects scan --plan <PATH> [--remote-check]
+iniza projects scan --plan <PATH> --remote-check
+  --remote-overlay <PROJECT_IDENTIFIER>:<REVIEW_HASH>
+  [--include-ignored <PROJECT_IDENTIFIER>:<CANDIDATE_IDENTIFIER>]...
+  [--exclude-ignored <PROJECT_IDENTIFIER>:<CANDIDATE_IDENTIFIER>]...
+  --output-plan <NEW_PLAN>
 ```
 
 The Plan must be approved and non-stale. Project roots and must-protect or optional requirements come from that reviewed Plan; arbitrary roots are not accepted by this implementation. Without `--remote-check`, the command performs no intentional network operation. With it, the command performs a read-only `git ls-remote` check and never fetches, pushes, checks out, commits, merges, rebases, resets, or stashes.
 
-The human result may show local paths, sanitized remote addresses, pending ignored-state paths, and the count of ignored paths already covered by exact Plan exclusions. Each Project reports its ignored-state inventory as Complete or Unavailable. Git failure, malformed output, or bounded-output overflow is Unavailable and adds a Restorable gap; it is never rendered as a successful zero count. JavaScript Object Notation schema version 2 uses stable identifiers, classifications, counts, state, and reason codes; it redacts local remote paths and structurally omits source roots, relative paths, filenames, protected content, and raw Git output. A completed audit exits `1` while Restorable or Synchronized gaps remain; command failure exits `40`.
+The human result may show local paths, sanitized remote addresses, pending ignored-state paths and their stable candidate identifiers, and the count of ignored paths already covered by exact Plan exclusions. Each Project reports its ignored-state inventory as Complete or Unavailable. Git failure, malformed output, or bounded-output overflow is Unavailable and adds a Restorable gap; it is never rendered as a successful zero count.
+
+Every Project also reports exact locally known ahead and behind counts, one of `Full Project Capsule`, `Remote Reconstruction with Local Overlay`, or `Action Required`, typed reasons, and a deterministic protection review hash. Remote reconstruction requires a verified unchanged clean Project, no stash or local-only reference, a configured upstream, zero ahead and behind counts, a successful live remote check, and proof that the live remote advertises the exact local commit on that upstream branch. Reachability alone is insufficient. A reviewed remote-overlay decision creates a new unapproved Plan and requires one exact include-or-exclude decision for every ignored-state candidate; generated state remains excluded unless explicitly reviewed otherwise.
+
+Plan preparation requires `--remote-check`, one `--remote-overlay` decision, an exact decision for every pending ignored candidate in that Project, and a new `--output-plan` path. A stale review hash, ineligible Project, missing or duplicate candidate decision, candidate decision for another Project, or existing output destination fails without writing a revised Plan. The source Plan remains unchanged. Human output identifies the new Plan and approval hash; machine output adds only its unapproved state and hash to the same single result object.
+
+JavaScript Object Notation schema version 2 uses stable identifiers, classifications, counts, state, and reason codes; it redacts local remote paths and structurally omits source roots, relative paths, filenames, protected content, and raw Git output. A completed audit exits `1` while Restorable or Synchronized gaps remain; command failure exits `40`.
 
 ### `iniza projects push`
 
