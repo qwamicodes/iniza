@@ -3,15 +3,17 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use iniza::{
-    BundleEngine, CoreError, InizaCore, InspectRequest, MigrationCaptureOwnerReview,
-    MigrationCaptureRequest, MigrationCaptureState, MigrationWorkflowEngine, OfflineRecoveryEngine,
-    OfflineRecoveryLocator, OfflineRecoveryRehearsalRequest, Plan, PlanApprovalState, PlanEngine,
-    ProjectAuditEngine, ProjectAuditRequest, ProtectionCandidateEngine, ProtectionCandidateRequest,
-    PublicationPolicy, PushExecutionState, PushPlanApprovalRequest, PushPlanDraftRequest,
-    PushPlanEngine, PushPlanExecutionRequest, ReadinessEvidenceEngine,
-    ReadinessEvidenceStatusRequest, RestoreEngine, RestoreRequest, ScanRequest,
-    StoredRecoveryMethodEngine, StoredRecoveryMethodRequest, VaultwardenInstallationReport,
-    VaultwardenInstallationRequest, VaultwardenPreflightReport, VerifiedCopyRequest, VerifyRequest,
+    BundleEngine, CoreError, InizaCore, InspectRequest, InstalledBitwarden,
+    MigrationCaptureOwnerReview, MigrationCaptureRequest, MigrationCaptureState,
+    MigrationWorkflowEngine, OfflineRecoveryEngine, OfflineRecoveryLocator,
+    OfflineRecoveryRehearsalRequest, Plan, PlanApprovalState, PlanEngine, ProjectAuditEngine,
+    ProjectAuditRequest, ProtectionCandidateEngine, ProtectionCandidateRequest, PublicationPolicy,
+    PushExecutionState, PushPlanApprovalRequest, PushPlanDraftRequest, PushPlanEngine,
+    PushPlanExecutionRequest, ReadinessEvidenceEngine, ReadinessEvidenceStatusRequest,
+    RestoreEngine, RestoreRequest, ScanRequest, StoredRecoveryMethodEngine,
+    StoredRecoveryMethodRequest, VaultwardenInstallationReport, VaultwardenInstallationRequest,
+    VaultwardenItemIdentifier, VaultwardenPreflightReport, VaultwardenRecoveryEngine,
+    VaultwardenRecoveryLocator, VerifiedCopyRequest, VerifyRequest,
 };
 
 fn main() -> ExitCode {
@@ -398,6 +400,29 @@ fn run(
         [command, pack_arguments @ ..] if command == "pack" => {
             run_pack(pack_arguments, machine_output, non_interactive)
         }
+        [command, encrypted_arguments @ ..] if command == "verify" => {
+            run_verify(encrypted_arguments, machine_output)
+        }
+        [command, bundle] if command == "inspect" => {
+            let bundle_path = PathBuf::from(bundle);
+            print_progress(
+                machine_output,
+                &format!("Inspecting encrypted Bundle {}", bundle_path.display()),
+            );
+            InizaCore
+                .inspect_bundle(&bundle_path)
+                .map_err(|error| CliError::BundleInvalid(error.to_string()))?;
+            unreachable!("encrypted Bundle inspection requires a stored Recovery Method")
+        }
+        [command, encrypted_arguments @ ..] if command == "inspect" => {
+            run_inspect(encrypted_arguments, machine_output)
+        }
+        [command, encrypted_arguments @ ..] if command == "copy" => {
+            run_copy(encrypted_arguments, machine_output)
+        }
+        [command, encrypted_arguments @ ..] if command == "restore" => {
+            run_restore(encrypted_arguments, machine_output)
+        }
         [
             command,
             plan_flag,
@@ -440,188 +465,400 @@ fn run(
             }
             Ok(ExitCode::from(report.exit_code()))
         }
-        [command, bundle_flag, bundle, recovery_flag, recovery_document]
-            if command == "verify"
-                && bundle_flag == "--bundle"
-                && recovery_flag == "--offline-recovery-document" =>
-        {
-            print_progress(machine_output, "Fully verifying encrypted Bundle");
-            let loaded = StoredRecoveryMethodEngine::local()
-                .load(StoredRecoveryMethodRequest::new(
-                    bundle,
-                    OfflineRecoveryLocator::new(recovery_document),
-                ))
-                .map_err(map_bundle_error)?;
-            let verification = BundleEngine::local()
-                .verify(VerifyRequest::new(bundle, loaded.recovery_secret()))
-                .map_err(map_bundle_error)?;
-            if machine_output {
-                println!("{}", verification.machine_json_result());
-            } else {
-                println!("Bundle fully verified");
-                println!("Recovery Method: {:?}", loaded.recovery_method());
-                println!(
-                    "Bundle format: IZ{}/{}",
-                    verification.summary.format_version,
-                    verification.summary.cryptographic_suite
-                );
-                println!(
-                    "Authenticated chunks: {}",
-                    verification.authenticated_chunks
-                );
-                println!("Authenticated bytes: {}", verification.authenticated_bytes);
-                println!("Included Migration Items: {}", verification.summary.included_items);
-                println!("Changed Migration Items: {}", verification.summary.changed_items);
-                println!(
-                    "Unsupported Migration Items: {}",
-                    verification.summary.unsupported_items
-                );
-                println!(
-                    "Unverified Migration Items: {}",
-                    verification.summary.unverified_items
-                );
-            }
-            Ok(ExitCode::SUCCESS)
-        }
-        [command, bundle_flag, bundle, recovery_flag, recovery_document]
-            if command == "inspect"
-                && bundle_flag == "--bundle"
-                && recovery_flag == "--offline-recovery-document" =>
-        {
-            print_progress(machine_output, "Inspecting authenticated encrypted Bundle");
-            let loaded = StoredRecoveryMethodEngine::local()
-                .load(StoredRecoveryMethodRequest::new(
-                    bundle,
-                    OfflineRecoveryLocator::new(recovery_document),
-                ))
-                .map_err(map_bundle_error)?;
-            let summary = BundleEngine::local()
-                .inspect(InspectRequest::new(bundle, loaded.recovery_secret()))
-                .map_err(map_bundle_error)?;
-            if machine_output {
-                print_machine_value(
-                    "inspect",
-                    serde_json::json!({
-                        "format_version": summary.format_version,
-                        "cryptographic_suite": summary.cryptographic_suite,
-                        "source_name": summary.source_name,
-                        "logical_size": summary.logical_size,
-                        "included_items": summary.included_items,
-                        "changed_items": summary.changed_items,
-                        "unsupported_items": summary.unsupported_items,
-                        "unverified_items": summary.unverified_items,
-                    }),
-                );
-            } else {
-                println!("Authenticated Bundle inspection");
-                println!("Recovery Method: {:?}", loaded.recovery_method());
-                println!(
-                    "Bundle format: IZ{}/{}",
-                    summary.format_version, summary.cryptographic_suite
-                );
-                println!("Source name: {}", summary.source_name);
-                println!("Logical size: {} bytes", summary.logical_size);
-                println!("Included Migration Items: {}", summary.included_items);
-                println!("Changed Migration Items: {}", summary.changed_items);
-                println!(
-                    "Unsupported Migration Items: {}",
-                    summary.unsupported_items
-                );
-                println!("Unverified Migration Items: {}", summary.unverified_items);
-            }
-            Ok(ExitCode::SUCCESS)
-        }
-        [
-            command,
-            bundle_flag,
-            bundle,
-            destination_flag,
-            destination,
-            recovery_flag,
-            recovery_document,
-        ] if command == "restore"
-            && bundle_flag == "--bundle"
-            && destination_flag == "--to"
-            && recovery_flag == "--offline-recovery-document" =>
-        {
-            print_progress(machine_output, "Restoring authenticated encrypted Bundle");
-            let loaded = StoredRecoveryMethodEngine::local()
-                .load(StoredRecoveryMethodRequest::new(
-                    bundle,
-                    OfflineRecoveryLocator::new(recovery_document),
-                ))
-                .map_err(map_bundle_error)?;
-            let report = RestoreEngine::local()
-                .restore(RestoreRequest::new(
-                    bundle,
-                    destination,
-                    loaded.recovery_secret(),
-                ))
-                .map_err(map_encrypted_restore_error)?;
-            if machine_output {
-                println!("{}", report.machine_json_result());
-            } else {
-                println!("{}", report.human_result());
-                println!("Recovery Method: {:?}", report.recovery_method());
-            }
-            Ok(ExitCode::SUCCESS)
-        }
-        [
-            command,
-            bundle_flag,
-            bundle,
-            destination_flag,
-            destination,
-            recovery_flag,
-            recovery_document,
-        ] if command == "copy"
-            && bundle_flag == "--bundle"
-            && destination_flag == "--to"
-            && recovery_flag == "--offline-recovery-document" =>
-        {
-            print_progress(machine_output, "Creating and authenticating Verified Copy");
-            let loaded = StoredRecoveryMethodEngine::local()
-                .load(StoredRecoveryMethodRequest::new(
-                    bundle,
-                    OfflineRecoveryLocator::new(recovery_document),
-                ))
-                .map_err(map_bundle_error)?;
-            let report = BundleEngine::local()
-                .copy_verified(VerifiedCopyRequest::new(
-                    bundle,
-                    destination,
-                    loaded.recovery_secret(),
-                ))
-                .map_err(map_verified_copy_error)?;
-            if machine_output {
-                println!("{}", report.machine_json_result());
-            } else {
-                println!("{}", report.human_summary());
-                println!("Recovery Method: {:?}", loaded.recovery_method());
-                println!("Verified: {}", report.is_verified());
-                println!("Storage location: {:?}", report.storage_location());
-                println!("Durability: {:?}", report.durability());
-                for warning in report.warnings() {
-                    println!("Warning: {warning}");
-                }
-            }
-            Ok(ExitCode::SUCCESS)
-        }
-        [command, bundle] if command == "inspect" => {
-            let bundle_path = PathBuf::from(bundle);
-            print_progress(
-                machine_output,
-                &format!("Inspecting encrypted Bundle {}", bundle_path.display()),
-            );
-            InizaCore
-                .inspect_bundle(&bundle_path)
-                .map_err(|error| CliError::BundleInvalid(error.to_string()))?;
-            unreachable!("encrypted Bundle inspection is not implemented")
-        }
         _ => Err(CliError::Usage(
-            "usage: iniza scan <SOURCE> (--list-protection-candidates | --candidate <ID>... --output-plan <PLAN> | --output-plan <PLAN>) [SCAN OPTIONS] | iniza projects scan --plan <APPROVED_PLAN> [--remote-check] | iniza recovery offline rehearse --bundle <BUNDLE> --document <RECOVERY_DOCUMENT> | iniza verify --bundle <BUNDLE> --offline-recovery-document <RECOVERY_DOCUMENT> | iniza inspect --bundle <BUNDLE> --offline-recovery-document <RECOVERY_DOCUMENT> | iniza copy --bundle <BUNDLE> --to <NEW_BUNDLE> --offline-recovery-document <RECOVERY_DOCUMENT> | iniza restore --bundle <BUNDLE> --to <NEW_DESTINATION> --offline-recovery-document <RECOVERY_DOCUMENT> | iniza plan show --plan <PLAN> | iniza plan validate --plan <PLAN> | iniza plan approve --plan <PLAN> --approved-hash <HASH> | iniza plan diff <OLD> <NEW> | iniza inspect <BUNDLE> | iniza fixture pack --plan <PLAN> --output <PATH.iniza-fixture> | iniza fixture inspect <PATH.iniza-fixture> | iniza fixture restore <PATH.iniza-fixture> --to <NEW_DESTINATION>"
+            "usage: iniza scan <SOURCE> (--list-protection-candidates | --candidate <IDENTIFIER>... --output-plan <PLAN> | --output-plan <PLAN>) [SCAN OPTIONS] | iniza projects scan --plan <APPROVED_PLAN> [--remote-check] | iniza recovery offline rehearse --bundle <BUNDLE> --document <RECOVERY_DOCUMENT> | iniza pack [PACK OPTIONS] | iniza verify [ENCRYPTED OPTIONS] | iniza inspect [ENCRYPTED OPTIONS] | iniza copy [ENCRYPTED OPTIONS] | iniza restore [ENCRYPTED OPTIONS] | iniza status --plan <PLAN> --receipts <EVIDENCE_DIRECTORY> --bundle <BUNDLE> --offline-recovery-document <RECOVERY_DOCUMENT> | iniza plan show --plan <PLAN> | iniza plan validate --plan <PLAN> | iniza plan approve --plan <PLAN> --approved-hash <HASH> | iniza plan diff <OLD> <NEW> | iniza fixture pack --plan <PLAN> --output <PATH.iniza-fixture> | iniza fixture inspect <PATH.iniza-fixture> | iniza fixture restore <PATH.iniza-fixture> --to <NEW_DESTINATION>"
                 .to_owned(),
         )),
+    }
+}
+
+#[derive(Default)]
+struct EncryptedCommandArguments<'a> {
+    bundle: Option<&'a str>,
+    destination: Option<&'a str>,
+    recovery: Option<&'a str>,
+    offline_document: Option<&'a str>,
+    vaultwarden_item: Option<&'a str>,
+    vaultwarden_server_identity_hash: Option<&'a str>,
+    bitwarden_installation_review_hash: Option<&'a str>,
+    bitwarden_executable: Option<&'a str>,
+}
+
+struct VaultwardenCommandLocator<'a> {
+    item_identifier: &'a str,
+    server_identity_hash: &'a str,
+    installation_review_hash: &'a str,
+    executable: Option<&'a str>,
+}
+
+impl<'a> EncryptedCommandArguments<'a> {
+    fn parse(command: &str, arguments: &'a [String]) -> Result<Self, CliError> {
+        let mut parsed = Self::default();
+        let mut index = 0;
+        while index < arguments.len() {
+            let value = arguments
+                .get(index + 1)
+                .ok_or_else(|| encrypted_command_usage(command))?;
+            let destination = match arguments[index].as_str() {
+                "--bundle" if parsed.bundle.is_none() => &mut parsed.bundle,
+                "--to" if parsed.destination.is_none() => &mut parsed.destination,
+                "--recovery" if parsed.recovery.is_none() => &mut parsed.recovery,
+                "--offline-recovery-document" if parsed.offline_document.is_none() => {
+                    &mut parsed.offline_document
+                }
+                "--vaultwarden-item" if parsed.vaultwarden_item.is_none() => {
+                    &mut parsed.vaultwarden_item
+                }
+                "--vaultwarden-server-identity-hash"
+                    if parsed.vaultwarden_server_identity_hash.is_none() =>
+                {
+                    &mut parsed.vaultwarden_server_identity_hash
+                }
+                "--bitwarden-installation-review-hash"
+                    if parsed.bitwarden_installation_review_hash.is_none() =>
+                {
+                    &mut parsed.bitwarden_installation_review_hash
+                }
+                "--bitwarden-executable" if parsed.bitwarden_executable.is_none() => {
+                    &mut parsed.bitwarden_executable
+                }
+                _ => return Err(encrypted_command_usage(command)),
+            };
+            *destination = Some(value.as_str());
+            index += 2;
+        }
+        Ok(parsed)
+    }
+
+    fn bundle(&self, command: &str) -> Result<&'a str, CliError> {
+        self.bundle.ok_or_else(|| encrypted_command_usage(command))
+    }
+
+    fn destination(&self, command: &str) -> Result<&'a str, CliError> {
+        self.destination
+            .ok_or_else(|| encrypted_command_usage(command))
+    }
+
+    fn vaultwarden_locator(
+        &self,
+        command: &str,
+    ) -> Result<Option<VaultwardenCommandLocator<'a>>, CliError> {
+        let has_any = self.vaultwarden_item.is_some()
+            || self.vaultwarden_server_identity_hash.is_some()
+            || self.bitwarden_installation_review_hash.is_some()
+            || self.bitwarden_executable.is_some();
+        if !has_any {
+            return Ok(None);
+        }
+        let item = self
+            .vaultwarden_item
+            .ok_or_else(|| encrypted_command_usage(command))?;
+        let server = self
+            .vaultwarden_server_identity_hash
+            .ok_or_else(|| encrypted_command_usage(command))?;
+        let review = self
+            .bitwarden_installation_review_hash
+            .ok_or_else(|| encrypted_command_usage(command))?;
+        Ok(Some(VaultwardenCommandLocator {
+            item_identifier: item,
+            server_identity_hash: server,
+            installation_review_hash: review,
+            executable: self.bitwarden_executable,
+        }))
+    }
+}
+
+fn run_verify(arguments: &[String], machine_output: bool) -> Result<ExitCode, CliError> {
+    let parsed = EncryptedCommandArguments::parse("verify", arguments)?;
+    let bundle = parsed.bundle("verify")?;
+    if parsed.destination.is_some() {
+        return Err(encrypted_command_usage("verify"));
+    }
+
+    if parsed.recovery == Some("both") {
+        let document = parsed
+            .offline_document
+            .ok_or_else(|| encrypted_command_usage("verify"))?;
+        let vaultwarden_locator = parsed
+            .vaultwarden_locator("verify")?
+            .ok_or_else(|| encrypted_command_usage("verify"))?;
+        print_progress(
+            machine_output,
+            "Fully verifying encrypted Bundle through both Recovery Methods",
+        );
+        let offline = load_offline_recovery(bundle, document)?;
+        let vaultwarden = load_vaultwarden_recovery(
+            bundle,
+            vaultwarden_locator.item_identifier,
+            vaultwarden_locator.server_identity_hash,
+            vaultwarden_locator.installation_review_hash,
+            vaultwarden_locator.executable,
+        )?;
+        let offline_verification = BundleEngine::local()
+            .verify(VerifyRequest::new(bundle, offline.recovery_secret()))
+            .map_err(map_bundle_error)?;
+        let vaultwarden_verification = BundleEngine::local()
+            .verify(VerifyRequest::new(bundle, vaultwarden.recovery_secret()))
+            .map_err(map_bundle_error)?;
+        if offline_verification.bundle_identity() != vaultwarden_verification.bundle_identity() {
+            return Err(CliError::Recovery(
+                "the two Recovery Methods did not authenticate the same Bundle identity".to_owned(),
+            ));
+        }
+        if machine_output {
+            print_machine_value(
+                "verify",
+                serde_json::json!({
+                    "bundle_identity": offline_verification.bundle_identity(),
+                    "recovery_methods": ["offline", "vaultwarden"],
+                    "same_bundle_identity": true,
+                    "format_version": offline_verification.summary.format_version,
+                    "cryptographic_suite": offline_verification.summary.cryptographic_suite,
+                    "authenticated_chunks": offline_verification.authenticated_chunks,
+                    "authenticated_bytes": offline_verification.authenticated_bytes,
+                }),
+            );
+        } else {
+            println!("Bundle fully verified through both Recovery Methods");
+            println!(
+                "Bundle identity: {}",
+                offline_verification.bundle_identity()
+            );
+            println!("Offline Recovery Key: verified");
+            println!("Vaultwarden Recovery Secret: verified");
+            println!("Both Recovery Methods authenticated the same Bundle: yes");
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+    if parsed.recovery.is_some() {
+        return Err(encrypted_command_usage("verify"));
+    }
+
+    print_progress(machine_output, "Fully verifying encrypted Bundle");
+    let loaded = load_single_recovery("verify", bundle, &parsed)?;
+    let verification = BundleEngine::local()
+        .verify(VerifyRequest::new(bundle, loaded.recovery_secret()))
+        .map_err(map_bundle_error)?;
+    if machine_output {
+        println!("{}", verification.machine_json_result());
+    } else {
+        println!("Bundle fully verified");
+        println!("Recovery Method: {:?}", loaded.recovery_method());
+        println!(
+            "Bundle format: IZ{}/{}",
+            verification.summary.format_version, verification.summary.cryptographic_suite
+        );
+        println!(
+            "Authenticated chunks: {}",
+            verification.authenticated_chunks
+        );
+        println!("Authenticated bytes: {}", verification.authenticated_bytes);
+        println!(
+            "Included Migration Items: {}",
+            verification.summary.included_items
+        );
+        println!(
+            "Changed Migration Items: {}",
+            verification.summary.changed_items
+        );
+        println!(
+            "Unsupported Migration Items: {}",
+            verification.summary.unsupported_items
+        );
+        println!(
+            "Unverified Migration Items: {}",
+            verification.summary.unverified_items
+        );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn run_inspect(arguments: &[String], machine_output: bool) -> Result<ExitCode, CliError> {
+    let parsed = EncryptedCommandArguments::parse("inspect", arguments)?;
+    let bundle = parsed.bundle("inspect")?;
+    if parsed.destination.is_some() || parsed.recovery.is_some() {
+        return Err(encrypted_command_usage("inspect"));
+    }
+    print_progress(machine_output, "Inspecting authenticated encrypted Bundle");
+    let loaded = load_single_recovery("inspect", bundle, &parsed)?;
+    let summary = BundleEngine::local()
+        .inspect(InspectRequest::new(bundle, loaded.recovery_secret()))
+        .map_err(map_bundle_error)?;
+    if machine_output {
+        print_machine_value(
+            "inspect",
+            serde_json::json!({
+                "format_version": summary.format_version,
+                "cryptographic_suite": summary.cryptographic_suite,
+                "source_name": summary.source_name,
+                "logical_size": summary.logical_size,
+                "included_items": summary.included_items,
+                "changed_items": summary.changed_items,
+                "unsupported_items": summary.unsupported_items,
+                "unverified_items": summary.unverified_items,
+            }),
+        );
+    } else {
+        println!("Authenticated Bundle inspection");
+        println!("Recovery Method: {:?}", loaded.recovery_method());
+        println!(
+            "Bundle format: IZ{}/{}",
+            summary.format_version, summary.cryptographic_suite
+        );
+        println!("Source name: {}", summary.source_name);
+        println!("Logical size: {} bytes", summary.logical_size);
+        println!("Included Migration Items: {}", summary.included_items);
+        println!("Changed Migration Items: {}", summary.changed_items);
+        println!("Unsupported Migration Items: {}", summary.unsupported_items);
+        println!("Unverified Migration Items: {}", summary.unverified_items);
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn run_copy(arguments: &[String], machine_output: bool) -> Result<ExitCode, CliError> {
+    let parsed = EncryptedCommandArguments::parse("copy", arguments)?;
+    let bundle = parsed.bundle("copy")?;
+    let destination = parsed.destination("copy")?;
+    if parsed.recovery.is_some() {
+        return Err(encrypted_command_usage("copy"));
+    }
+    print_progress(machine_output, "Creating and authenticating Verified Copy");
+    let loaded = load_single_recovery("copy", bundle, &parsed)?;
+    let report = BundleEngine::local()
+        .copy_verified(VerifiedCopyRequest::new(
+            bundle,
+            destination,
+            loaded.recovery_secret(),
+        ))
+        .map_err(map_verified_copy_error)?;
+    if machine_output {
+        println!("{}", report.machine_json_result());
+    } else {
+        println!("{}", report.human_summary());
+        println!("Recovery Method: {:?}", loaded.recovery_method());
+        println!("Verified: {}", report.is_verified());
+        println!("Storage location: {:?}", report.storage_location());
+        println!("Durability: {:?}", report.durability());
+        for warning in report.warnings() {
+            println!("Warning: {warning}");
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn run_restore(arguments: &[String], machine_output: bool) -> Result<ExitCode, CliError> {
+    let parsed = EncryptedCommandArguments::parse("restore", arguments)?;
+    let bundle = parsed.bundle("restore")?;
+    let destination = parsed.destination("restore")?;
+    if parsed.recovery.is_some() {
+        return Err(encrypted_command_usage("restore"));
+    }
+    print_progress(machine_output, "Restoring authenticated encrypted Bundle");
+    let loaded = load_single_recovery("restore", bundle, &parsed)?;
+    let report = RestoreEngine::local()
+        .restore(RestoreRequest::new(
+            bundle,
+            destination,
+            loaded.recovery_secret(),
+        ))
+        .map_err(map_encrypted_restore_error)?;
+    if machine_output {
+        println!("{}", report.machine_json_result());
+    } else {
+        println!("{}", report.human_result());
+        println!("Recovery Method: {:?}", report.recovery_method());
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn load_single_recovery(
+    command: &str,
+    bundle: &str,
+    parsed: &EncryptedCommandArguments<'_>,
+) -> Result<iniza::LoadedRecoveryMethod, CliError> {
+    match (
+        parsed.offline_document,
+        parsed.vaultwarden_locator(command)?,
+    ) {
+        (Some(document), None) => load_offline_recovery(bundle, document),
+        (None, Some(locator)) => load_vaultwarden_recovery(
+            bundle,
+            locator.item_identifier,
+            locator.server_identity_hash,
+            locator.installation_review_hash,
+            locator.executable,
+        ),
+        _ => Err(CliError::Approval(
+            "select exactly one stored Recovery Method for this command".to_owned(),
+        )),
+    }
+}
+
+fn load_offline_recovery(
+    bundle: &str,
+    document: &str,
+) -> Result<iniza::LoadedRecoveryMethod, CliError> {
+    StoredRecoveryMethodEngine::local()
+        .load(StoredRecoveryMethodRequest::new(
+            bundle,
+            OfflineRecoveryLocator::new(document),
+        ))
+        .map_err(map_bundle_error)
+}
+
+fn encrypted_command_usage(command: &str) -> CliError {
+    let destination = if matches!(command, "copy" | "restore") {
+        " --to <NEW_DESTINATION>"
+    } else {
+        ""
+    };
+    let both = if command == "verify" {
+        " | --recovery both --offline-recovery-document <DOCUMENT> <VAULTWARDEN_LOCATOR>"
+    } else {
+        ""
+    };
+    CliError::Usage(format!(
+        "usage: iniza {command} --bundle <BUNDLE>{destination} (--offline-recovery-document <DOCUMENT> | <VAULTWARDEN_LOCATOR>{both}); VAULTWARDEN_LOCATOR is --vaultwarden-item <IDENTIFIER> --vaultwarden-server-identity-hash <HASH> --bitwarden-installation-review-hash <HASH> [--bitwarden-executable <PATH>]"
+    ))
+}
+
+fn load_vaultwarden_recovery(
+    bundle: &str,
+    item_identifier: &str,
+    server_identity_hash: &str,
+    installation_review_hash: &str,
+    bitwarden_executable: Option<&str>,
+) -> Result<iniza::LoadedRecoveryMethod, CliError> {
+    let installation_request = bitwarden_executable
+        .map(|path| VaultwardenInstallationRequest::explicit(PathBuf::from(path)))
+        .unwrap_or_else(VaultwardenInstallationRequest::trusted_path);
+    let vaultwarden = VaultwardenRecoveryEngine::with_command_line(InstalledBitwarden::system());
+    let installation = vaultwarden
+        .inspect_installation(installation_request)
+        .map_err(map_vaultwarden_recovery_error)?;
+    let item_identifier = VaultwardenItemIdentifier::parse(item_identifier.to_owned())
+        .map_err(map_vaultwarden_recovery_error)?;
+    StoredRecoveryMethodEngine::local()
+        .load(StoredRecoveryMethodRequest::new(
+            bundle,
+            VaultwardenRecoveryLocator::new(
+                item_identifier,
+                server_identity_hash,
+                installation,
+                installation_review_hash,
+            ),
+        ))
+        .map_err(map_vaultwarden_recovery_error)
+}
+
+fn map_vaultwarden_recovery_error(error: CoreError) -> CliError {
+    match error {
+        CoreError::AuthenticationFailed => CliError::Recovery(error.to_string()),
+        CoreError::BundleIncomplete(_)
+        | CoreError::BundleInvalid(_)
+        | CoreError::TestFixtureIsNotBundle(_) => CliError::BundleInvalid(error.to_string()),
+        CoreError::Vaultwarden(_) => CliError::Vaultwarden(error.to_string()),
+        _ => CliError::Operation(error.to_string()),
     }
 }
 

@@ -164,3 +164,11 @@ The first test must fail because `StoredRecoveryMethodEngine` does not exist. Th
 ## Confirmation required
 
 The owner confirmed all twelve seams on 2026-09-08. COKS-41 behavior tests and implementation may proceed through these interfaces without reopening the decision unless a public seam must materially change.
+
+## Implementation completion evidence
+
+The confirmed interfaces are implemented. The supported executable now performs approved interactive Pack with both Recovery Methods, loads either the Offline Recovery Key document or the exact reviewed Vaultwarden item for authenticated Inspect, Verify, Verified Copy, and Restore, and supports `verify --recovery both` to prove both stored methods authenticate the same Bundle identity. The complete synthetic rehearsal still exercises Pack pause and Resume in one live workflow, two independently classified Verified Copies, interrupted and resumed Restore, Project Capsule validation, append-only Readiness Evidence, Receipt invalidation, and the Not Protected Report.
+
+The final COKS-41 verification accounted for 329 passing tests with zero failures and zero ignored tests. The sixty-three-test Pack persistence suite passed, every other integration suite passed, strict Clippy passed with warnings denied, formatting passed, and the Git diff check passed. The local manual quality-assurance walkthrough is recorded in [COKS-41 complete migration rehearsal](../manual-qa/COKS-41-complete-migration-rehearsal.md).
+
+This completes the synthetic and deliberately duplicated-data implementation. It does not authorize personal-data capture, Git publication, a real Vaultwarden mutation, deletion, or machine erasure. Those real operations retain their separate COKS-42 reviews and approvals.

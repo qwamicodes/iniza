@@ -89,9 +89,11 @@ This automated result does not replace the independent cryptographic, parser, an
 
 ## Command-line orchestration evidence
 
-At repository commit `44254dba76f6a495d8f8460bc8d0ed53eba1a0ea`, the supported executable exposes Plan scan, review, validation, approval and comparison; read-only Project audit; immutable Push Plan operations; Offline Recovery Key rehearsal; authenticated inspect; and development-only fixture operations. The documented encrypted `pack`, `verify`, `copy`, `restore`, `status`, and Bitwarden connector commands are not yet wired into the executable.
+The COKS-41 implementation connects the supported executable to approved interactive Pack, authenticated Inspect, full Verify, Verified Copy, safe Restore, and append-only Readiness Evidence status. Pack stores and rehearses both Recovery Methods before reporting success. Later authenticated commands can load either the separately stored Offline Recovery Key document or the exact reviewed Vaultwarden item, and `verify --recovery both` proves both methods authenticate the same completed Bundle identity.
 
-The reusable encrypted Bundle, Verified Copy, Restore, Offline Recovery Key, Vaultwarden, and Project Capsule transactions exist in the Rust core and have automated synthetic coverage. Those in-process interfaces do not by themselves provide the supported cross-process owner workflow required to capture and migrate this Mac. Owner Dogfood therefore remains blocked on the issue that binds both Recovery Methods and these transactions into the fail-closed command-line workflow.
+The complete synthetic and deliberately duplicated-data rehearsal composes the encrypted Bundle, both Recovery Methods, two independently classified Verified Copies, interrupted and resumed Restore, Project audit, Project Capsule Restore Rehearsal, Not Protected Report, Receipt invalidation, and Readiness Evidence interfaces. The final COKS-41 verification accounted for 329 passing tests with zero failures and zero ignored tests, together with strict Clippy, formatting, and Git diff checks.
+
+This command coverage does not convert preliminary host observations into current real evidence. COKS-42 must still revalidate the exact approved real Plans, current Projects, conventional backups, three distinct storage failure domains, and destination capacity before personal source reads. Any Git publication, real Vaultwarden item, Offline Recovery Key write, Bundle capture, external Verified Copy, or iCloud Drive Verified Copy retains its own exact review and execution approval.
 
 Owner Dogfood remains blocked until the external storage, conventional backups, current Project inventory, both Recovery Methods, and required rehearsals are present and verified.
 

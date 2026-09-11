@@ -6,10 +6,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use iniza::{
-    BundleEngine, OfflineRecoveryEngine, OfflineRecoveryPersistenceTransition,
+    BundleEngine, InstalledBitwarden, OfflineRecoveryEngine, OfflineRecoveryPersistenceTransition,
     OfflineRecoveryStorage, OfflineRecoveryWriteRequest, PackRecoveryContext, PackRequest,
     PlanEngine, ReadinessEvidenceEngine, ReadinessEvidenceInitializationRequest,
-    ReadinessReceiptRecordRequest, RecoveryMethod, RecoverySecret, ScanRequest, VerifyRequest,
+    ReadinessReceiptRecordRequest, RecoveryMethod, RecoverySecret, ScanRequest,
+    VaultwardenInstallationRequest, VaultwardenRecoveryEngine, VerifyRequest,
 };
 use zeroize::Zeroizing;
 
@@ -64,6 +65,22 @@ fn iniza(arguments: &[&str]) -> Output {
         .args(arguments)
         .output()
         .expect("iniza should run")
+}
+
+fn iniza_with_session(arguments: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_iniza"))
+        .args(arguments)
+        .env("BW_SESSION", "c3ludGhldGljLXNlc3Npb24=")
+        .output()
+        .expect("iniza should run")
+}
+
+fn documented_identity_hash(domain: &[u8], value: &str) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(domain);
+    hasher.update(&(value.len() as u64).to_be_bytes());
+    hasher.update(value.as_bytes());
+    hasher.finalize().to_hex().to_string()
 }
 
 fn completed_bundle_and_offline_document(directory: &TestDirectory) -> (PathBuf, PathBuf) {
@@ -363,6 +380,308 @@ fn owner_and_automation_can_fully_verify_a_bundle_using_only_the_offline_documen
     assert!(!machine_output.contains(bundle_text));
     assert!(!machine_output.contains(document_text));
     assert!(!machine_output.contains(&"47".repeat(32)));
+}
+
+#[cfg(unix)]
+struct VaultwardenCommandFixture {
+    bundle: PathBuf,
+    document: PathBuf,
+    executable: PathBuf,
+    bundle_identity: String,
+    server_identity_hash: String,
+    installation_review_hash: String,
+}
+
+#[cfg(unix)]
+fn completed_bundle_with_both_recovery_methods(
+    directory: &TestDirectory,
+) -> VaultwardenCommandFixture {
+    use std::os::unix::fs::PermissionsExt;
+
+    const ITEM_IDENTIFIER: &str = "12345678-1234-4234-8234-123456789abc";
+    const SERVER_ORIGIN: &str = "https://vaultwarden.example.test";
+
+    let source = directory.path().join("both-recovery-source");
+    fs::create_dir(&source).unwrap();
+    fs::write(
+        source.join("settings.txt"),
+        b"synthetic settings verified through both recovery methods\n",
+    )
+    .unwrap();
+    let mut plan = PlanEngine::local()
+        .scan(ScanRequest::for_directory(&source))
+        .unwrap();
+    let reviewed_hash = plan.approval_hash().unwrap();
+    plan.approve(&reviewed_hash).unwrap();
+    let recovery = PackRecoveryContext::from_secrets(
+        RecoverySecret::from_bytes(
+            RecoveryMethod::Vaultwarden,
+            zeroize::Zeroizing::new([0x31; 32]),
+        ),
+        RecoverySecret::from_bytes(RecoveryMethod::Offline, zeroize::Zeroizing::new([0x47; 32])),
+    )
+    .unwrap();
+    let bundle = directory.path().join("both-recovery.iniza");
+    BundleEngine::local()
+        .pack(PackRequest::new(&plan, &bundle).with_recovery_context(&recovery))
+        .unwrap();
+    let bundle_identity = BundleEngine::local()
+        .verify(VerifyRequest::new(&bundle, recovery.offline_recovery_key()))
+        .unwrap()
+        .bundle_identity()
+        .to_owned();
+    let document = directory.path().join("both-recovery.iniza-recovery");
+    OfflineRecoveryEngine::with_storage(SyntheticRemovableStorage)
+        .write(OfflineRecoveryWriteRequest::new(
+            &bundle,
+            &document,
+            recovery.offline_recovery_key(),
+        ))
+        .unwrap();
+
+    let retrieved_item = directory.path().join("retrieved-item.json");
+    let item = serde_json::json!({
+        "passwordHistory": null,
+        "revisionDate": "2026-09-08T12:30:00.000Z",
+        "creationDate": "2026-09-08T12:30:00.000Z",
+        "deletedDate": null,
+        "object": "item",
+        "id": ITEM_IDENTIFIER,
+        "organizationId": null,
+        "folderId": null,
+        "type": 2,
+        "reprompt": 0,
+        "name": "Iniza Recovery — Synthetic command-line verification — 2026-09-08",
+        "notes": null,
+        "favorite": false,
+        "fields": [
+            { "name": "iniza_bundle_id", "value": bundle_identity, "type": 0 },
+            { "name": "iniza_format", "value": "IZ2/IZ1", "type": 0 },
+            {
+                "name": "iniza_secret",
+                "value": "3131313131313131313131313131313131313131313131313131313131313131",
+                "type": 1
+            },
+            { "name": "iniza_created_at", "value": "2026-09-08T12:30:00Z", "type": 0 }
+        ],
+        "secureNote": { "type": 0 },
+        "collectionIds": []
+    });
+    fs::write(&retrieved_item, serde_json::to_vec(&item).unwrap()).unwrap();
+    let executable = directory.path().join("bw");
+    let script = format!(
+        "#!/bin/sh\n\
+if [ \"$1\" = \"--version\" ]; then printf '2026.8.0\\n'; exit 0; fi\n\
+if [ \"$1\" = \"status\" ]; then\n\
+  [ \"$2\" = \"--nointeraction\" ] || exit 71\n\
+  [ \"$BW_SESSION\" = \"c3ludGhldGljLXNlc3Npb24=\" ] || exit 72\n\
+  printf '{{\"serverUrl\":\"{SERVER_ORIGIN}\",\"lastSync\":null,\"userEmail\":\"owner@example.test\",\"userId\":\"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\",\"status\":\"unlocked\"}}\\n'\n\
+  exit 0\n\
+fi\n\
+if [ \"$1\" = \"sync\" ]; then\n\
+  [ \"$2\" = \"--response\" ] || exit 73\n\
+  [ \"$3\" = \"--nointeraction\" ] || exit 74\n\
+  [ \"$BW_SESSION\" = \"c3ludGhldGljLXNlc3Npb24=\" ] || exit 75\n\
+  printf '{{\"success\":true,\"data\":{{\"object\":\"message\",\"title\":\"Syncing complete.\",\"message\":null,\"noColor\":false}}}}\\n'\n\
+  exit 0\n\
+fi\n\
+if [ \"$1\" = \"get\" ]; then\n\
+  [ \"$2\" = \"item\" ] || exit 76\n\
+  [ \"$3\" = \"{ITEM_IDENTIFIER}\" ] || exit 77\n\
+  [ \"$4\" = \"--nointeraction\" ] || exit 78\n\
+  [ \"$BW_SESSION\" = \"c3ludGhldGljLXNlc3Npb24=\" ] || exit 79\n\
+  /bin/cat '{}'\n\
+  exit 0\n\
+fi\n\
+exit 80\n",
+        retrieved_item.display(),
+    );
+    fs::write(&executable, script).unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    let installation = VaultwardenRecoveryEngine::with_command_line(InstalledBitwarden::system())
+        .inspect_installation(VaultwardenInstallationRequest::explicit(&executable))
+        .unwrap();
+    let server_identity_hash =
+        documented_identity_hash(b"iniza vaultwarden server identity v1", SERVER_ORIGIN);
+
+    VaultwardenCommandFixture {
+        bundle,
+        document,
+        executable,
+        bundle_identity,
+        server_identity_hash,
+        installation_review_hash: installation.review_hash().to_owned(),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn owner_can_fully_verify_one_bundle_through_both_stored_recovery_methods() {
+    const ITEM_IDENTIFIER: &str = "12345678-1234-4234-8234-123456789abc";
+
+    let directory = TestDirectory::new();
+    let fixture = completed_bundle_with_both_recovery_methods(&directory);
+    let output = iniza_with_session(&[
+        "--json",
+        "verify",
+        "--bundle",
+        fixture.bundle.to_str().unwrap(),
+        "--recovery",
+        "both",
+        "--offline-recovery-document",
+        fixture.document.to_str().unwrap(),
+        "--vaultwarden-item",
+        ITEM_IDENTIFIER,
+        "--vaultwarden-server-identity-hash",
+        &fixture.server_identity_hash,
+        "--bitwarden-installation-review-hash",
+        &fixture.installation_review_hash,
+        "--bitwarden-executable",
+        fixture.executable.to_str().unwrap(),
+    ]);
+
+    assert!(
+        output.status.success(),
+        "both Recovery Methods should verify: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    let standard_output = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(standard_output.lines().count(), 1);
+    let result: serde_json::Value = serde_json::from_str(standard_output.trim()).unwrap();
+    assert_eq!(result["command"], "verify");
+    assert_eq!(result["status"], "success");
+    assert_eq!(
+        result["data"]["recovery_methods"],
+        serde_json::json!(["offline", "vaultwarden"])
+    );
+    assert_eq!(result["data"]["same_bundle_identity"], true);
+    assert_eq!(result["data"]["bundle_identity"], fixture.bundle_identity);
+    assert!(!standard_output.contains(&"31".repeat(32)));
+    assert!(!standard_output.contains("c3ludGhldGljLXNlc3Npb24="));
+    assert!(!standard_output.contains(fixture.bundle.to_str().unwrap()));
+    assert!(!standard_output.contains(fixture.document.to_str().unwrap()));
+}
+
+#[cfg(unix)]
+#[test]
+fn encrypted_commands_accept_the_exact_vaultwarden_recovery_locator() {
+    const ITEM_IDENTIFIER: &str = "12345678-1234-4234-8234-123456789abc";
+
+    let directory = TestDirectory::new();
+    let fixture = completed_bundle_with_both_recovery_methods(&directory);
+    let common = [
+        "--vaultwarden-item",
+        ITEM_IDENTIFIER,
+        "--vaultwarden-server-identity-hash",
+        fixture.server_identity_hash.as_str(),
+        "--bitwarden-installation-review-hash",
+        fixture.installation_review_hash.as_str(),
+        "--bitwarden-executable",
+        fixture.executable.to_str().unwrap(),
+    ];
+
+    let mut verify_arguments = vec![
+        "--json",
+        "verify",
+        "--bundle",
+        fixture.bundle.to_str().unwrap(),
+    ];
+    verify_arguments.extend(common);
+    let verify = iniza_with_session(&verify_arguments);
+    assert!(
+        verify.status.success(),
+        "Vaultwarden Verify should succeed: {}{}",
+        String::from_utf8_lossy(&verify.stdout),
+        String::from_utf8_lossy(&verify.stderr)
+    );
+    let verify_result: serde_json::Value =
+        serde_json::from_slice(&verify.stdout).expect("Verify should emit one result");
+    assert_eq!(verify_result["command"], "verify");
+    assert_eq!(verify_result["status"], "success");
+
+    let mut inspect_arguments = vec![
+        "--json",
+        "inspect",
+        "--bundle",
+        fixture.bundle.to_str().unwrap(),
+    ];
+    inspect_arguments.extend(common);
+    let inspect = iniza_with_session(&inspect_arguments);
+    assert!(
+        inspect.status.success(),
+        "Vaultwarden Inspect should succeed: {}{}",
+        String::from_utf8_lossy(&inspect.stdout),
+        String::from_utf8_lossy(&inspect.stderr)
+    );
+    let inspect_result: serde_json::Value =
+        serde_json::from_slice(&inspect.stdout).expect("Inspect should emit one result");
+    assert_eq!(inspect_result["command"], "inspect");
+    assert_eq!(inspect_result["status"], "success");
+
+    let copy = directory.path().join("vaultwarden-copy.iniza");
+    let mut copy_arguments = vec![
+        "--json",
+        "copy",
+        "--bundle",
+        fixture.bundle.to_str().unwrap(),
+        "--to",
+        copy.to_str().unwrap(),
+    ];
+    copy_arguments.extend(common);
+    let copied = iniza_with_session(&copy_arguments);
+    assert!(
+        copied.status.success(),
+        "Vaultwarden Verified Copy should succeed: {}{}",
+        String::from_utf8_lossy(&copied.stdout),
+        String::from_utf8_lossy(&copied.stderr)
+    );
+    let copied_result: serde_json::Value =
+        serde_json::from_slice(&copied.stdout).expect("Verified Copy should emit one result");
+    assert_eq!(copied_result["command"], "copy");
+    assert_eq!(copied_result["status"], "success");
+    assert!(copy.exists());
+
+    let restore = directory.path().join("vaultwarden-restore");
+    let mut restore_arguments = vec![
+        "--json",
+        "restore",
+        "--bundle",
+        fixture.bundle.to_str().unwrap(),
+        "--to",
+        restore.to_str().unwrap(),
+    ];
+    restore_arguments.extend(common);
+    let restored = iniza_with_session(&restore_arguments);
+    assert!(
+        restored.status.success(),
+        "Vaultwarden Restore should succeed: {}{}",
+        String::from_utf8_lossy(&restored.stdout),
+        String::from_utf8_lossy(&restored.stderr)
+    );
+    let restored_result: serde_json::Value =
+        serde_json::from_slice(&restored.stdout).expect("Restore should emit one result");
+    assert_eq!(restored_result["command"], "restore");
+    assert_eq!(restored_result["status"], "success");
+    assert_eq!(
+        fs::read(restore.join("settings.txt")).unwrap(),
+        b"synthetic settings verified through both recovery methods\n"
+    );
+
+    let visible = format!(
+        "{}{}{}{}{}{}{}{}",
+        String::from_utf8_lossy(&verify.stdout),
+        String::from_utf8_lossy(&verify.stderr),
+        String::from_utf8_lossy(&inspect.stdout),
+        String::from_utf8_lossy(&inspect.stderr),
+        String::from_utf8_lossy(&copied.stdout),
+        String::from_utf8_lossy(&copied.stderr),
+        String::from_utf8_lossy(&restored.stdout),
+        String::from_utf8_lossy(&restored.stderr),
+    );
+    assert!(!visible.contains(&"31".repeat(32)));
+    assert!(!visible.contains("c3ludGhldGljLXNlc3Npb24="));
+    assert!(!visible.contains(fixture.bundle.to_str().unwrap()));
 }
 
 #[test]

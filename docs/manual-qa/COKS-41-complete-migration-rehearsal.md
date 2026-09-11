@@ -8,7 +8,8 @@ The delivered behavior:
 
 - captures one approved, non-stale Plan into an authenticated encrypted Bundle;
 - stores and independently rehearses both the Vaultwarden Recovery Method and the Offline Recovery Key;
-- loads a stored Recovery Method in a fresh caller scope for Inspect, Verify, Verified Copy, Restore, and Readiness Evidence status;
+- loads either the Offline Recovery Key document or the exact reviewed Vaultwarden item in a fresh caller scope for Inspect, Verify, Verified Copy, and Restore;
+- proves both stored Recovery Methods independently authenticate the same completed Bundle through `verify --recovery both`;
 - creates an External-storage Verified Copy and an iCloud Drive Verified Copy through classified test boundaries;
 - interrupts Restore at a durable checkpoint, reloads recovery, resumes, and compares restored bytes without executing restored content;
 - audits attached and detached synthetic Projects with staged, unstaged, untracked, ignored, stashed, local-only-reference, no-remote, and disabled-hook state;
@@ -77,11 +78,22 @@ cargo run --locked -- plan approve --plan "$INIZA_COKS41_QA/plan.toml" --approve
    test ! -e "$INIZA_COKS41_QA/separate.iniza-recovery"
    ```
 
+4. Review the executable-level stored Recovery Method behaviors without contacting a real service:
+
+   ```bash
+   cargo test --locked --test encrypted_cli owner_can_fully_verify_one_bundle_through_both_stored_recovery_methods -- --exact --nocapture
+   cargo test --locked --test encrypted_cli encrypted_commands_accept_the_exact_vaultwarden_recovery_locator -- --exact --nocapture
+   ```
+
+   The test-owned Bitwarden command-line adapter accepts only the exact item identifier, server identity hash, installation review hash, and short-lived synthetic session. It exercises Inspect, Verify, Verified Copy, and Restore through the same executable interface used after a real Pack.
+
 ## 5. Expected result
 
 - The focused rehearsal test ends with `1 passed; 0 failed`.
 - The rehearsal internally completes both Recovery Methods, two Verified Copies, interrupted and resumed Restore, exact byte comparison, two Project audits, a Restorable Project Capsule, append-only evidence recording, Receipt invalidation, and replacement-copy revalidation.
 - The Pack dry run writes exactly one versioned JavaScript Object Notation result to standard output with `status` equal to `success`, `recovery_methods` equal to `2`, `would_contact_vaultwarden` equal to `false`, and `would_create_artifacts` equal to `false`.
+- Dual recovery verification reports `offline` and `vaultwarden`, the authenticated Bundle identity, and `same_bundle_identity` equal to `true`.
+- The exact Vaultwarden locator test creates a fully authenticated Verified Copy and a safe new-destination Restore without exposing the synthetic session, Recovery Secret, Bundle path, or destination path in machine output.
 - No output says that the Mac is safe to erase.
 
 ## 6. Failure or safety check
@@ -148,6 +160,7 @@ Do not remove a real Bundle, Offline Recovery Key document, Vaultwarden Secure N
 
 - COKS-41 authorizes and proves synthetic or deliberately duplicated data only. It does not authorize reading personal source content; that is the COKS-42 Owner Dogfood gate.
 - The production Pack command requires an actual separate removable destination, an already unlocked official Bitwarden command-line session, and exact installation and preflight hash review. This manual walkthrough intentionally does not contact that external service.
+- Later Inspect, Verify, Verified Copy, and Restore commands can use the Offline Recovery Key document or the exact Vaultwarden item. Vaultwarden use requires the item identifier, server identity hash, installation review hash, an unlocked `BW_SESSION`, and either the trusted installed executable or an explicit reviewed executable path. `verify --recovery both` requires both locators and succeeds only when they authenticate the same Bundle identity.
 - Pack Resume is deliberately limited to the same live migration workflow because generated Recovery Secrets are never persisted into a generic resume file. A fresh `--resume` invocation fails with deterministic recovery guidance.
 - Readiness Evidence can remain Blocking when owner-stated attestations are absent. Synthetic automation never invents those owner statements.
 - No COKS-41 result authorizes Git publication, deletion, machine erasure, or a claim that every personal file has been protected.
