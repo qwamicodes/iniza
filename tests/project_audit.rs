@@ -547,7 +547,7 @@ fn ahead_project_requires_an_exact_push_plan_action() {
 }
 
 #[test]
-fn reachable_remote_with_a_different_revision_requires_owner_action() {
+fn clean_project_uses_the_live_remote_when_cached_tracking_is_stale() {
     let directory = TestDirectory::new("remote-revision-mismatch");
     let project_root = directory.path.join("required-project");
     init_repository(&project_root);
@@ -580,10 +580,12 @@ fn reachable_remote_with_a_different_revision_requires_owner_action() {
     let reviewed_hash = plan.approval_hash().expect("Plan should have a hash");
     plan.approve(&reviewed_hash)
         .expect("matching reviewed hash should approve the Plan");
+    let local_commit = git_stdout(&project_root, &["rev-parse", "HEAD"]);
+    let authoritative_remote_commit = "0123456789012345678901234567890123456789";
     let report = ProjectAuditEngine::with_git_process(ScriptedRemoteGit {
         installed: InstalledGit::default(),
         remote_status: 0,
-        remote_stdout: b"0123456789012345678901234567890123456789\trefs/heads/main\n".to_vec(),
+        remote_stdout: format!("{authoritative_remote_commit}\trefs/heads/main\n").into_bytes(),
         remote_stderr: Vec::new(),
     })
     .audit(ProjectAuditRequest::from_plan(&plan).with_remote_check())
@@ -595,25 +597,35 @@ fn reachable_remote_with_a_different_revision_requires_owner_action() {
 
     let assessment =
         ProjectProtectionEngine::classify(ProjectProtectionRequest::new(&plan, project))
-            .expect("remote revision mismatch should classify");
+            .expect("live authoritative remote should classify");
 
     assert_eq!(
         assessment.classification(),
-        ProjectProtectionClassification::ActionRequired
+        ProjectProtectionClassification::RemoteReconstructionWithLocalOverlay
     );
-    assert_eq!(
-        assessment.reasons(),
-        &[ProjectProtectionReason::RemoteRevisionMismatch]
-    );
-    assert!(
-        report
-            .to_human_text()
-            .contains("Synchronized gap: the live upstream revision differs from the local commit")
-    );
+    assert_eq!(assessment.reasons(), &[]);
+
+    let revised = ProjectProtectionEngine::prepare_plan(
+        ProjectProtectionPlanRequest::new(&plan, &report).with_remote_overlay(
+            project.id(),
+            assessment.review_hash(),
+            Vec::new(),
+        ),
+    )
+    .expect("remote-authoritative Project should produce a revised Plan");
+    let recipe = revised
+        .recipes()
+        .iter()
+        .find_map(|recipe| recipe.strip_prefix("project-remote-overlay-v1:"))
+        .expect("revised Plan should contain a remote reconstruction recipe");
+    let recipe: serde_json::Value =
+        serde_json::from_str(recipe).expect("remote reconstruction recipe should be valid JSON");
+    assert_eq!(recipe["commit_object"], authoritative_remote_commit);
+    assert_ne!(recipe["commit_object"], local_commit);
 }
 
 #[test]
-fn behind_project_requires_owner_reconciliation_with_the_exact_count() {
+fn clean_behind_project_uses_the_live_remote_without_requiring_a_pull() {
     let directory = TestDirectory::new("behind-action");
     let project_root = directory.path.join("required-project");
     init_repository(&project_root);
@@ -673,14 +685,18 @@ fn behind_project_requires_owner_reconciliation_with_the_exact_count() {
 
     assert_eq!(
         assessment.classification(),
-        ProjectProtectionClassification::ActionRequired
+        ProjectProtectionClassification::RemoteReconstructionWithLocalOverlay
     );
-    assert_eq!(
-        assessment.reasons(),
-        &[
-            ProjectProtectionReason::BehindCommits(1),
-            ProjectProtectionReason::RemoteRevisionMismatch,
-        ]
+    assert_eq!(assessment.reasons(), &[]);
+    let human = report.to_human_text();
+    assert!(human.contains("upstream: origin/main (0 ahead, 1 behind)"));
+    assert!(
+        !human
+            .contains("Synchronized gap: the current branch is behind its locally known upstream")
+    );
+    assert!(
+        !human
+            .contains("Synchronized gap: the live upstream revision differs from the local commit")
     );
 }
 
@@ -1334,6 +1350,67 @@ fn failed_remote_check_keeps_verified_local_evidence_and_discards_hostile_error_
     assert!(project.local_audit_verified());
     assert_eq!(project.local_state().staged_changes(), 1);
     assert!(!format!("{report:?}").contains("credential-marker-4f91"));
+}
+
+#[test]
+fn clean_project_with_an_inaccessible_remote_uses_a_full_project_capsule() {
+    let directory = TestDirectory::new("inaccessible-remote-capsule");
+    let project_root = directory.path.join("required-project");
+    init_repository(&project_root);
+    git(&project_root, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+    fs::write(project_root.join("tracked.txt"), "published fixture\n")
+        .expect("tracked fixture should be written");
+    git(&project_root, &["add", "tracked.txt"]);
+    commit(&project_root, "published fixture");
+    git(
+        &project_root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://example.invalid/private/repository.git",
+        ],
+    );
+    git(
+        &project_root,
+        &["update-ref", "refs/remotes/origin/main", "HEAD"],
+    );
+    git(
+        &project_root,
+        &["branch", "--set-upstream-to=origin/main", "main"],
+    );
+
+    let mut plan = PlanEngine::local()
+        .scan(ScanRequest::for_directory(&project_root))
+        .expect("required Project should scan");
+    let reviewed_hash = plan.approval_hash().expect("Plan should have a hash");
+    plan.approve(&reviewed_hash)
+        .expect("matching reviewed hash should approve the Plan");
+    let report = ProjectAuditEngine::with_git_process(ScriptedRemoteGit {
+        installed: InstalledGit::default(),
+        remote_status: 128,
+        remote_stdout: Vec::new(),
+        remote_stderr: b"fatal: synthetic remote unavailable\n".to_vec(),
+    })
+    .audit(ProjectAuditRequest::from_plan(&plan).with_remote_check())
+    .expect("inaccessible remote must not erase verified local evidence");
+    let project = report
+        .projects()
+        .first()
+        .expect("Project should be reported");
+
+    let assessment =
+        ProjectProtectionEngine::classify(ProjectProtectionRequest::new(&plan, project))
+            .expect("inaccessible remote Project should classify");
+
+    assert_eq!(
+        assessment.classification(),
+        ProjectProtectionClassification::FullProjectCapsule
+    );
+    assert_eq!(
+        assessment.reasons(),
+        &[ProjectProtectionReason::RemoteCheckFailed]
+    );
 }
 
 #[cfg(unix)]

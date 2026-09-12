@@ -69,7 +69,7 @@ A Project whose reviewed local state has been preserved in a verified Project Ca
 _Avoid_: Backed-up repository, pushed repository
 
 **Synchronized Project**:
-A Project whose required upstream branches were checked against their remotes, are not behind, and have had approved ahead commits pushed. Local-only refs are separately approved for publication or explicitly retained only in the Project Capsule.
+A Project whose live reviewed remote is authoritative for tracked state, with no unpublished local commits. A behind local checkout is informational and need not be updated. Local-only state is separately approved for publication or explicitly retained only in a verified Project Capsule.
 _Avoid_: Clean repository, backed-up repository
 
 **Push Plan**:

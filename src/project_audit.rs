@@ -615,13 +615,14 @@ fn apply_remote_overlay_selection(
                 "remote reconstruction recipe requires the reviewed upstream remote".to_owned(),
             )
         })?;
-    let head_object = project.local_state.head_object.as_deref().ok_or_else(|| {
+    let authoritative_remote_object = upstream_remote_advertised_object(project).ok_or_else(|| {
         CoreError::InvalidPlan(
-            "remote reconstruction recipe requires an exact commit object identifier".to_owned(),
+            "remote reconstruction recipe requires an exact advertised upstream commit object identifier"
+                .to_owned(),
         )
     })?;
     let recipe = serde_json::json!({
-        "commit_object": head_object,
+        "commit_object": authoritative_remote_object,
         "project_id": project.id,
         "remote": remote.address,
         "review_hash": assessment.review_hash,
@@ -703,10 +704,7 @@ fn classify_project(project: &ProjectAudit) -> ProjectProtectionAssessment {
         (Some(ahead), Some(0)) if ahead > 0 => {
             reasons.push(ProjectProtectionReason::AheadCommits(ahead));
         }
-        (Some(0), Some(behind)) if behind > 0 => {
-            reasons.push(ProjectProtectionReason::BehindCommits(behind));
-        }
-        (Some(0), Some(0)) => {}
+        (Some(0), Some(_)) => {}
         _ => reasons.push(ProjectProtectionReason::UpstreamComparisonUnavailable),
     }
 
@@ -720,7 +718,12 @@ fn classify_project(project: &ProjectAudit) -> ProjectProtectionAssessment {
     });
     match remote_outcome {
         Some(RemoteCheckOutcome::Reachable) => {
-            if !upstream_remote_advertises_local_head(project) {
+            let upstream_branch_is_advertised =
+                upstream_remote_advertised_object(project).is_some();
+            let exact_local_head_is_advertised = upstream_remote_advertises_local_head(project);
+            if !upstream_branch_is_advertised
+                || (local.ahead != Some(0) && !exact_local_head_is_advertised)
+            {
                 reasons.push(ProjectProtectionReason::RemoteRevisionMismatch);
             }
         }
@@ -728,6 +731,13 @@ fn classify_project(project: &ProjectAudit) -> ProjectProtectionAssessment {
             reasons.push(ProjectProtectionReason::RemoteCheckNotRequested);
         }
         Some(RemoteCheckOutcome::Failed { .. }) | None => {
+            if local.ahead == Some(0) {
+                return ProjectProtectionAssessment {
+                    classification: ProjectProtectionClassification::FullProjectCapsule,
+                    reasons: vec![ProjectProtectionReason::RemoteCheckFailed],
+                    review_hash: String::new(),
+                };
+            }
             reasons.push(ProjectProtectionReason::RemoteCheckFailed);
         }
     }
@@ -744,6 +754,12 @@ fn classify_project(project: &ProjectAudit) -> ProjectProtectionAssessment {
 }
 
 fn upstream_remote_advertises_local_head(project: &ProjectAudit) -> bool {
+    upstream_remote_advertised_object(project)
+        .zip(project.local_state.head_object.as_ref())
+        .is_some_and(|(advertised, local)| advertised == local)
+}
+
+fn upstream_remote_advertised_object(project: &ProjectAudit) -> Option<&String> {
     project
         .local_state
         .upstream
@@ -758,8 +774,6 @@ fn upstream_remote_advertises_local_head(project: &ProjectAudit) -> bool {
                 .filter(|remote| remote.check_outcome == RemoteCheckOutcome::Reachable)
                 .and_then(|remote| remote.advertised_references.get(&reference))
         })
-        .zip(project.local_state.head_object.as_ref())
-        .is_some_and(|(advertised, local)| advertised == local)
 }
 
 fn project_protection_review_hash(
@@ -1087,7 +1101,9 @@ fn human_protection_reason(reason: &ProjectProtectionReason) -> String {
             format!("{count} ahead commit(s) require a separately reviewed Push Plan")
         }
         ProjectProtectionReason::BehindCommits(count) => {
-            format!("{count} behind commit(s) require owner reconciliation outside Iniza")
+            format!(
+                "{count} behind commit(s) are informational; the live remote remains authoritative"
+            )
         }
         ProjectProtectionReason::DivergedCommits { ahead, behind } => format!(
             "diverged by {ahead} ahead and {behind} behind commit(s); owner reconciliation is required outside Iniza"
@@ -1100,7 +1116,8 @@ fn human_protection_reason(reason: &ProjectProtectionReason) -> String {
             "the reviewed upstream remote check failed".to_owned()
         }
         ProjectProtectionReason::RemoteRevisionMismatch => {
-            "the reviewed upstream remote does not advertise the exact local commit".to_owned()
+            "the reviewed live remote does not advertise the required upstream branch revision"
+                .to_owned()
         }
         ProjectProtectionReason::UpstreamComparisonUnavailable => {
             "ahead and behind comparison is unavailable".to_owned()
@@ -1140,6 +1157,8 @@ impl ProjectAudit {
 
     fn synchronized_gaps(&self) -> Vec<&'static str> {
         let mut gaps = Vec::new();
+        let remote_is_authoritative = classify_project(self).classification
+            == ProjectProtectionClassification::RemoteReconstructionWithLocalOverlay;
         if self.remotes.is_empty() {
             gaps.push("no configured remote was found");
         }
@@ -1160,13 +1179,14 @@ impl ProjectAudit {
         if self.local_state.upstream.is_none() {
             gaps.push("the current branch has no upstream");
         }
-        if self.local_state.behind.is_some_and(|count| count > 0) {
+        if !remote_is_authoritative && self.local_state.behind.is_some_and(|count| count > 0) {
             gaps.push("the current branch is behind its locally known upstream");
         }
         if self.local_state.ahead.is_some_and(|count| count > 0) {
             gaps.push("ahead commits require a separately reviewed Push Plan");
         }
-        if self.local_state.upstream.is_some()
+        if !remote_is_authoritative
+            && self.local_state.upstream.is_some()
             && self
                 .remotes
                 .iter()

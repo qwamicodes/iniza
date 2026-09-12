@@ -1696,6 +1696,88 @@ fn project_already_equal_to_its_upstream_is_synchronized_without_a_push_executio
     );
 }
 
+#[test]
+fn clean_behind_project_is_synchronized_from_the_authoritative_remote_without_a_pull() {
+    let directory = TestDirectory::new();
+    let project = directory.path().join("synthetic-project");
+    let remote = directory.path().join("synthetic-remote.git");
+    fs::create_dir(&project).expect("synthetic Project should be created");
+    run_git(&project, &["init", "-q", "--initial-branch=main"]);
+    run_git(
+        directory.path(),
+        &[
+            "init",
+            "-q",
+            "--bare",
+            "--initial-branch=main",
+            remote.to_str().expect("remote path should be Unicode"),
+        ],
+    );
+    run_git(
+        &project,
+        &[
+            "remote",
+            "add",
+            "origin",
+            remote.to_str().expect("remote path should be Unicode"),
+        ],
+    );
+    fs::write(project.join("tracked.txt"), "published base\n")
+        .expect("base fixture should be written");
+    run_git(&project, &["add", "tracked.txt"]);
+    run_git_with_identity(&project, &["commit", "-q", "-m", "Published base"]);
+    let local_checkout = git_stdout(&project, &["rev-parse", "HEAD"]);
+    run_git(&project, &["push", "-q", "-u", "origin", "main"]);
+    fs::write(project.join("remote.txt"), "authoritative remote state\n")
+        .expect("remote fixture should be written");
+    run_git(&project, &["add", "remote.txt"]);
+    run_git_with_identity(&project, &["commit", "-q", "-m", "Remote advances"]);
+    run_git(&project, &["push", "-q", "origin", "main"]);
+    run_git(&project, &["reset", "-q", "--hard", local_checkout.trim()]);
+
+    let mut plan = PlanEngine::local()
+        .scan(ScanRequest::for_directory(&project))
+        .expect("Project should scan");
+    let plan_hash = plan.approval_hash().expect("Plan should have a hash");
+    plan.approve(&plan_hash)
+        .expect("exact reviewed hash should approve the Plan");
+    let audit = ProjectAuditEngine::local()
+        .audit(ProjectAuditRequest::from_plan(&plan))
+        .expect("clean behind Project should audit");
+    let project_audit = audit
+        .projects()
+        .first()
+        .expect("Project should be discovered");
+    assert_eq!(project_audit.local_state().ahead(), Some(0));
+    assert_eq!(project_audit.local_state().behind(), Some(1));
+
+    let evidence_directory = directory.path().join("readiness-evidence");
+    let engine = ReadinessEvidenceEngine::with_git_publication_process(LocalGitPublication);
+    engine
+        .initialize(ReadinessEvidenceInitializationRequest::new(
+            &plan,
+            &evidence_directory,
+        ))
+        .expect("approved Plan should initialize a private evidence store");
+    let status = engine
+        .status(
+            ReadinessEvidenceStatusRequest::new(&evidence_directory, &plan)
+                .with_project_publication(project_audit),
+        )
+        .expect("read-only authoritative remote comparison should produce Project status");
+
+    assert_eq!(status.projects().len(), 1);
+    assert_eq!(
+        status.projects()[0].synchronized(),
+        ReadinessEvidenceConclusion::Current
+    );
+    assert_eq!(
+        git_stdout(&project, &["rev-parse", "HEAD"]).trim(),
+        local_checkout.trim(),
+        "readiness revalidation must not update the old checkout"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn local_only_references_are_synchronized_only_with_current_capsule_protection_and_owner_decision()
@@ -1873,6 +1955,177 @@ fn local_only_references_are_synchronized_only_with_current_capsule_protection_a
     assert_eq!(
         after_withdrawal.projects()[0].synchronized(),
         ReadinessEvidenceConclusion::Missing
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn project_without_a_usable_remote_is_current_only_after_capsule_protection_and_owner_decision() {
+    let directory = TestDirectory::new();
+    let project = directory.path().join("synthetic-project");
+    let inaccessible_remote = directory.path().join("unsupported-local-remote.git");
+    fs::create_dir(&project).expect("synthetic Project should be created");
+    run_git(&project, &["init", "-q", "--initial-branch=main"]);
+    run_git(
+        directory.path(),
+        &[
+            "init",
+            "-q",
+            "--bare",
+            "--initial-branch=main",
+            inaccessible_remote
+                .to_str()
+                .expect("remote path should be Unicode"),
+        ],
+    );
+    run_git(
+        &project,
+        &[
+            "remote",
+            "add",
+            "origin",
+            inaccessible_remote
+                .to_str()
+                .expect("remote path should be Unicode"),
+        ],
+    );
+    fs::write(project.join("tracked.txt"), "capsule-only state\n")
+        .expect("tracked fixture should be written");
+    run_git(&project, &["add", "tracked.txt"]);
+    run_git_with_identity(&project, &["commit", "-q", "-m", "Capsule-only state"]);
+    run_git(&project, &["push", "-q", "-u", "origin", "main"]);
+
+    let mut plan = PlanEngine::local()
+        .scan(ScanRequest::for_directory(&project))
+        .expect("Project should scan");
+    let plan_hash = plan.approval_hash().expect("Plan should have a hash");
+    plan.approve(&plan_hash)
+        .expect("exact reviewed hash should approve the Plan");
+    let audit = ProjectAuditEngine::local()
+        .audit(ProjectAuditRequest::from_plan(&plan).with_remote_check())
+        .expect("Project without a remote should audit");
+    let project_audit = audit
+        .projects()
+        .first()
+        .expect("Project should be discovered");
+    assert!(project_audit.local_state().local_only_branches().is_empty());
+
+    let review = ProjectCapsuleEngine::local()
+        .review(ProjectCapsuleReviewRequest::new(&plan, project_audit))
+        .expect("capsule-only Project should produce a review");
+    let capsule = directory.path().join("project-capsule.iniza");
+    let capture = ProjectCapsuleEngine::local()
+        .capture(ProjectCapsuleCaptureRequest::new(
+            &plan,
+            project_audit,
+            &review,
+            review.review_hash(),
+            &capsule,
+        ))
+        .expect("reviewed Project should capture into a verified Project Capsule");
+    let expectation = capture
+        .expectation()
+        .expect("verified Project Capsule should bind an expectation");
+    let restored = directory.path().join("restored-project");
+    let rehearsal = ProjectCapsuleEngine::local()
+        .rehearse(ProjectCapsuleRehearsalRequest::new(
+            &capsule,
+            expectation,
+            capture.offline_recovery_key(),
+            &restored,
+        ))
+        .expect("Project Capsule should restore the reviewed Project");
+
+    let evidence_directory = directory.path().join("readiness-evidence");
+    let engine = ReadinessEvidenceEngine::local();
+    engine
+        .initialize(ReadinessEvidenceInitializationRequest::new(
+            &plan,
+            &evidence_directory,
+        ))
+        .expect("approved Plan should initialize a private evidence store");
+    let capture_record = engine
+        .record_receipt(ReadinessReceiptRecordRequest::project_capsule_capture(
+            &evidence_directory,
+            &plan,
+            &capture,
+        ))
+        .expect("verified Project Capsule capture should append");
+    engine
+        .record_receipt(ReadinessReceiptRecordRequest::project_capsule_rehearsal(
+            &evidence_directory,
+            &plan,
+            &rehearsal,
+        ))
+        .expect("Restorable Project rehearsal should append");
+
+    let request = || {
+        ReadinessEvidenceStatusRequest::new(&evidence_directory, &plan)
+            .with_project_capsule(&capsule, expectation, capture.offline_recovery_key())
+            .with_project_publication(project_audit)
+    };
+    let without_decision = engine
+        .status(request())
+        .expect("missing owner decision should produce blocking Project evidence");
+    assert_eq!(
+        without_decision.projects()[0].restorable(),
+        ReadinessEvidenceConclusion::Current
+    );
+    assert_eq!(
+        without_decision.projects()[0].synchronized(),
+        ReadinessEvidenceConclusion::Missing
+    );
+
+    let unrelated_attestation_review = engine
+        .prepare_attestation(OwnerAttestationPreparationRequest::new(
+            &evidence_directory,
+            &plan,
+            OwnerAttestationClaimKind::LocalOnlyProjectReferencesRetainedInProjectCapsule,
+            capture_record.evidence_reference(),
+        ))
+        .expect("a valid but narrower capsule decision should still be recordable");
+    engine
+        .confirm_attestation(OwnerAttestationConfirmationRequest::new(
+            &evidence_directory,
+            &plan,
+            &unrelated_attestation_review,
+            unrelated_attestation_review.review_hash(),
+            unrelated_attestation_review.required_acknowledgement(),
+        ))
+        .expect("narrower capsule decision should append as owner-stated evidence");
+    let with_unrelated_decision = engine
+        .status(request())
+        .expect("the narrower decision should remain distinguishable");
+    assert_eq!(
+        with_unrelated_decision.projects()[0].synchronized(),
+        ReadinessEvidenceConclusion::Missing,
+        "a local-only-reference claim must not authorize a Project that has no usable remote"
+    );
+
+    let attestation_review = engine
+        .prepare_attestation(OwnerAttestationPreparationRequest::new(
+            &evidence_directory,
+            &plan,
+            OwnerAttestationClaimKind::ProjectRetainedInProjectCapsuleWithoutPublication,
+            capture_record.evidence_reference(),
+        ))
+        .expect("exact Project Capsule reference should prepare the owner decision");
+    engine
+        .confirm_attestation(OwnerAttestationConfirmationRequest::new(
+            &evidence_directory,
+            &plan,
+            &attestation_review,
+            attestation_review.review_hash(),
+            attestation_review.required_acknowledgement(),
+        ))
+        .expect("exact capsule-only owner decision should append");
+
+    let with_decision = engine
+        .status(request())
+        .expect("current capsule protection and owner decision should revalidate");
+    assert_eq!(
+        with_decision.projects()[0].synchronized(),
+        ReadinessEvidenceConclusion::Current
     );
 }
 

@@ -22,7 +22,8 @@ use crate::{
     LoadedVaultwardenRecoverySecret, OfflineRecoveryEngine, OfflineRecoveryRehearsalReceipt,
     OfflineRecoveryRehearsalRequest, Plan, PlanApprovalState, ProjectAudit, ProjectAuditEngine,
     ProjectAuditRequest, ProjectCapsuleCaptureReport, ProjectCapsuleExpectation,
-    ProjectCapsuleRehearsalReceipt, ProtectionRequirement, PushExecutionReport, PushExecutionState,
+    ProjectCapsuleRehearsalReceipt, ProjectProtectionClassification, ProjectProtectionEngine,
+    ProjectProtectionRequest, ProtectionRequirement, PushExecutionReport, PushExecutionState,
     RecoveryMethod, RecoverySecret, RestoreReport, RestoreState, VaultwardenRecoveryReceipt,
     VerifiedCopyDurability, VerifiedCopyReport, VerifiedCopyStorageLocation, VerifyRequest,
 };
@@ -545,6 +546,7 @@ pub enum OwnerAttestationClaimKind {
     FreshDeviceVaultwardenAccessConfirmed,
     IndependentMultiFactorRecoveryPathConfirmed,
     LocalOnlyProjectReferencesRetainedInProjectCapsule,
+    ProjectRetainedInProjectCapsuleWithoutPublication,
 }
 
 impl OwnerAttestationClaimKind {
@@ -574,6 +576,9 @@ impl OwnerAttestationClaimKind {
             Self::LocalOnlyProjectReferencesRetainedInProjectCapsule => {
                 "I confirm that this Project's reviewed local-only references are deliberately retained only in its verified Project Capsule and must not be published."
             }
+            Self::ProjectRetainedInProjectCapsuleWithoutPublication => {
+                "I confirm that this Project is deliberately retained only in its verified Project Capsule and must not be published."
+            }
         }
     }
 
@@ -597,8 +602,19 @@ impl OwnerAttestationClaimKind {
             Self::LocalOnlyProjectReferencesRetainedInProjectCapsule => {
                 "local-only-project-references-retained-in-project-capsule"
             }
+            Self::ProjectRetainedInProjectCapsuleWithoutPublication => {
+                "project-retained-in-project-capsule-without-publication"
+            }
         }
     }
+}
+
+fn is_project_capsule_retention_claim(claim_kind: OwnerAttestationClaimKind) -> bool {
+    matches!(
+        claim_kind,
+        OwnerAttestationClaimKind::LocalOnlyProjectReferencesRetainedInProjectCapsule
+            | OwnerAttestationClaimKind::ProjectRetainedInProjectCapsuleWithoutPublication
+    )
 }
 
 #[derive(Debug)]
@@ -1581,6 +1597,12 @@ impl<G: GitPublicationProcess, S: ReadinessEvidenceStorage> ReadinessEvidenceEng
         for project in &request.project_publications {
             let has_local_only_references = !project.local_state().local_only_branches().is_empty()
                 || !project.local_state().local_only_tags().is_empty();
+            let requires_capsule_only_decision = ProjectProtectionEngine::classify(
+                ProjectProtectionRequest::new(request.plan, project),
+            )
+            .is_ok_and(|assessment| {
+                assessment.classification() == ProjectProtectionClassification::FullProjectCapsule
+            });
             let latest_capsule_reference =
                 records
                     .iter()
@@ -1593,15 +1615,19 @@ impl<G: GitPublicationProcess, S: ReadinessEvidenceStorage> ReadinessEvidenceEng
                         }
                         _ => None,
                     });
-            let capsule_only_decision_is_current = latest_capsule_reference.as_deref().is_some_and(
-                |reference| {
-                    active_owner_attestations.iter().any(|attestation| {
-                        attestation.claim_kind
-                            == OwnerAttestationClaimKind::LocalOnlyProjectReferencesRetainedInProjectCapsule
-                            && attestation.evidence_reference == reference
-                    })
-                },
-            );
+            let capsule_only_decision_is_current =
+                latest_capsule_reference
+                    .as_deref()
+                    .is_some_and(|reference| {
+                        active_owner_attestations.iter().any(|attestation| {
+                            (attestation.claim_kind
+                                == OwnerAttestationClaimKind::ProjectRetainedInProjectCapsuleWithoutPublication
+                                || (has_local_only_references
+                                    && attestation.claim_kind
+                                        == OwnerAttestationClaimKind::LocalOnlyProjectReferencesRetainedInProjectCapsule))
+                                && attestation.evidence_reference == reference
+                        })
+                    });
             let capsule_protection_is_current =
                 projects_by_identity
                     .get(project.id())
@@ -1625,40 +1651,37 @@ impl<G: GitPublicationProcess, S: ReadinessEvidenceStorage> ReadinessEvidenceEng
                         }
                         _ => None,
                     });
-            let synchronized = match latest_execution {
-                None if project.local_state().ahead() == Some(0)
-                    && project.local_state().behind() == Some(0)
-                    && (!has_local_only_references
-                        || (capsule_protection_is_current && capsule_only_decision_is_current)) =>
-                {
-                    match revalidate_already_synchronized_project(&self.git, project) {
-                        Ok(()) => ReadinessEvidenceConclusion::Current,
-                        Err(_) => ReadinessEvidenceConclusion::Invalidated,
-                    }
+            let synchronized = if requires_capsule_only_decision {
+                if capsule_protection_is_current && capsule_only_decision_is_current {
+                    ReadinessEvidenceConclusion::Current
+                } else {
+                    ReadinessEvidenceConclusion::Missing
                 }
-                None => ReadinessEvidenceConclusion::Missing,
-                Some((record_plan, state, remote, stored_proofs))
-                    if plan_is_current
-                        && record_plan == &current_plan_hash
-                        && *state == StoredPushExecutionState::Complete =>
-                {
-                    let proofs = stored_proofs
-                        .iter()
-                        .map(PushPublicationProof::from)
-                        .collect::<Vec<_>>();
-                    match revalidate_synchronized_project(&self.git, project, remote, &proofs) {
-                        Ok(()) => ReadinessEvidenceConclusion::Current,
-                        Err(_) => ReadinessEvidenceConclusion::Invalidated,
-                    }
-                }
-                Some(_) => ReadinessEvidenceConclusion::Invalidated,
-            };
-            let synchronized = if has_local_only_references
-                && !(capsule_protection_is_current && capsule_only_decision_is_current)
-            {
-                ReadinessEvidenceConclusion::Missing
             } else {
-                synchronized
+                match latest_execution {
+                    None if project.local_state().ahead() == Some(0) => {
+                        match revalidate_already_synchronized_project(&self.git, project) {
+                            Ok(()) => ReadinessEvidenceConclusion::Current,
+                            Err(_) => ReadinessEvidenceConclusion::Invalidated,
+                        }
+                    }
+                    None => ReadinessEvidenceConclusion::Missing,
+                    Some((record_plan, state, remote, stored_proofs))
+                        if plan_is_current
+                            && record_plan == &current_plan_hash
+                            && *state == StoredPushExecutionState::Complete =>
+                    {
+                        let proofs = stored_proofs
+                            .iter()
+                            .map(PushPublicationProof::from)
+                            .collect::<Vec<_>>();
+                        match revalidate_synchronized_project(&self.git, project, remote, &proofs) {
+                            Ok(()) => ReadinessEvidenceConclusion::Current,
+                            Err(_) => ReadinessEvidenceConclusion::Invalidated,
+                        }
+                    }
+                    Some(_) => ReadinessEvidenceConclusion::Invalidated,
+                }
             };
             projects_by_identity
                 .entry(project.id().to_owned())
@@ -1865,7 +1888,8 @@ impl<G: GitPublicationProcess, S: ReadinessEvidenceStorage> ReadinessEvidenceEng
                 })
             }
             OwnerAttestationClaimKind::ConventionalBackupValidated
-            | OwnerAttestationClaimKind::LocalOnlyProjectReferencesRetainedInProjectCapsule => None,
+            | OwnerAttestationClaimKind::LocalOnlyProjectReferencesRetainedInProjectCapsule
+            | OwnerAttestationClaimKind::ProjectRetainedInProjectCapsuleWithoutPublication => None,
         };
         if matches!(
             request.claim_kind,
@@ -1881,9 +1905,7 @@ impl<G: GitPublicationProcess, S: ReadinessEvidenceStorage> ReadinessEvidenceEng
                 "Owner Attestation does not reference the current typed evidence Receipt",
             ));
         }
-        if request.claim_kind
-            == OwnerAttestationClaimKind::LocalOnlyProjectReferencesRetainedInProjectCapsule
-        {
+        if is_project_capsule_retention_claim(request.claim_kind) {
             let references_current_capsule = records.iter().rev().any(|record| {
                 matches!(
                     record.content.evidence,
@@ -2381,7 +2403,8 @@ fn owner_attestation_references_current_evidence(
             .is_some_and(|reference| reference == attestation.evidence_reference)
         }
         OwnerAttestationClaimKind::ConventionalBackupValidated => true,
-        OwnerAttestationClaimKind::LocalOnlyProjectReferencesRetainedInProjectCapsule => records
+        OwnerAttestationClaimKind::LocalOnlyProjectReferencesRetainedInProjectCapsule
+        | OwnerAttestationClaimKind::ProjectRetainedInProjectCapsuleWithoutPublication => records
             .iter()
             .rev()
             .find(|record| {

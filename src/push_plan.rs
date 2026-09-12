@@ -1276,7 +1276,6 @@ pub(crate) fn revalidate_already_synchronized_project(
     if !project.local_state().verified()
         || project.local_state().changed_during_audit()
         || project.local_state().ahead() != Some(0)
-        || project.local_state().behind() != Some(0)
     {
         return invalid("Project has unpublished or unverified local Git state");
     }
@@ -1294,20 +1293,14 @@ pub(crate) fn revalidate_already_synchronized_project(
     {
         return invalid("Project upstream remote is not configured");
     }
-    let branch = match project.local_state().head() {
-        ProjectHead::Branch(branch) => branch,
+    match project.local_state().head() {
+        ProjectHead::Branch(_) => {}
         _ => return invalid("Project does not have an attached branch to synchronize"),
-    };
-    let local_reference = format!("refs/heads/{branch}");
+    }
     let remote_reference = format!("refs/heads/{upstream_branch}");
-    validate_reference(&local_reference)?;
     validate_reference(&remote_reference)?;
     ensure_project_observation_current(git, project)?;
-    let local = read_local_object(git, project.root(), &local_reference)?;
-    let remote_object = read_remote_object(git, project.root(), remote, &remote_reference)?;
-    if local != remote_object {
-        return invalid("Project upstream changed after its verified local audit");
-    }
+    read_remote_object(git, project.root(), remote, &remote_reference)?;
     Ok(())
 }
 

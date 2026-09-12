@@ -218,9 +218,10 @@ Reviewed static secrets and configuration, certificates, and irreplaceable uploa
 - Iniza records results without capturing Git credentials.
 - Selected Projects track two independent outcomes: Restorable and Synchronized.
 - A Project is Restorable only after its reviewed local state round-trips through a verified Project Capsule.
-- A Project is Synchronized only when required upstream branches were remotely checked, are not behind, and approved ahead commits were pushed successfully.
-- Iniza never pulls, merges, rebases, or otherwise reconciles a behind branch. The owner must do so outside Iniza and rerun the check.
-- Local-only branches and tags remain protected in the Project Capsule unless the owner separately approves publication.
+- A Project is Synchronized when a reviewed live remote is authoritative for tracked state and there are no unpublished local commits, or when current verified Project Capsule protection is paired with an exact owner decision to retain the Project without publication.
+- A behind local checkout is informational and does not require reconciliation. Iniza never fetches into, pulls, merges, rebases, or otherwise updates it.
+- Ahead or diverged state remains Action Required and any publication requires a separate approved Push Plan.
+- Local-only branches and tags, dirty state, and Projects without a usable remote remain protected in a full Project Capsule unless the owner separately approves publication.
 
 ### 8.5 Bundle creation
 

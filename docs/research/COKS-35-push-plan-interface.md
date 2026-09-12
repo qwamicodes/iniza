@@ -6,7 +6,7 @@
 
 ## Problem space
 
-A Project is Synchronized only when required upstream branches were checked against their remotes, are not behind, and every approved ahead commit was published successfully. Publication cannot protect staged, unstaged, untracked, ignored, stashed, detached, or deliberately unpublished state, so it remains independent of Project Capsule protection.
+A Project was originally defined as Synchronized only when required upstream branches were checked against their remotes, were not behind, and every approved ahead commit was published successfully. The 2026-09-12 remote-authoritative amendment in Architecture Decision Record 0016 supersedes the behind requirement: a behind checkout is informational when there are no unpublished local commits and the reviewed live remote is authoritative. Publication still cannot protect staged, unstaged, untracked, ignored, stashed, detached, or deliberately unpublished state, so it remains independent of Project Capsule protection.
 
 The boundary must show exact local and remote reference transitions without credentials, create an immutable Push Plan, require approval of its exact canonical hash, revalidate local and remote state immediately before each action, structurally prohibit force push, execute only approved actions, and report partial outcomes without affecting Restorable Project evidence.
 
